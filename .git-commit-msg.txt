@@ -1,20 +1,17 @@
-﻿fix(login): product-agnostic session capture for TeXPage deployments; non-blocking login UX
+﻿feat(config): default upstream to www.overleaf.com; route dynamically-inserted resources through the proxy
 
-tex.nju.edu.cn is a TeXPage-based deployment, not standard Overleaf: its
-session cookie names differ and the dashboard path is not /project, so the
-CDP capture loop never satisfied its detection conditions and hung until
-timeout, while the toolbar button stayed wedged for up to 15 minutes.
+Per user decision the default login site is now the public Overleaf cloud;
+tex.nju.edu.cn (TeXPage-based) remains usable via the settings card hot-swap
+or the composed patch row.
 
-- login-cdp.ts: capture succeeds on (1) any non-preference cookie for the
-  configured host, (2) a tab outside the origin's login/SSO pages, and (3) a
-  tolerant server-side check; closing the login window aborts immediately.
-- cookie-validate.ts: shared tolerant validation (200, 3xx away from login
-  pages, or 404 when the probe route does not exist) used by both the CDP
-  flow and the paste-cookie route.
-- service.ts: /overleaf/workbench/login now returns immediately and runs the
-  CDP flow in the background; new /login-status route exposes running state,
-  elapsed time, result, and error.
-- view.tsx: login start + 3s status polling; frame-bust detector surfaces a
-  hint when the embedded document navigates itself out of the proxy.
-- docs: bilingual README restored after a UTF-8 mojibake regression and
-  updated for TeXPage support; version 0.1.2.
+Blank-page diagnosis for post-login TeXPage dashboards: the server-side
+rewrite only covers the initial HTML, so SPAs that insert scripts/styles
+at runtime with root-relative URLs dropped out of the proxy and hit the
+GUI shell fallback routes.
+
+- inject-script.ts: bridge now sweeps resource attributes on DOMContentLoaded
+  and watches insertions/attribute changes via MutationObserver, rebasing any
+  single-leading-slash src/href/poster/data-src under /overleaf-proxy.
+- config.ts + cordis.patch.yml: DEFAULT_BASE_URL = https://www.overleaf.com.
+- smoke-offline: default-fallback assertion updated; suites green.
+- version 0.1.3.

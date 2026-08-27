@@ -33,8 +33,8 @@ export interface WorkbenchConfig {
   assistPanelEnabled?: boolean
 }
 
-/** Default upstream: NJU self-hosted Overleaf (the primary target audience). */
-const DEFAULT_BASE_URL = 'https://tex.nju.edu.cn'
+/** Default upstream: the public Overleaf cloud (user decision, v0.1.3). */
+const DEFAULT_BASE_URL = 'https://www.overleaf.com'
 const DEFAULT_LOGIN_TIMEOUT_MS = 10 * 60_000
 
 export const Config: z<WorkbenchConfig> = z.object({

@@ -64,6 +64,8 @@ dsh --profile web web        # 用你平时的方式启动即可
 dsh --profile web --dump-config   # 应看到 "# == dsh-overleaf" 配置块
 ```
 
+默认上游为 `https://www.overleaf.com`。要接入其它实例（自托管 Overleaf、`tex.nju.edu.cn` 等），打开 设置 > 插件 > 插件配置 > dsh-overleaf，修改 `baseUrl` 并保存——代理目标即刻热切换，无需重启。
+
 随时可以干净卸载：
 
 ```sh

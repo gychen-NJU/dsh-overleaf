@@ -156,7 +156,7 @@ async function main() {
   assert.equal(res1.statusCode, 200)
   const envelope1 = JSON.parse(res1.body.join(''))
   assert.equal(envelope1.ok, true)
-  assert.equal(envelope1.value.baseUrl, 'https://tex.nju.edu.cn', 'blank config falls back to NJU default')
+  assert.equal(envelope1.value.baseUrl, 'https://www.overleaf.com', 'blank config falls back to public Overleaf default')
   assert.equal(envelope1.value.loggedIn, false)
 
   // 3. Spin a fixture upstream and fetch HTML through the proxy rewrite.

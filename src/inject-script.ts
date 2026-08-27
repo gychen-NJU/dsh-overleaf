@@ -435,7 +435,80 @@ export function renderBridgeScript(): string {
   }
   announceLocation()
   window.addEventListener('popstate', safe(announceLocation, 'popstate'))
+
+  /* ---------------------------------------------------------------- */
+  /* Dynamic resource routing                                         */
+  /*                                                                  */
+  /* The proxy rewrites the INITIAL HTML server-side, but SPAs (TeXPage */
+  /* dashboards, Overleaf loaders) insert scripts/styles/images at     */
+  /* runtime with root-relative URLs; those would fall out of the      */
+  /* proxy and hit the GUI shell's own fallback routes. Sweep existing */
+  /* nodes once the DOM is ready, then watch every insertion/attribute */
+  /* change and rebase matching URLs in place.                         */
+  /* ---------------------------------------------------------------- */
+
+  var RESOURCE_ATTRS = ['src', 'href', 'poster', 'data-src']
+  function fixResourceNode(el) {
+    try {
+      if (!el || el.nodeType !== 1 || !el.hasAttribute) return
+      for (var i = 0; i < RESOURCE_ATTRS.length; i++) {
+        var attr = RESOURCE_ATTRS[i]
+        if (!el.hasAttribute(attr)) continue
+        var value = el.getAttribute(attr)
+        if (typeof value !== 'string') continue
+        /* Only single-leading-slash URLs: leaves #fragments, //host, and
+           schemes untouched, and skips anything already proxied or the
+           bridge script itself. */
+        if (value.charAt(0) !== '/' || value.charAt(1) === '/') continue
+        if (value.indexOf(PREFIX + '/') === 0 || value.indexOf('/overleaf/workbench/') === 0) continue
+        el.setAttribute(attr, PREFIX + value)
+      }
+    } catch (err) {
+      if (DEBUG) log('fixResourceNode failed', err)
+    }
+  }
+  try {
+    var resourceObserver = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        var mutation = mutations[i]
+        if (mutation.type === 'attributes') {
+          fixResourceNode(mutation.target)
+          continue
+        }
+        for (var j = 0; j < mutation.addedNodes.length; j++) {
+          var added = mutation.addedNodes[j]
+          fixResourceNode(added)
+          if (added && added.querySelectorAll) {
+            var list = added.querySelectorAll('[src],[href],[poster],[data-src]')
+            for (var k = 0; k < list.length; k++) fixResourceNode(list[k])
+          }
+        }
+      }
+    })
+    function startResourceObserver() {
+      if (!document.documentElement) {
+        setTimeout(startResourceObserver, 50)
+        return
+      }
+      resourceObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: RESOURCE_ATTRS,
+      })
+    }
+    startResourceObserver()
+  } catch (err) {
+    if (DEBUG) log('resource observer unavailable', err)
+  }
+
   document.addEventListener('DOMContentLoaded', safe(function () {
+    try {
+      var list = document.querySelectorAll('[src],[href],[poster],[data-src]')
+      for (var i = 0; i < list.length; i++) fixResourceNode(list[i])
+    } catch (err) {
+      if (DEBUG) log('initial sweep failed', err)
+    }
     announceLocation()
     reportCapabilities()
   }, 'dom ready'))

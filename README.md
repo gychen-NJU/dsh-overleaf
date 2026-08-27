@@ -64,6 +64,8 @@ Verify composition survived:
 dsh --profile web --dump-config   # expect a "# == dsh-overleaf" block
 ```
 
+The default upstream is `https://www.overleaf.com`. To point the workbench at any other instance (self-hosted Overleaf, `tex.nju.edu.cn`, ...), open Settings > Plugins > Plugin configuration > dsh-overleaf, change `baseUrl`, and save — the proxy target hot-swaps without a restart.
+
 Uninstall cleanly at any time:
 
 ```sh

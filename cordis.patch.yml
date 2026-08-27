@@ -9,7 +9,7 @@
     - id: overleaf-workbench
       name: 'dsh-overleaf'
       config:
-        baseUrl: 'https://tex.nju.edu.cn'
+        baseUrl: 'https://www.overleaf.com'
         browserChannel: auto
         browserPath: ''
         loginTimeoutMs: 600000
