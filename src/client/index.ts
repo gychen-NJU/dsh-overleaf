@@ -86,14 +86,13 @@ export function apply(ctx: RootLike): void {
         ctx.inject(['settingsScope'], (raw: RootLike & { settingsScope?: unknown }) => {
           try {
             const binder = raw.settingsScope as {
-              bind(options: { namespace: string }): never
+              bind(options: { namespace: string }): unknown
             } | undefined
             if (binder === undefined) return
-            // Bind the namespace on the caller's fiber so disposal cascades.
-            const scopeBinder = raw.effect(
-              () => binder.bind({ namespace: LOCALE_NS }),
-              'dsh-overleaf: settings scope attach',
-            ) as unknown
+            // Bind the namespace directly on the caller's fiber. (Wrapping
+            // bind() in raw.effect() made cordis reject the scope object as
+            // an "Invalid effect" — the bound scope is not a Disposable.)
+            const scopeBinder = binder.bind({ namespace: LOCALE_NS })
             const innerSlots = raw.get('slots') as SlotsFace | undefined
             if (innerSlots?.inject === undefined || innerSlots.register === undefined) return
             innerSlots.inject('settings.plugin.item', () => innerSlots.register({

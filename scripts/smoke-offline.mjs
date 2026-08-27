@@ -110,7 +110,7 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, allowSelfInCsp } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
 
   // 0. Cookie authority regression (the v0.1.5 login-page bug): a browser-side
   // anonymous/stale twin of the session cookie must NEVER override the stored
@@ -129,6 +129,38 @@ async function main() {
       'without a stored credential the browser cookies pass through')
     // mergeCookieHeaders keeps documented helper semantics: extra (stored) wins.
     assert.equal(mergeCookieHeaders('overleaf_session2=stale', 'overleaf_session2=stored'), 'overleaf_session2=stored')
+  }
+
+  // 0b. CSP adjustment regression (the v0.1.7 editor blank-page bug): the
+  // editor page ships an allowlist CSP without 'self', which blocked the
+  // same-origin bridge script and every same-origin editor call. The proxy
+  // must append 'self' to resource directives, drop frame-ancestors, and
+  // preserve every other allowlist entry.
+  {
+    const overleafLike = "default-src 'none'; script-src https://cdn.overleaf.com 'unsafe-inline'; "
+      + "connect-src 'self' wss://www.overleaf.com https://www.overleaf.com; "
+      + "frame-ancestors 'self'; img-src 'self' data:"
+    const out = allowSelfInCsp(overleafLike)
+    assert.ok(!out.value.includes('frame-ancestors'), 'frame-ancestors dropped')
+    const dir = name => {
+      const m = new RegExp(`${name} ([^;]*)`).exec(out.value)
+      return m === null ? '' : m[1]
+    }
+    const scriptDir = dir('script-src')
+    assert.ok(scriptDir.includes("'self'") && scriptDir.includes('cdn.overleaf.com') && scriptDir.includes("'unsafe-inline'"),
+      `script-src gained self, kept cdn + unsafe-inline: ${scriptDir}`)
+    const connectDir = dir('connect-src')
+    assert.ok(connectDir.includes('wss://www.overleaf.com'), 'connect-src entries preserved')
+    assert.equal((connectDir.match(/'self'/g) ?? []).length, 1, 'connect-src self not duplicated')
+    assert.equal(dir('default-src'), "'none'", "default-src 'none' preserved")
+    assert.equal(dir('img-src'), "'self' data:", 'img-src untouched when self already present')
+
+    const defaultOnly = allowSelfInCsp('default-src https://cdn.overleaf.com')
+    assert.ok(/default-src https:\/\/cdn\.overleaf\.com 'self'/.test(defaultOnly.value),
+      `self appended to default-src when script-src absent: ${defaultOnly.value}`)
+
+    const alreadySelf = allowSelfInCsp("script-src 'self' https://x.example")
+    assert.equal(alreadySelf.value, "script-src 'self' https://x.example", 'no duplicate self')
   }
 
   // 1. Mount against a fake context and confirm every route family lands.

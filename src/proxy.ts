@@ -91,6 +91,61 @@ export function rewriteHtml(
   return out
 }
 
+/**
+ * Rewrite a Content-Security-Policy value so the proxied document can run:
+ *  1. drop `frame-ancestors` entirely (the whole point of the proxy);
+ *  2. append `'self'` to every resource directive the embedded app needs for
+ *     same-origin loads (the bridge script, lazily inserted chunks, editor
+ *     data calls, the socket.io tunnel) when that directive exists;
+ *  3. when only `default-src` exists, append `'self'` there instead.
+ * Everything else — every host allowlist entry — is preserved verbatim, so
+ * the policy still blocks everything it blocked before except same-origin.
+ */
+const SELF_NEEDED_DIRECTIVES = new Set([
+  'script-src', 'style-src', 'img-src', 'font-src', 'connect-src',
+  'media-src', 'worker-src', 'child-src',
+])
+
+export function allowSelfInCsp(value: string): { value: string; changed: boolean } {
+  let changed = false
+  const kept: string[] = []
+  let hasScriptSrc = false
+  let hasDefaultSrc = false
+  for (const rawDirective of value.split(';').map(item => item.trim()).filter(Boolean)) {
+    if (/^frame-ancestors\b/i.test(rawDirective)) {
+      changed = true
+      continue
+    }
+    const match = /^([a-z-]+)(?:\s+([\s\S]*))?$/.exec(rawDirective)
+    if (match === null) {
+      kept.push(rawDirective)
+      continue
+    }
+    const name = (match[1] ?? '').toLowerCase()
+    const values = (match[2] ?? '').trim()
+    if (name === 'script-src') hasScriptSrc = true
+    if (name === 'default-src') hasDefaultSrc = true
+    if (SELF_NEEDED_DIRECTIVES.has(name) && !/(?:^|\s)'self'(?:\s|$)/i.test(values)) {
+      changed = true
+      kept.push(values === '' ? `${name} 'self'` : `${name} ${values} 'self'`)
+      continue
+    }
+    kept.push(rawDirective)
+  }
+  if (!hasScriptSrc && hasDefaultSrc) {
+    const index = kept.findIndex(directive => /^default-src\b/i.test(directive))
+    const directive = index >= 0 ? kept[index] : undefined
+    if (directive !== undefined) {
+      const values = directive.replace(/^default-src\b/i, '').trim()
+      if (!/(?:^|\s)'self'(?:\s|$)/i.test(values)) {
+        changed = true
+        kept[index] = values === '' ? "default-src 'self'" : `default-src ${values} 'self'`
+      }
+    }
+  }
+  return { value: kept.join('; '), changed }
+}
+
 /** Remove only the framing directives from a Content-Security-Policy value. */
 export function relaxFrameCsp(value: string): { value: string; changed: boolean } {
   const kept: string[] = []
@@ -213,9 +268,9 @@ function buildResponseHeaders(
   const csp = upstreamHeaders['content-security-policy']
   if (csp !== undefined) {
     const joined = Array.isArray(csp) ? csp.join('; ') : csp
-    const relaxed = relaxFrameCsp(joined)
-    hadFrameCsp = relaxed.changed
-    if (relaxed.value !== '') headers['content-security-policy'] = relaxed.value
+    const adjusted = allowSelfInCsp(joined)
+    hadFrameCsp = adjusted.changed
+    if (adjusted.value !== '') headers['content-security-policy'] = adjusted.value
   }
   return { headers, hadFrameCsp }
 }
