@@ -1,0 +1,11 @@
+# README language pairing metadata (dsh-web-ui family convention).
+default: en
+languages:
+  en:
+    path: README.md
+    title: dsh-overleaf
+    description: Embedded Overleaf workbench tab for DeepSeek Harness Web
+  zh:
+    path: README.zh.md
+    title: dsh-overleaf
+    description: DeepSeek Harness Web 的 Overleaf 嵌入工作台插件

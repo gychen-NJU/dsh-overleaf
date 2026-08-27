@@ -1,0 +1,19 @@
+# dsh-overleaf bundle patch: insert the dual-face plugin row into a web
+# profile. The node half (exports ".") provides ctx.overleafWorkbench plus the
+# /overleaf-proxy and /overleaf/workbench routes; the browser half (exports
+# "./client", discovered through the dsh.client declaration) registers the
+# "Overleaf" conversation view tab and the plugin-settings card. Route prefixes
+# are disjoint from every known Overleaf-related plugin (dsh-better-overleaf
+# owns /overleaf/*), so the two plugins coexist safely in one profile.
+- insert:
+    - id: overleaf-workbench
+      name: 'dsh-overleaf'
+      config:
+        baseUrl: 'https://tex.nju.edu.cn'
+        browserChannel: auto
+        browserPath: ''
+        loginTimeoutMs: 600000
+        selectionQuoteEnabled: true
+        cursorInsertEnabled: true
+        injectScriptEnabled: true
+        assistPanelEnabled: true

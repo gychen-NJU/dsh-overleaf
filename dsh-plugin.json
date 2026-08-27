@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Yan-Zero/dsh-std/main/packages/manifest/schema/dsh-plugin-0.15.schema.json",
+  "manifestVersion": "0.15",
+  "id": "dsh.overleaf",
+  "name": "dsh-overleaf",
+  "version": "0.1.0",
+  "facets": {
+    "host": {
+      "entry": "lib/index.js",
+      "apiVersion": "v1"
+    }
+  },
+  "requires": {
+    "contracts": [
+      { "apiVersion": "cordis.svc/v1", "kind": "WebServer", "optional": false, "fallback": "dsh-host-webserver 0.1.x ctx.webServer (exact/prefix HTTP routes + exact upgrade routes)" },
+      { "apiVersion": "cordis.svc/v1", "kind": "Credentials", "optional": true, "fallback": "missing credentials service disables cookie storage; manual-cookie mode only" }
+    ]
+  },
+  "permissions": [
+    {
+      "name": "dsh.overleaf.network-proxy",
+      "scope": "outbound https to config.baseUrl origin only",
+      "reason": "The workbench forwards browser traffic to the configured self-hosted or public Overleaf instance."
+    },
+    {
+      "name": "dsh.overleaf.credential-store",
+      "scope": "credentialRef OVERLEAF_WORKBENCH_COOKIE",
+      "reason": "Store the captured Overleaf session cookie so reboots do not require re-login."
+    }
+  ],
+  "license": "MIT",
+  "source": {
+    "repository": "https://github.com/gychen-NJU/dsh-overleaf"
+  }
+}
