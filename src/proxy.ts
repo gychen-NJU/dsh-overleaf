@@ -43,6 +43,25 @@ function rebaseAttributeUrl(url: string, prefix: string): string {
 }
 
 /**
+ * Extract the script nonce for one response: prefer the `script-src` nonce in
+ * the CSP header, fall back to the first `<script nonce="...">` in the HTML.
+ * Under `'strict-dynamic'` CSP, 'self'/host allowlists are ignored and ONLY
+ * nonce-marked scripts run, so the injected bridge must carry this nonce.
+ */
+export function extractCspNonce(csp: string | undefined, html: string | undefined): string | undefined {
+  if (csp !== undefined && csp !== '') {
+    const scriptSrc = /script-src[^;]*/i.exec(csp)?.[0] ?? csp
+    const nonce = /'nonce-([^']+)'/.exec(scriptSrc)?.[1]
+    if (nonce !== undefined && nonce !== '') return nonce
+  }
+  if (html !== undefined && html !== '') {
+    const nonce = /<script[^>]*\bnonce="([^"]+)"/i.exec(html)?.[1]
+    if (nonce !== undefined && nonce !== '') return nonce
+  }
+  return undefined
+}
+
+/**
  * Rewrite one HTML body for same-origin serving:
  *  1. every occurrence of the TARGET ORIGIN string becomes the proxy prefix,
  *     so apps that build internal links/API/socket URLs from an embedded
@@ -50,21 +69,21 @@ function rebaseAttributeUrl(url: string, prefix: string): string {
  *     navigating the iframe to the real site, where X-Frame-Options blocks
  *     the load and clicks appear dead;
  *  2. root-relative attribute references become proxy-rooted;
- *  3. the bridge script (and via it the runtime URL wrappers) is injected.
+ *  3. the bridge script (and via it the runtime URL wrappers) is injected,
+ *     carrying the response's CSP nonce when one exists ('strict-dynamic'
+ *     pages would otherwise block it).
  */
 export function rewriteHtml(
   html: string,
   prefix: string,
   injectScriptSrc: string | undefined,
   targetOrigin: string | undefined,
+  cspNonce: string | undefined,
 ): string {
   let out = html.replaceAll('"//', '"https://')
-  if (targetOrigin !== undefined && targetOrigin !== '') {
-    out = out.split(targetOrigin).join(prefix)
-  }
-  // Root-relative attribute references become proxy-rooted so assets issued by
-  // static markup resolve back through this plugin instead of hitting the DSH
-  // shell's own fallback routes.
+  // 1. Root-relative attribute references become proxy-rooted first. (The
+  // origin-string replacement below must run AFTER this, otherwise an
+  // absolute-origin attribute would be rebased twice.)
   out = out.replace(/(\s(?:href|src|action|poster|data-src)\s*=\s*")(\/[^"']*)(")/gi,
     (_match, lead: string, pathValue: string, tail: string) =>
       `${lead}${rebaseAttributeUrl(pathValue, prefix)}${tail}`)
@@ -78,8 +97,15 @@ export function rewriteHtml(
     }).join(',')
     return `${lead}${rebuilt}${tail}`
   })
+  // 2. Any remaining occurrence of the TARGET ORIGIN string (absolute links,
+  // embedded siteUrl config values) becomes the proxy prefix. Attributes
+  // already rebased above contain no origin substring, so they are untouched.
+  if (targetOrigin !== undefined && targetOrigin !== '') {
+    out = out.split(targetOrigin).join(prefix)
+  }
   if (injectScriptSrc !== undefined && !html.includes('dsh-overleaf-bridge')) {
-    const tag = `<script src="${injectScriptSrc}" data-dsh-overleaf-bridge></script>`
+    const nonceAttr = cspNonce !== undefined && cspNonce !== '' ? ` nonce="${cspNonce}"` : ''
+    const tag = `<script src="${injectScriptSrc}"${nonceAttr} data-dsh-overleaf-bridge></script>`
     if (/<head[^>]*>/i.test(out)) {
       out = out.replace(/<head[^>]*>/i, match => `${match}\n${tag}\n`)
     } else if (/<html[^>]*>/i.test(out)) {
@@ -427,7 +453,11 @@ async function deliverResponse(
       return
     }
     try {
-      const body = rewriteHtml(Buffer.concat(chunks).toString('utf8'), PROXY_PREFIX, injectScriptSrc, target.origin)
+      const htmlString = Buffer.concat(chunks).toString('utf8')
+      const cspHeader = upstreamRes.headers['content-security-policy']
+      const cspJoined = Array.isArray(cspHeader) ? cspHeader.join('; ') : cspHeader
+      const cspNonce = extractCspNonce(cspJoined, htmlString)
+      const body = rewriteHtml(htmlString, PROXY_PREFIX, injectScriptSrc, target.origin, cspNonce)
       const payload = Buffer.from(body, 'utf8')
       const finalHeaders: Record<string, string | string[]> = { ...headers }
       finalHeaders['content-length'] = String(payload.byteLength)

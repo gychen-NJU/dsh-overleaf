@@ -110,7 +110,7 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, allowSelfInCsp } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, allowSelfInCsp, extractCspNonce, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
 
   // 0. Cookie authority regression (the v0.1.5 login-page bug): a browser-side
   // anonymous/stale twin of the session cookie must NEVER override the stored
@@ -161,6 +161,22 @@ async function main() {
 
     const alreadySelf = allowSelfInCsp("script-src 'self' https://x.example")
     assert.equal(alreadySelf.value, "script-src 'self' https://x.example", 'no duplicate self')
+  }
+
+  // 0c. Nonce-tagged bridge injection (the v0.1.8 gap): under 'strict-dynamic'
+  // CSP, 'self' is ignored and only nonce-marked scripts run, so the bridge
+  // must carry the response nonce.
+  {
+    const csp = "script-src 'nonce-abc123==' 'unsafe-inline' 'strict-dynamic' https:; default-src 'none'"
+    assert.equal(extractCspNonce(csp, undefined), 'abc123==', 'nonce from CSP script-src')
+    assert.equal(extractCspNonce(undefined, '<html><body><script nonce="html-nonce">'), 'html-nonce',
+      'nonce fallback from HTML script tag')
+    assert.equal(extractCspNonce(undefined, '<html><body>hi'), undefined, 'no nonce anywhere')
+    const out = rewriteHtml('<html><head><title>t</title></head><body><a href="https://www.overleaf.com/x">l</a></body></html>',
+      '/overleaf-proxy', '/overleaf/workbench/bridge.js', 'https://www.overleaf.com', 'abc123==')
+    assert.ok(out.includes('src="/overleaf/workbench/bridge.js" nonce="abc123=="'),
+      `bridge tag carries the nonce: ${out.slice(0, 240)}`)
+    assert.ok(out.includes('href="/overleaf-proxy/x"'), 'origin string replaced')
   }
 
   // 1. Mount against a fake context and confirm every route family lands.
