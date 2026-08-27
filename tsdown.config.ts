@@ -4,13 +4,14 @@
  * - client pass: CJS `lib/client.js` closure registered through
  *   `window.__ModuleLoader__.load({ id, factory })`.
  *
- * The client module id is deliberately NOT `dsh-overleaf`: the installed
- * dsh-better-overleaf already claims that id in its bundle banner, and module
- * ids share one page-global registry. `dsh-overleaf-workbench` is unique.
+ * The client module id must equal the npm package name: dsh-client-modules
+ * matches each `/plugins/<pkg>/client.js` bundle against a registration under
+ * `<pkg>` (any other id triggers "loaded without registering"). `dsh-overleaf`
+ * is free — dsh-better-overleaf now registers under its own package name.
  */
 import { defineConfig } from 'tsdown'
 
-const ID = 'dsh-overleaf-workbench'
+const ID = 'dsh-overleaf'
 
 const CLIENT_EXTERNALS = ['react', 'react/jsx-runtime'] as const
 

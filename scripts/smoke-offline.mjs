@@ -125,15 +125,9 @@ async function main() {
       registeredNs = ns
       registeredBase = options?.base ?? {}
       return {
-        getSnapshot: () => ({
-          value: resolvedFromSchema(schema, mutableDoc),
-          base: {},
-          user: { ...mutableDoc },
-          revision: 1,
-          writable: true,
-        }),
+        get: () => resolvedFromSchema(schema, mutableDoc),
         watch(listener) {
-          watcherFn = listener
+          watcherFn = () => listener(resolvedFromSchema(schema, mutableDoc), undefined)
           return () => {}
         },
       }
@@ -245,7 +239,7 @@ async function main() {
   vm.createContext(sandbox)
   vm.runInContext(bundleSource, sandbox, { filename: 'client.js' })
   assert.equal(registered.length, 1, 'bundle registered exactly one module factory')
-  assert.equal(registered[0].id, 'dsh-overleaf-workbench', 'module id is the workbench-safe id')
+  assert.equal(registered[0].id, 'dsh-overleaf', 'module id matches the npm package name')
 
   // Materialize with a require shim answering the two seeds.
   const jsxStub = (type, props) => ({ type, props })

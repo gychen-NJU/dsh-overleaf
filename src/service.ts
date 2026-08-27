@@ -87,19 +87,15 @@ declare module '@deepseek-ai/cordis' {
 
 /** Minimal structural face of the optional settings service we consume. */
 interface SettingsScopeFace {
-  getSnapshot(): {
-    value?: Record<string, unknown>
-    base?: Record<string, unknown>
-    user?: Record<string, unknown>
-    revision: number
-    writable: boolean
-  }
-  watch(listener: (value: unknown) => void): () => void
+  /** Current resolved value for the namespace (no snapshot wrapper). */
+  get(): Record<string, unknown> | undefined
+  /** Observe changes; listeners receive `(next, prev)` resolved values. */
+  watch(listener: (next: unknown, prev: unknown) => void): () => void
 }
 
 /** The `ctx.overleafWorkbench` service. */
 export class OverleafWorkbenchService extends Service {
-  static inject = ['webServer', 'credentials']
+  static inject = ['webServer', 'credentials', 'settings']
   static Config = Config
 
   /** Mutable because live settings updates swap it wholesale. */
@@ -137,11 +133,10 @@ export class OverleafWorkbenchService extends Service {
       const scope = settings.register('dsh-overleaf', Config, {
         base: this.mountBaseConfig ?? {},
       })
-      this.ctx.effect(() => scope.watch(() => {
+      this.ctx.effect(() => scope.watch((next) => {
         try {
-          const snapshot = scope.getSnapshot()
-          if (snapshot.value !== undefined) {
-            this.applyRuntimeConfig(resolveConfig(snapshot.value as WorkbenchConfig))
+          if (next !== undefined) {
+            this.applyRuntimeConfig(resolveConfig(next as WorkbenchConfig))
           }
         } catch (error) {
           console.warn('[dsh-overleaf] settings application failed:', error instanceof Error ? error.message : error)
@@ -149,9 +144,9 @@ export class OverleafWorkbenchService extends Service {
       }), 'dsh-overleaf: settings watcher')
       // Seed from a possibly pre-existing user section (saved on an earlier
       // run); without it the freshly mounted service would ignore prior edits.
-      const seeded = scope.getSnapshot()
-      if (seeded.value !== undefined) {
-        this.applyRuntimeConfig(resolveConfig(seeded.value as WorkbenchConfig))
+      const seeded = scope.get()
+      if (seeded !== undefined) {
+        this.applyRuntimeConfig(resolveConfig(seeded as WorkbenchConfig))
       }
     } catch (error) {
       // A rejected registration must never fail the plugin mount.

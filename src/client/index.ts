@@ -1,8 +1,9 @@
 /**
  * dsh-overleaf client half entry. Registered by the host bundle loader through
- * `window.__ModuleLoader__.load({ id: 'dsh-overleaf-workbench', factory })`;
- * Cordis calls `apply(ctx)` on activation. Everything degrades silently when a
- * service is missing — a broken integration must never take the GUI down.
+ * `window.__ModuleLoader__.load({ id: 'dsh-overleaf', factory })` (the module
+ * id must equal the npm package name); Cordis calls `apply(ctx)` on
+ * activation. Everything degrades silently when a service is missing — a
+ * broken integration must never take the GUI down.
  */
 import { createElement } from 'react'
 import { OverleafView } from './view.tsx'
