@@ -41,6 +41,8 @@ export interface LoginOptions {
   browserChannel: OverleafBrowserChannel
   /** Explicit Chromium-family executable tried first when set. */
   browserPath?: string
+  /** Chromium --proxy-server value for the login window (Google reCAPTCHA access); empty = system. */
+  loginProxyServer?: string
   timeoutMs: number
   profileMode?: LoginProfileMode | undefined
 }
@@ -429,6 +431,9 @@ async function loginWithExecutable(executablePath: string, options: LoginOptions
     '--remote-allow-origins=*',
     '--no-first-run',
     '--no-default-browser-check',
+    ...(options.loginProxyServer !== undefined && options.loginProxyServer !== ''
+      ? [`--proxy-server=${options.loginProxyServer}`]
+      : []),
     options.loginUrl,
   ], { stdio: 'ignore', windowsHide: true })
   let cdp: CdpClient | undefined

@@ -1,0 +1,17 @@
+﻿feat(login): configurable proxy for the CDP login browser; embedded-login CAPTCHA hint
+
+"captcha not available" on www.overleaf.com: Google reCAPTCHA assets live on
+google.com/gstatic.com (unreachable from CN networks), and the widget cannot
+run under the loopback proxy origin at all because reCAPTCHA site keys are
+domain-locked.
+
+- config: new loginProxyServer field (normalized to Chromium --proxy-server
+  form, bare-port friendly); the CDP login browser launches with the flag
+  when set, empty keeps the system default.
+- bridge/view: when the embedded document shows a login page, the view
+  surfaces a hint steering to the popup or paste-cookie flow instead of a
+  form that can never submit.
+- settings card + locales: loginProxyServer field (zh/en).
+- also fixes a schema drift: Config declared compileAssistEnabled while the
+  interface used assistPanelEnabled; schema now matches.
+- version 0.1.4.

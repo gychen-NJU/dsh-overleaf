@@ -19,6 +19,8 @@ export interface WorkbenchConfig {
   browserChannel?: OverleafBrowserChannel
   /** Explicit Chromium-family executable tried first (third-party browsers). */
   browserPath?: string
+  /** Proxy for the CDP login browser (e.g. Clash: http://127.0.0.1:7890); empty = system default. */
+  loginProxyServer?: string
   /** Login wait timeout in milliseconds before falling back to manual paste. */
   loginTimeoutMs?: number
   /** Login profile persistence mode. */
@@ -47,12 +49,13 @@ export const Config: z<WorkbenchConfig> = z.object({
     z.const('real'),
   ]).default('auto'),
   browserPath: z.string(),
+  loginProxyServer: z.string(),
   loginTimeoutMs: z.natural().default(DEFAULT_LOGIN_TIMEOUT_MS),
   loginProfile: z.union([z.const('persistent'), z.const('temporary')]).default('persistent'),
   selectionQuoteEnabled: z.boolean().default(true),
   cursorInsertEnabled: z.boolean().default(true),
   injectScriptEnabled: z.boolean().default(true),
-  compileAssistEnabled: z.boolean().default(true),
+  assistPanelEnabled: z.boolean().default(true),
 })
 
 /** Parsed config with every default applied. */
@@ -60,6 +63,7 @@ export interface ResolvedConfig {
   baseUrl: string
   browserChannel: OverleafBrowserChannel
   browserPath?: string
+  loginProxyServer?: string
   loginTimeoutMs: number
   loginProfile: LoginProfileMode
   selectionQuoteEnabled: boolean
@@ -71,12 +75,17 @@ export interface ResolvedConfig {
 /** Apply defaults in the owning implementation, never hidden inside methods. */
 export function resolveConfig(config: WorkbenchConfig): ResolvedConfig {
   const channel = config.browserChannel ?? 'auto'
+  const browserPath = config.browserPath !== undefined && config.browserPath.trim() !== ''
+    ? config.browserPath.trim()
+    : undefined
+  const loginProxyServer = config.loginProxyServer !== undefined && config.loginProxyServer.trim() !== ''
+    ? normalizeProxyServer(config.loginProxyServer)
+    : undefined
   return {
     baseUrl: normalizeOrigin(config.baseUrl ?? DEFAULT_BASE_URL),
     browserChannel: channel,
-    ...(config.browserPath !== undefined && config.browserPath.trim() !== ''
-      ? { browserPath: config.browserPath.trim() }
-      : {}),
+    ...(browserPath !== undefined ? { browserPath } : {}),
+    ...(loginProxyServer !== undefined ? { loginProxyServer } : {}),
     loginTimeoutMs: config.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS,
     loginProfile: config.loginProfile ?? 'persistent',
     selectionQuoteEnabled: config.selectionQuoteEnabled ?? true,
@@ -84,6 +93,22 @@ export function resolveConfig(config: WorkbenchConfig): ResolvedConfig {
     injectScriptEnabled: config.injectScriptEnabled ?? true,
     assistPanelEnabled: config.assistPanelEnabled ?? true,
   }
+}
+
+/**
+ * Normalize a user-supplied proxy server string into the form Chromium's
+ * --proxy-server flag accepts (mirrors the dsh-browser helper): a bare port
+ * becomes a loopback HTTP proxy, scheme-less host:port gains http://, and
+ * full scheme URLs pass through. Empty/invalid yields undefined so the flag
+ * is omitted entirely (system VPN / direct).
+ */
+export function normalizeProxyServer(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === '') return undefined
+  const trimmed = raw.trim()
+  if (trimmed === '') return undefined
+  if (/^\d+$/.test(trimmed)) return `http://127.0.0.1:${trimmed}`
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return trimmed
+  return `http://${trimmed}`
 }
 
 /**

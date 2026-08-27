@@ -135,6 +135,13 @@ Two paths, both feeding the same credential store:
 - **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds default + installed Chromium builds; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Sign in once and keep that window open; the plugin polls `Storage.getCookies`/`Network.getAllCookies` until (1) at least one non-preference cookie exists for the configured host, (2) a tab sits on the origin outside its login/SSO pages, and (3) the assembled header passes a tolerant server-side check. This works for standard Overleaf AND TeXPage-based deployments (such as `tex.nju.edu.cn`) whose session cookie names differ. Closing the login window early aborts capture immediately — paste the cookie instead. The login route returns immediately and the view polls progress, so the toolbar never wedges.
 - **Manual paste**: DevTools copy of the Cookie header line pasted through the toolbar dialog; validated with the same tolerant check (200, or a redirect away from login pages) before persisting.
 
+### CAPTCHA notes (www.overleaf.com from CN networks)
+
+Overleaf's login is protected by Google reCAPTCHA hosted on google.com/gstatic.com. Two consequences:
+
+- **The embedded page can never complete a login** — reCAPTCHA site keys are domain-locked to www.overleaf.com, so the widget fails on the loopback proxy origin. When the embedded page shows a login form the view displays a hint steering you to the popup/cookie flow. Always sign in through the CDP popup window or paste a cookie.
+- **The CDP popup needs direct access to Google**. From CN networks set `loginProxyServer` (Settings > Plugins > dsh-overleaf, or the composed row) to your proxy client's HTTP endpoint — `http://127.0.0.1:7890` for a typical Clash setup, a bare port works too — and the login browser is launched with `--proxy-server`. Leave it empty to use the system default. Without reachability you will see "captcha not available".
+
 No cookie value ever passes through plugin config, route payloads (beyond your paste), logs, or client storage.
 
 ## Security model

@@ -341,6 +341,9 @@ export class OverleafWorkbenchService extends Service {
         : this.config.browserPath !== undefined
           ? { browserPath: this.config.browserPath }
           : {}),
+      ...(this.config.loginProxyServer !== undefined
+        ? { loginProxyServer: this.config.loginProxyServer }
+        : {}),
       timeoutMs: this.config.loginTimeoutMs,
       profileMode: this.config.loginProfile,
     })

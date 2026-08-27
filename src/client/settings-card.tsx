@@ -40,6 +40,7 @@ const FIELDS: FieldDef[] = [
   { key: 'cursorInsertEnabled', kind: 'boolean', labelKey: 'set.cursorInsert' },
   { key: 'injectScriptEnabled', kind: 'boolean', labelKey: 'set.injectScript' },
   { key: 'assistPanelEnabled', kind: 'boolean', labelKey: 'set.assistPanel' },
+  { key: 'loginProxyServer', kind: 'text', labelKey: 'set.loginProxyServer', hintKey: 'set.loginProxyServerHint' },
 ]
 
 const STYLES = `

@@ -133,6 +133,13 @@ scripts/
 - **直连 CDP 抓取（推荐）**：插件用你选择的 Chromium 系浏览器（`auto` 自动发现默认浏览器与已装 Chromium；可指定渠道或路径）以独立配置目录（`~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`）加预留 loopback 调试端口启动。登录一次并保持窗口打开；插件轮询 `Storage.getCookies` / `Network.getAllCookies`，直到 (1) 配置主机名下出现至少一个非偏好类 Cookie，(2) 有页面停留在该站点且不在登录/SSO 页，(3) 组装出的 Cookie 头通过宽容的服务端校验。因此它同时兼容标准 Overleaf 与 TeXPage 系部署（如 `tex.nju.edu.cn`，其会话 Cookie 名完全不同）。提前关闭登录窗口会立即中止抓取——此时改用粘贴 Cookie。登录请求立即返回、视图轮询进度，工具栏不会卡死。
 - **手动粘贴**：DevTools 复制整行 Cookie 经工具栏对话框粘贴入库；保存前以 redirect-manual GET 校验 `<baseUrl>/project`。
 
+### CAPTCHA 说明（国内网络登录 www.overleaf.com）
+
+Overleaf 登录使用 Google reCAPTCHA（资源在 google.com / gstatic.com）。两个后果：
+
+- **内嵌页面永远无法完成登录**——reCAPTCHA 站点密钥锁死 www.overleaf.com 域名，在回环代理源下必然失败。内嵌页出现登录表单时视图会给出提示，引导改用弹窗/粘贴 Cookie。
+- **CDP 弹窗需要能直连 Google**。国内网络请在 设置 > 插件 > 插件配置 > dsh-overleaf 里把 `loginProxyServer` 设为代理客户端 HTTP 端口（Clash 典型为 `http://127.0.0.1:7890`，纯端口号亦可），登录浏览器会以 `--proxy-server` 启动；留空则用系统默认。不可达时就会看到 "captcha not available"。
+
 Cookie 值从不进入插件 config、路由返回值、日志或客户端存储。
 
 ## 安全模型

@@ -127,6 +127,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [cookieValue, setCookieValue] = useState('')
   const [busy, setBusy] = useState<'login' | 'cookie' | undefined>(undefined)
   const [frameEscaped, setFrameEscaped] = useState(false)
+  const [embeddedLoginHint, setEmbeddedLoginHint] = useState(false)
 
   // Same-origin detection: if the iframe document navigated itself outside
   // the proxy prefix (site anti-framing JS), surface a hint instead of a
@@ -192,7 +193,15 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           else setNote({ ok: false, text: done.error ?? '' })
           return
         }
-        case 'url-change':
+        case 'url-change': {
+          const href = typeof (data as { href?: unknown }).href === 'string'
+            ? (data as { href: string }).href
+            : ''
+          // CAPTCHA cannot run inside the embedded origin (domain-locked
+          // site key), so flag login pages and steer to the popup/cookie.
+          setEmbeddedLoginHint(href.includes('/login'))
+          return
+        }
         case 'snapshot-saved':
         default:
           return
@@ -365,6 +374,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           onLoad={checkFrameLocation}
         />
         {frameEscaped && <div className="dso-hint" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>{tt('status.frameBust')}</div>}
+        {embeddedLoginHint && <div className="dso-hint" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>{tt('status.embeddedLoginHint')}</div>}
         {selectedText !== undefined
           ? <button className="dso-quote-cta" onClick={onQuoteSelected}>{tt('quote.cta')}</button>
           : null}

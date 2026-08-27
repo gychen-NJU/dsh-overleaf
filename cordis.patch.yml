@@ -12,6 +12,7 @@
         baseUrl: 'https://www.overleaf.com'
         browserChannel: auto
         browserPath: ''
+        loginProxyServer: ''
         loginTimeoutMs: 600000
         selectionQuoteEnabled: true
         cursorInsertEnabled: true
