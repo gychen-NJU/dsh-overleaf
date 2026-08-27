@@ -73,7 +73,7 @@ async function main() {
       'x-frame-options': 'DENY',
       'set-cookie': ['overleaf_session2=tok456; Domain=.upstream.test; Path=/; HttpOnly; Secure'],
     })
-    res.end(`<html><head><script src="/js/app.js"></script></head><body>hi<!-- cookies: ${String(req.headers.cookie ?? '')} --></body></html>`)
+    res.end(`<html><head><script>window.siteUrl = "http://127.0.0.1:${upstreamPort}"</script><script src="/js/app.js"></script></head><body>hi<!-- cookies: ${String(req.headers.cookie ?? '')} --></body></html>`)
   })
   upstream.on('upgrade', (req, socket) => {
     upgradesSeen += 1
@@ -151,6 +151,10 @@ async function main() {
   assert.equal(htmlRes.headers.get('x-frame-options'), null, 'XFO removed')
   assert.ok(htmlBody.includes('overleaf_session2=stored-token'), 'stored credential rode upstream verbatim')
   assert.ok(!htmlBody.includes('conflicting-browser-value'), 'browser-side session cookie must not leak upstream')
+  // 7. siteUrl rebasing: the app's own origin string must become the proxy
+  // prefix so SPA-built links never escape to the real site.
+  assert.ok(htmlBody.includes('window.siteUrl = "/overleaf-proxy"'), `siteUrl rebased:\n${htmlBody.slice(0, 400)}`)
+  assert.ok(!htmlBody.includes(`http://127.0.0.1:${upstreamPort}`), 'target origin string fully scrubbed from HTML')
   const cookieHeaders = htmlRes.headers.getSetCookie?.() ?? []
   assert.equal(cookieHeaders.length, 1, `set-cookie passthrough (${cookieHeaders.join(' | ')})`)
   assert.ok(!cookieHeaders[0].includes('Domain='), 'domain attr stripped')

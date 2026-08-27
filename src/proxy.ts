@@ -42,9 +42,26 @@ function rebaseAttributeUrl(url: string, prefix: string): string {
   return url.startsWith('/') ? `${prefix}${url}` : url
 }
 
-/** Rewrite root-relative resource references inside one HTML body. */
-export function rewriteHtml(html: string, prefix: string, injectScriptSrc: string | undefined): string {
+/**
+ * Rewrite one HTML body for same-origin serving:
+ *  1. every occurrence of the TARGET ORIGIN string becomes the proxy prefix,
+ *     so apps that build internal links/API/socket URLs from an embedded
+ *     `siteUrl` (Overleaf does exactly this) stay inside the proxy instead of
+ *     navigating the iframe to the real site, where X-Frame-Options blocks
+ *     the load and clicks appear dead;
+ *  2. root-relative attribute references become proxy-rooted;
+ *  3. the bridge script (and via it the runtime URL wrappers) is injected.
+ */
+export function rewriteHtml(
+  html: string,
+  prefix: string,
+  injectScriptSrc: string | undefined,
+  targetOrigin: string | undefined,
+): string {
   let out = html.replaceAll('"//', '"https://')
+  if (targetOrigin !== undefined && targetOrigin !== '') {
+    out = out.split(targetOrigin).join(prefix)
+  }
   // Root-relative attribute references become proxy-rooted so assets issued by
   // static markup resolve back through this plugin instead of hitting the DSH
   // shell's own fallback routes.
@@ -355,7 +372,7 @@ async function deliverResponse(
       return
     }
     try {
-      const body = rewriteHtml(Buffer.concat(chunks).toString('utf8'), PROXY_PREFIX, injectScriptSrc)
+      const body = rewriteHtml(Buffer.concat(chunks).toString('utf8'), PROXY_PREFIX, injectScriptSrc, target.origin)
       const payload = Buffer.from(body, 'utf8')
       const finalHeaders: Record<string, string | string[]> = { ...headers }
       finalHeaders['content-length'] = String(payload.byteLength)
