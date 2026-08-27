@@ -19,6 +19,7 @@ import { Config, resolveConfig } from './config.ts'
 import type { ResolvedConfig, WorkbenchConfig } from './config.ts'
 import { OVERLEAF_WORKBENCH_COOKIE } from './credentials.ts'
 import { loginViaCdp } from './login-cdp.ts'
+import { validateCookieHeader } from './cookie-validate.ts'
 import { ReverseProxy, PROXY_PREFIX } from './proxy.ts'
 import { renderBridgeScript } from './inject-script.ts'
 import type {
@@ -102,6 +103,12 @@ export class OverleafWorkbenchService extends Service {
   private config: ResolvedConfig
   private proxy: ReverseProxy
   private readonly bridgeScript: string
+
+  /** Background CDP login bookkeeping (client polls /login-status). */
+  private loginRunning = false
+  private loginStartedAt = 0
+  private loginResult: WorkbenchLoginResult | undefined
+  private loginError: string | undefined
 
   constructor(ctx: Context, config: WorkbenchConfig) {
     super(ctx, 'overleaf-workbench')
@@ -199,15 +206,40 @@ export class OverleafWorkbenchService extends Service {
   private registerRoutes(): void {
     // JSON API routes.
     this.route('/overleaf/workbench/status', () => this.status())
+    // Login runs in the background: the route returns immediately and the
+    // client polls /login-status, so a page refresh or slow CDP wait never
+    // wedges the toolbar button for minutes.
     this.route('/overleaf/workbench/login', async (payload) => {
+      if (this.loginRunning) return { kind: 'pending' as const }
       const browserChannel = stringField(payload, 'browserChannel')
       const channel = browserChannel !== undefined && ['auto', 'default', 'msedge', 'chrome', 'real'].includes(browserChannel)
         ? browserChannel as ResolvedConfig['browserChannel']
         : undefined
-      const result = await this.login(channel, stringField(payload, 'browserPath'))
-      await this.refreshCredential()
-      return result
+      const browserPath = stringField(payload, 'browserPath')
+      this.loginRunning = true
+      this.loginStartedAt = Date.now()
+      this.loginResult = undefined
+      this.loginError = undefined
+      void this.login(channel, browserPath)
+        .then(async result => {
+          this.loginResult = result
+          await this.refreshCredential()
+        })
+        .catch((error: unknown) => {
+          this.loginError = error instanceof Error ? error.message : String(error)
+        })
+        .finally(() => {
+          this.loginRunning = false
+          void this.refreshCredential().catch(() => undefined)
+        })
+      return { kind: 'started' as const }
     })
+    this.route('/overleaf/workbench/login-status', async () => ({
+      running: this.loginRunning,
+      elapsedMs: this.loginRunning ? Date.now() - this.loginStartedAt : 0,
+      ...(this.loginResult !== undefined ? { result: this.loginResult } : {}),
+      ...(this.loginError !== undefined ? { error: this.loginError } : {}),
+    }))
     this.route('/overleaf/workbench/cookie', async (payload) => {
       const cookie = stringField(payload, 'cookie')
       if (cookie === undefined || cookie.trim() === '') throw new Error('dsh-overleaf: cookie route requires a non-empty cookie header line')
@@ -301,6 +333,7 @@ export class OverleafWorkbenchService extends Service {
     return await loginViaCdp(this.ctx.credentials, {
       loginUrl: `${this.config.baseUrl}/login`,
       targetHost: target.hostname,
+      baseUrl: this.config.baseUrl,
       projectUrlPrefix: `${this.config.baseUrl}/project`,
       browserChannel: browserChannel ?? this.config.browserChannel,
       ...(browserPath !== undefined && browserPath.trim() !== ''
@@ -314,22 +347,12 @@ export class OverleafWorkbenchService extends Service {
   }
 
   /**
-   * Store a cookie header line only after the upstream accepts it as a live
-   * session (validates with a redirect-manual GET against /project).
+   * Store a cookie header line after a tolerant upstream check. The check
+   * accepts standard Overleaf (200 on /project) and TeXPage-style deployments
+   * (dashboard redirect away from /login); see cookie-validate.ts.
    */
   async saveCookie(cookie: string): Promise<void> {
-    const response = await fetch(`${this.config.baseUrl}/project`, {
-      headers: { cookie, accept: 'text/html' },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (response.status !== 200) {
-      const location = response.headers.get('location') ?? ''
-      throw new Error(
-        `dsh-overleaf: cookie rejected by ${this.config.baseUrl} (HTTP ${response.status}`
-        + `${location === '' ? '' : ` -> ${location}`}); include the httpOnly overleaf_session2 value`,
-      )
-    }
+    await validateCookieHeader(cookie, this.config.baseUrl)
     await this.ctx.credentials.set(OVERLEAF_WORKBENCH_COOKIE, cookie)
   }
 

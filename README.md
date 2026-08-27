@@ -1,8 +1,8 @@
-﻿# dsh-overleaf
+# dsh-overleaf
 
-[English](README.md) | [涓枃](README.zh.md)
+[English](README.md) | [中文](README.zh.md)
 
-An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It adds a fourth tab next to `Chat / Trajectory / Context` on the session page: the tab loads your Overleaf site (public cloud or self-hosted such as `https://tex.nju.edu.cn`) through a same-origin reverse proxy, so the page renders and **stays fully operable** 鈥?editing, compiling, PDF preview 鈥?while the native DSH composer stays below it, with selection quoting, caret insertion, and LaTeX assist panels wired between the two.
+An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It adds a fourth tab next to `Chat / Trajectory / Context` on the session page: the tab loads your Overleaf site (public cloud or self-hosted such as `https://tex.nju.edu.cn`) through a same-origin reverse proxy, so the page renders and **stays fully operable** — editing, compiling, PDF preview — while the native DSH composer stays below it, with selection quoting, caret insertion, and LaTeX assist panels wired between the two.
 
 ```
 +--------------------------------------------------------------+
@@ -26,19 +26,19 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 
 ## Why it exists
 
-Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a plain `<iframe src="https://tex.nju.edu.cn">` is refused by browsers. This plugin ships an HTTP/1.1 reverse proxy inside the DSH host process: all browser traffic goes to `/overleaf-proxy/<original-path>` which forwards to your configured upstream origin 鈥?one fixed origin, locked by configuration, no open SSRF surface. Because the iframe and the GUI then share one origin, browser-level bridges become possible: text selections flow out of the embedded editor into the composer as structured quotes, and generated content can be written back at the editor caret.
+Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a plain `<iframe src="https://tex.nju.edu.cn">` is refused by browsers. This plugin ships an HTTP/1.1 reverse proxy inside the DSH host process: all browser traffic goes to `/overleaf-proxy/<original-path>` which forwards to your configured upstream origin — one fixed origin, locked by configuration, no open SSRF surface. Because the iframe and the GUI then share one origin, browser-level bridges become possible: text selections flow out of the embedded editor into the composer as structured quotes, and generated content can be written back at the editor caret.
 
 ## Feature map (spec coverage)
 
 | Requirement | Status |
 |---|---|
-| R1 路 fourth session-page tab | `conversation.view` entry `id:"overleaf"`, `order:30`; visible whenever the tab bar shows (`tabs >= 2`) |
-| R2 路 configurable site address | Settings page (`Settings > Plugins > Plugin configuration > dsh-overleaf`) edits `baseUrl`; saving hot-swaps the proxy target without a restart |
-| R3 路 original site features usable | Streaming reverse proxy preserves paths and query strings; responses pass through minus framing headers; small HTML bodies get link/asset rebasing plus the bridge script |
-| R4 路 native composer below | The view replaces only the message area; composer, workspace recording, deliverables untouched |
-| R5 路 selection quoting | `selectionchange` in the iframe surfaces a floating quote button; clicking inserts a structured quote chip through the official reference pipeline (`inputTriggers.registerSource({name:'quote-ref'})` codec), falling back to plain-text block quotes when absent |
-| R6 路 generate at caret | Template inserts (section/subsection/figure/table/equation/BibTeX) and free-form paste write to the live cursor through CodeMirror APIs (CM5 primary, CM6 probe, editable fallback). Auto-writing model replies is on the roadmap; lane type documented as required by the spec |
-| R7 路 assist features | Assist panel: document outline extracted from the live editor buffer with jump-to-line flashing; login/logout/cookie management; status reporting (`editorAssistEnabled` toggle = `assistPanelEnabled`) |
+| R1 · fourth session-page tab | `conversation.view` entry `id:"overleaf"`, `order:30`; visible whenever the tab bar shows (`tabs >= 2`) |
+| R2 · configurable site address | Settings page (`Settings > Plugins > Plugin configuration > dsh-overleaf`) edits `baseUrl`; saving hot-swaps the proxy target without a restart |
+| R3 · original site features usable | Streaming reverse proxy preserves paths and query strings; responses pass through minus framing headers; small HTML bodies get link/asset rebasing plus the bridge script |
+| R4 · native composer below | The view replaces only the message area; composer, workspace recording, deliverables untouched |
+| R5 · selection quoting | `selectionchange` in the iframe surfaces a floating quote button; clicking inserts a structured quote chip through the official reference pipeline (`inputTriggers.registerSource({name:'quote-ref'})` codec), falling back to plain-text block quotes when absent |
+| R6 · generate at caret | Template inserts (section/subsection/figure/table/equation/BibTeX) and free-form paste write to the live cursor through CodeMirror APIs (CM5 primary, CM6 probe, editable fallback). Auto-writing model replies is on the roadmap; lane type documented as required by the spec |
+| R7 · assist features | Assist panel: document outline extracted from the live editor buffer with jump-to-line flashing; login/logout/cookie management; status reporting (`editorAssistEnabled` toggle = `assistPanelEnabled`) |
 
 ## Installation
 
@@ -49,7 +49,7 @@ The npm package name is occupied by another project, so this plugin distributes 
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
 # From a release asset:
-dsh plugin --profile web add ./dsh-overleaf-0.1.1.tgz
+dsh plugin --profile web add ./dsh-overleaf-0.1.2.tgz
 ```
 
 Then restart the web service once (client bundles join the boot graph at startup):
@@ -130,15 +130,15 @@ Inside the proxied document the bridge script installs defensive wrappers (`fetc
 
 Two paths, both feeding the same credential store:
 
-- **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds default + installed Chromium builds; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Sign in once; the plugin polls `Storage.getCookies`/`Network.getAllCookies` until an `overleaf_session*` cookie for the configured host exists AND a page has reached `<baseUrl>/project*`. The cookie line stores into `ctx.credentials` (`OVERLEAF_WORKBENCH_COOKIE`) and rides every proxied request afterwards.
-- **Manual paste**: DevTools copy of the Cookie header line pasted through the toolbar dialog; validated against `<baseUrl>/project` with a redirect-manual GET before persisting.
+- **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds default + installed Chromium builds; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Sign in once and keep that window open; the plugin polls `Storage.getCookies`/`Network.getAllCookies` until (1) at least one non-preference cookie exists for the configured host, (2) a tab sits on the origin outside its login/SSO pages, and (3) the assembled header passes a tolerant server-side check. This works for standard Overleaf AND TeXPage-based deployments (such as `tex.nju.edu.cn`) whose session cookie names differ. Closing the login window early aborts capture immediately — paste the cookie instead. The login route returns immediately and the view polls progress, so the toolbar never wedges.
+- **Manual paste**: DevTools copy of the Cookie header line pasted through the toolbar dialog; validated with the same tolerant check (200, or a redirect away from login pages) before persisting.
 
 No cookie value ever passes through plugin config, route payloads (beyond your paste), logs, or client storage.
 
 ## Security model
 
 - All plugin routes are loopback-fenced at the socket level (`127.0.0.1`/`::1`); non-loopback callers get 403 before handlers read bodies.
-- The proxy targets exactly one configured origin 鈥?URL parsing rejects scheme/path/host overrides, so there is no open relay surface.
+- The proxy targets exactly one configured origin — URL parsing rejects scheme/path/host overrides, so there is no open relay surface.
 - Framing protections are relaxed only for this user-chosen upstream, served to loopback clients that deliberately asked for it; headers are otherwise preserved.
 - Treat `baseUrl` like any tool allowed to hold your LaTeX account session: configure private/internal Overleaf instances only if your workstation is the trust boundary.
 - Cookies are forwarded but never echoed in API responses; logout removes the stored credential immediately.
@@ -147,7 +147,7 @@ No cookie value ever passes through plugin config, route payloads (beyond your p
 ## Known limitations
 
 - Cookies carry their upstream flags: `Secure` cookies are accepted over `http://127.0.0.1:3080` on modern Chrome/Firefox/Edge because loopback is trustworthy, but old browsers may drop them; host-side injection still works regardless.
-- Exact WS match means client code must reach `/overleaf-proxy/socket.io[/]` 鈥?the bridge wrapper rewrites the standard paths; exotic transports bypassing it fall back to polling.
+- Exact WS match means client code must reach `/overleaf-proxy/socket.io[/]` — the bridge wrapper rewrites the standard paths; exotic transports bypassing it fall back to polling.
 - Pure-client frameworks that compute URLs after load are covered by wrappers and `<base>`; anything opening sockets outside these paths needs manual routing rules.
 - CM6 support probes common handle locations; should Overleaf finish its CM6 migration with different internals, template inserts degrade to the editable-focus fallback.
 - A blank vs repeated render on some public-cloud project pages may need rebase tweaks per instance version; enable `DSH_OVERLEAF_DEBUG=1` on the host to log stripped CSP frames.
@@ -161,7 +161,7 @@ pnpm test         # smoke-offline.mjs + smoke-live.mjs (no DSH instance needed)
 pnpm typecheck
 ```
 
-Build produces `lib/index.js` (node half, ESM) and `lib/client.js` (browser half, lazy-CJS closure registered via `window.__ModuleLoader__.load({ id:'dsh-overleaf', factory })` 鈥?the module id MUST equal the npm package name, which is what `dsh-client-modules` matches each served `/plugins/<pkg>/client.js` bundle against). Only React (+jsx-runtime) may be required from platform seeds in the client bundle; everything else inlines 鈥?the purity gate mirrors the community convention.
+Build produces `lib/index.js` (node half, ESM) and `lib/client.js` (browser half, lazy-CJS closure registered via `window.__ModuleLoader__.load({ id:'dsh-overleaf', factory })` — the module id MUST equal the npm package name, which is what `dsh-client-modules` matches each served `/plugins/<pkg>/client.js` bundle against). Only React (+jsx-runtime) may be required from platform seeds in the client bundle; everything else inlines — the purity gate mirrors the community convention.
 
 To try local changes in a real profile, pack and add the tarball, restart the web service, and watch both DevTools consoles (shell + iframe) prefixed `[dsh-overleaf]`.
 

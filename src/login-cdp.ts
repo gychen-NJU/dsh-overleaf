@@ -19,6 +19,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { OVERLEAF_WORKBENCH_COOKIE } from './credentials.ts'
+import { isSessionishCookie, locationLooksLikeLogin, validateCookieHeader } from './cookie-validate.ts'
 import type { WorkbenchLoginResult } from './types.ts'
 import type { LoginProfileMode, OverleafBrowserChannel } from './config.ts'
 
@@ -33,6 +34,8 @@ export interface LoginOptions {
   loginUrl: string
   /** Origin whose cookies belong to this account (host suffix match). */
   targetHost: string
+  /** Upstream origin (used for generic landing-page and validation checks). */
+  baseUrl: string
   /** Project URL prefix proving the browser login reached a real session. */
   projectUrlPrefix: string
   browserChannel: OverleafBrowserChannel
@@ -323,14 +326,27 @@ async function pageTargetUrls(port: number): Promise<string[]> {
     .map(target => target.url)
 }
 
-/** Read target-origin cookies through CDP once the user has logged in. */
+/**
+ * Read target-origin cookies through CDP once the user has logged in.
+ *
+ * Detection is product-agnostic: the upstream may be standard Overleaf (where
+ * the session cookie is `overleaf_session2`) or a TeXPage-based deployment
+ * (self-hosted NJU and others) whose session cookie uses an entirely
+ * different name and whose dashboard may live at any path. Success therefore
+ * requires ALL of:
+ *  1. at least one non-preference cookie scoped to the target host,
+ *  2. a browser tab sitting on the target origin OUTSIDE its login/SSO pages,
+ *  3. server-side validation of the assembled header against /project
+ *     (tolerant: 200, 3xx-away-from-login, or 404 all count as authenticated).
+ */
 async function captureCookies(
   browserCdp: CdpClient,
   cdpPort: number,
-  options: Pick<LoginOptions, 'targetHost' | 'projectUrlPrefix'>,
+  options: Pick<LoginOptions, 'targetHost' | 'baseUrl'>,
   timeoutMs: number,
 ): Promise<string> {
   const bareHost = options.targetHost.replace(/^www\./, '')
+  const origin = options.baseUrl.replace(/\/+$/, '')
   const deadline = Date.now() + timeoutMs
   let cookieCdp = browserCdp
   let pageCdp: CdpClient | undefined
@@ -340,17 +356,28 @@ async function captureCookies(
         const cookies = await readCookiesFrom(cookieCdp)
         const siteCookies = cookies.filter(cookie =>
           cookie.domain === bareHost || cookie.domain.endsWith(`.${bareHost}`))
-        const header = siteCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
-        const authenticated = siteCookies.some(cookie =>
-          /^(overleaf_session|sharelatex_session)/i.test(cookie.name) && cookie.value !== '')
-        if (authenticated && header !== '') {
-          let reachedProject = false
+        const sessionish = siteCookies.filter(cookie => isSessionishCookie(cookie.name, cookie.value))
+        if (sessionish.length > 0) {
+          const header = siteCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+          let onLoggedInPage = false
           try {
-            reachedProject = (await pageTargetUrls(cdpPort)).some(url => url.startsWith(options.projectUrlPrefix))
+            onLoggedInPage = (await pageTargetUrls(cdpPort)).some(url => {
+              if (!url.startsWith(`${origin}/`)) return false
+              const path = url.slice(origin.length)
+              return !locationLooksLikeLogin(path)
+            })
           } catch {
-            reachedProject = false
+            onLoggedInPage = false
           }
-          if (reachedProject) return header
+          if (onLoggedInPage) {
+            try {
+              await validateCookieHeader(header, options.baseUrl)
+              return header
+            } catch {
+              // Not authenticated yet (or the probe page bounced to /login):
+              // keep polling until the user finishes the login flow.
+            }
+          }
         }
       } catch (error) {
         pageCdp?.close()
@@ -364,7 +391,7 @@ async function captureCookies(
       }
       await sleep(2_000)
     }
-    throw new Error('dsh-overleaf: did not detect a logged-in Overleaf session before timeout')
+    throw new Error('dsh-overleaf: did not detect a logged-in session before timeout — complete the sign-in inside the opened browser window and keep it open until the workbench reports success')
   } finally {
     pageCdp?.close()
   }
@@ -410,7 +437,17 @@ async function loginWithExecutable(executablePath: string, options: LoginOptions
       connectCdpWithRetry(cdpPort, 12_000),
       browserProcessFailure(child),
     ])
-    return await captureCookies(cdp, cdpPort, options, options.timeoutMs)
+    // Abandon capture the moment the user closes the login window instead of
+    // polling a dead CDP endpoint until the full timeout elapses.
+    const browserExited = new Promise<never>((_, reject) => {
+      child.once('exit', (code, signal) => {
+        reject(new Error(`dsh-overleaf: the login browser was closed before the session was captured (code=${String(code)}, signal=${String(signal)}); keep the window open until the workbench reports success, or paste the cookie manually`))
+      })
+    })
+    return await Promise.race([
+      captureCookies(cdp, cdpPort, options, options.timeoutMs),
+      browserExited,
+    ])
   } catch (error) {
     if (realProfile) {
       throw new Error(
@@ -474,7 +511,7 @@ export async function loginViaCdp(
     kind: 'manual',
     loginUrl: options.loginUrl,
     instructions: failures.length === 0
-      ? `Log in to Overleaf in your default browser, then copy the httpOnly overleaf_session2 cookie from DevTools > Application > Cookies > ${options.targetHost}; document.cookie cannot read it because it is httpOnly. Paste it through the workbench cookie dialog.`
-      : `Automatic cookie capture failed for: ${failures.join(' | ')}. Log in in the opened browser, then copy the httpOnly overleaf_session2 cookie from DevTools > Application > Cookies and paste it through the workbench cookie dialog.`,
+      ? `Log in to ${options.targetHost} in your default browser, then copy the full Cookie request-header line (DevTools > Network > any request to ${options.targetHost} > Request Headers > Cookie; it must include the httpOnly session cookie such as overleaf_session2). Paste it through the workbench cookie dialog.`
+      : `Automatic cookie capture failed for: ${failures.join(' | ')}. Log in in the opened browser, then copy the full Cookie request-header line from DevTools > Network (must include the httpOnly session cookie) and paste it through the workbench cookie dialog.`,
   }
 }

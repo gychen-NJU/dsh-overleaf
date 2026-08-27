@@ -32,7 +32,21 @@ export interface WorkbenchStatusWire {
   baseUrl: string
   embedUrl: string
   proxyReady: boolean
-  editorAssistEnabled?: boolean | undefined
+  assistPanelEnabled?: boolean | undefined
+}
+
+export interface LoginResultWire {
+  kind: 'automatic' | 'manual'
+  loginUrl?: string | undefined
+  instructions?: string | undefined
+}
+
+/** Response of /overleaf/workbench/login-status. */
+export interface LoginStatusWire {
+  running: boolean
+  elapsedMs: number
+  result?: LoginResultWire | undefined
+  error?: string | undefined
 }
 
 export interface EmbedInfo {

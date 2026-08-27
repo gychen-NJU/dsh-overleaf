@@ -12,7 +12,7 @@ import {
   insertQuoteIntoComposer, sessionWorkspaceHint,
 } from './workbench.ts'
 import { postWorkbench } from './wire.ts'
-import type { EmbedInfo, WorkbenchStatusWire } from './wire.ts'
+import type { EmbedInfo, LoginStatusWire, WorkbenchStatusWire } from './wire.ts'
 
 /** Message shape sent by the embedded bridge script. */
 export interface BridgeMessage {
@@ -126,6 +126,19 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
   const [cookieValue, setCookieValue] = useState('')
   const [busy, setBusy] = useState<'login' | 'cookie' | undefined>(undefined)
+  const [frameEscaped, setFrameEscaped] = useState(false)
+
+  // Same-origin detection: if the iframe document navigated itself outside
+  // the proxy prefix (site anti-framing JS), surface a hint instead of a
+  // silently dead pane.
+  const checkFrameLocation = useCallback((): void => {
+    try {
+      const href = frameRef.current?.contentWindow?.location.href ?? ''
+      setFrameEscaped(href !== '' && !href.includes('/overleaf-proxy'))
+    } catch {
+      /* navigation still in flight; ignore */
+    }
+  }, [])
 
   const selectionQuoteEnabled = embedInfo?.selectionQuoteEnabled ?? true
   const cursorInsertEnabled = embedInfo?.cursorInsertEnabled ?? true
@@ -227,20 +240,55 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     requestOutline()
   }, [requestOutline])
 
+  // Login flow: start it in the background, then poll /login-status so a
+  // slow CDP wait (or even a page refresh) never wedges the toolbar.
+  useEffect(() => {
+    if (busy !== 'login') return
+    let disposed = false
+    const startedAt = Date.now()
+    const tick = (): void => {
+      if (disposed) return
+      void postWorkbench<LoginStatusWire>('/overleaf/workbench/login-status')
+        .then(current => {
+          if (disposed) return
+          if (current.running) {
+            setNote({ ok: true, text: `${tt('status.loginPending').replace('{seconds}', String(Math.round((Date.now() - startedAt) / 1000)))}` })
+            return
+          }
+          setBusy(undefined)
+          if (current.error !== undefined) {
+            setNote({ ok: false, text: current.error })
+          } else if (current.result !== undefined) {
+            setNote(current.result.kind === 'automatic'
+              ? { ok: true, text: 'OK' }
+              : { ok: false, text: current.result.instructions ?? tt('status.loginPending') })
+          }
+          refreshStatus()
+        })
+        .catch(() => { /* transient network hiccups: keep polling */ })
+    }
+    tick()
+    const timer = setInterval(tick, 3_000)
+    return () => {
+      disposed = true
+      clearInterval(timer)
+    }
+  }, [busy, refreshStatus, tt])
+
   const startLogin = useCallback((): void => {
-    setBusy('login')
-    setNote({ ok: true, text: 'CDP login window opening; finish sign-in there...' })
-    void postWorkbench<{ kind: string; instructions?: string }>('/overleaf/workbench/login', {}, 15 * 60_000)
+    if (busy !== undefined) return
+    void postWorkbench<{ kind: string }>('/overleaf/workbench/login', {})
       .then(result => {
-        if (result.kind === 'automatic') setNote({ ok: true, text: 'login captured' })
-        else setNote({ ok: false, text: result.instructions ?? 'manual login fallback' })
+        if (result.kind === 'pending') {
+          // A login started earlier (maybe before a refresh) is still running.
+          setBusy('login')
+          return
+        }
+        setBusy('login')
+        setNote({ ok: true, text: tt('status.loginWindowOpened') })
       })
       .catch(error => setNote({ ok: false, text: String(error) }))
-      .finally(() => {
-        setBusy(undefined)
-        refreshStatus()
-      })
-  }, [refreshStatus])
+  }, [busy, tt])
 
   const saveCookie = useCallback((): void => {
     if (cookieValue.trim() === '') return
@@ -314,7 +362,9 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           src="/overleaf-proxy/"
           title="Overleaf"
           allow="clipboard-read; clipboard-write; fullscreen"
+          onLoad={checkFrameLocation}
         />
+        {frameEscaped && <div className="dso-hint" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>{tt('status.frameBust')}</div>}
         {selectedText !== undefined
           ? <button className="dso-quote-cta" onClick={onQuoteSelected}>{tt('quote.cta')}</button>
           : null}
