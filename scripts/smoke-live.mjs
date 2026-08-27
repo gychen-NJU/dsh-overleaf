@@ -73,7 +73,7 @@ async function main() {
       'x-frame-options': 'DENY',
       'set-cookie': ['overleaf_session2=tok456; Domain=.upstream.test; Path=/; HttpOnly; Secure'],
     })
-    res.end('<html><head><script src="/js/app.js"></script></head><body>hi</body></html>')
+    res.end(`<html><head><script src="/js/app.js"></script></head><body>hi<!-- cookies: ${String(req.headers.cookie ?? '')} --></body></html>`)
   })
   upstream.on('upgrade', (req, socket) => {
     upgradesSeen += 1
@@ -126,7 +126,13 @@ async function main() {
   if (initSym === undefined) throw new Error('WebServer init symbol not found')
   await serverB[initSym]()
 
-  new OverleafWorkbenchService(ctxB, { baseUrl: `http://127.0.0.1:${upstreamPort}` })
+  // Simulate a stored credential (as if the user pasted a cookie): seeded
+  // BEFORE construction so the boot-time credential probe picks it up, and
+  // the proxy must send it VERBATIM upstream, ignoring any conflicting
+  // browser-side jar.
+  credentialsStore.set('OVERLEAF_WORKBENCH_COOKIE', 'overleaf_session2=stored-token')
+  const workbench = new OverleafWorkbenchService(ctxB, { baseUrl: `http://127.0.0.1:${upstreamPort}` })
+  void workbench
 
   const PORT = serverB.port
   if (!PORT) throw new Error('webserver did not report a bound port')
@@ -135,12 +141,16 @@ async function main() {
   /* ---------------------- exercise everything ------------------------ */
 
   // 1+2. HTML rebase, bridge injection, XFO removal, cookie scoping.
-  const htmlRes = await fetch(`${base}/overleaf-proxy/project/demo`)
+  const htmlRes = await fetch(`${base}/overleaf-proxy/project/demo`, {
+    headers: { cookie: 'overleaf_session2=conflicting-browser-value; gclb=affinity' },
+  })
   assert.equal(htmlRes.status, 200, `html proxy status ${htmlRes.status}`)
   const htmlBody = await htmlRes.text()
   assert.ok(htmlBody.includes('src="/overleaf-proxy/js/app.js"'), `rebased:\n${htmlBody.slice(0, 300)}`)
   assert.ok(htmlBody.includes('/overleaf/workbench/bridge.js'), 'bridge injected')
   assert.equal(htmlRes.headers.get('x-frame-options'), null, 'XFO removed')
+  assert.ok(htmlBody.includes('overleaf_session2=stored-token'), 'stored credential rode upstream verbatim')
+  assert.ok(!htmlBody.includes('conflicting-browser-value'), 'browser-side session cookie must not leak upstream')
   const cookieHeaders = htmlRes.headers.getSetCookie?.() ?? []
   assert.equal(cookieHeaders.length, 1, `set-cookie passthrough (${cookieHeaders.join(' | ')})`)
   assert.ok(!cookieHeaders[0].includes('Domain='), 'domain attr stripped')

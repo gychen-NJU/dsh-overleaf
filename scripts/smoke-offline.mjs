@@ -110,7 +110,26 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+
+  // 0. Cookie authority regression (the v0.1.5 login-page bug): a browser-side
+  // anonymous/stale twin of the session cookie must NEVER override the stored
+  // credential on upstream requests.
+  {
+    const fakeReq = {
+      headers: { cookie: 'overleaf_session2=stale-browser-value; gclb=affinity' },
+      method: 'GET',
+    }
+    const target = new URL('https://www.overleaf.com/project')
+    const out = buildUpstreamHeaders(fakeReq, target, 'overleaf_session2=stored-credential')
+    assert.equal(out.cookie, 'overleaf_session2=stored-credential',
+      `stored credential must be sent verbatim, got: ${String(out.cookie)}`)
+    const outNoStored = buildUpstreamHeaders(fakeReq, target, undefined)
+    assert.equal(outNoStored.cookie, 'overleaf_session2=stale-browser-value; gclb=affinity',
+      'without a stored credential the browser cookies pass through')
+    // mergeCookieHeaders keeps documented helper semantics: extra (stored) wins.
+    assert.equal(mergeCookieHeaders('overleaf_session2=stale', 'overleaf_session2=stored'), 'overleaf_session2=stored')
+  }
 
   // 1. Mount against a fake context and confirm every route family lands.
   const { ctx, routes, upgrades, credentialsStore } = fakeCtx()

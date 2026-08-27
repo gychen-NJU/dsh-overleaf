@@ -94,13 +94,15 @@ export function scopeSetCookieToHost(setCookieLine: string): string {
 }
 
 /**
- * Merge two Cookie header strings without duplicated names; later entries win,
- * so a stored CDP-captured credential takes precedence over a stale
- * browser-side twin of the same cookie name.
+ * Merge two Cookie header strings without duplicated names; later entries win.
+ * NOTE: since v0.1.6 the proxy no longer mixes browser and stored cookies for
+ * upstream auth requests — the stored credential is sent verbatim when it
+ * exists (a browser-side anonymous twin of the session cookie must never be
+ * able to override it). This helper remains for tests and external callers.
  */
 export function mergeCookieHeaders(base: string | undefined, extra: string | undefined): string | undefined {
   const entries: string[] = []
-  for (const source of [extra, base]) {
+  for (const source of [base, extra]) {
     if (source === undefined || source.trim() === '') continue
     for (const pair of source.split(';')) {
       const item = pair.trim()
@@ -126,7 +128,7 @@ export function subPathOf(rawUrl: string | undefined, prefix: string): string {
 }
 
 /** Forward selection of inbound request headers toward one upstream request. */
-function buildUpstreamHeaders(
+export function buildUpstreamHeaders(
   req: IncomingMessage,
   target: URL,
   extraCookie: string | undefined,
@@ -146,8 +148,15 @@ function buildUpstreamHeaders(
   headers['host'] = target.host
   // Identity encoding keeps textual bodies rewritable end to end.
   headers['accept-encoding'] = 'identity'
-  const mergedCookie = mergeCookieHeaders(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, extraCookie)
-  if (mergedCookie !== undefined) headers['cookie'] = mergedCookie
+  // The stored credential is authoritative: when present it is sent VERBATIM
+  // and never mixed with the browser's own jar. A stale or anonymous twin of
+  // the session cookie in the browser jar (upstream Set-Cookie passthrough
+  // creates one on every anonymous visit) must never override the login.
+  if (extraCookie !== undefined && extraCookie !== '') {
+    headers['cookie'] = extraCookie
+  } else if (typeof req.headers.cookie === 'string' && req.headers.cookie !== '') {
+    headers['cookie'] = req.headers.cookie
+  }
   return headers
 }
 
@@ -398,8 +407,13 @@ function writeUpgradeRequest(
     }
   }
   if (typeof req.headers.origin === 'string') lines.push(`Origin: ${target.origin}`)
-  const mergedCookie = mergeCookieHeaders(typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined, extraCookie)
-  if (mergedCookie !== undefined) lines.push(`Cookie: ${mergedCookie}`)
+  // Same authoritative-credential rule as the plain HTTP path (see
+  // buildUpstreamHeaders): the stored cookie rides verbatim, never mixed.
+  if (extraCookie !== undefined && extraCookie !== '') {
+    lines.push(`Cookie: ${extraCookie}`)
+  } else if (typeof req.headers.cookie === 'string' && req.headers.cookie !== '') {
+    lines.push(`Cookie: ${req.headers.cookie}`)
+  }
   lines.push('', '')
   upstreamSocket.write(lines.join('\r\n'))
   if (head.length > 0) upstreamSocket.write(head)
