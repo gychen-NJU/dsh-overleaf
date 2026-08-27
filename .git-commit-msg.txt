@@ -1,0 +1,13 @@
+﻿fix(view): land the embedded frame directly on /project
+
+The server side was verified healthy end-to-end (stored credential wins
+over any browser-side session cookie, including empty values; /login for
+an authenticated user bounces to /project; every HTML response is
+no-store). The remaining way a user can land on a login page is browser
+history restoration of the pre-login /login URL or a stale tab snapshot.
+
+The embedded frame and the open-in-new-window entry now target
+/overleaf-proxy/project directly, skipping the root redirect chain and
+making the dashboard the deterministic landing page in every scenario.
+
+version 0.1.5.

@@ -324,6 +324,12 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     [sessionId],
   )
 
+  // Entry point: land directly on the project dashboard instead of the site
+  // root, removing the root->dashboard redirect chain (and any ambiguity
+  // around cached/restored intermediate pages).
+  const embedBase = embedInfo?.embedUrl ?? '/overleaf-proxy/'
+  const embedEntry = `${embedBase}${embedBase.endsWith('/') ? '' : '/'}project`
+
   const templates: Array<[string, string]> = [
     [tt('insert.section'), LATex_TEMPLATES.section],
     [tt('insert.subsection'), LATex_TEMPLATES.subsection],
@@ -341,7 +347,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         <button
           className="dso-btn"
           title={tt('toolbar.openWindow')}
-          onClick={() => { window.open(`${location.origin}/overleaf-proxy/`, '_blank') }}
+          onClick={() => { window.open(`${location.origin}${embedEntry}`, '_blank') }}
         >↗</button>
         <span style={{ flex: 1 }} />
         {busy === 'login'
@@ -368,7 +374,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           ref={frameRef}
           key={nonce}
           className="dso-frame"
-          src="/overleaf-proxy/"
+          src={embedEntry}
           title="Overleaf"
           allow="clipboard-read; clipboard-write; fullscreen"
           onLoad={checkFrameLocation}
