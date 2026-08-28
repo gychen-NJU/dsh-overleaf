@@ -275,18 +275,49 @@ export function renderBridgeScript(): string {
     }
   }
 
+  /* Locate the live CodeMirror 6 EditorView. @codemirror/view stores the
+     view on the .cm-editor DOM node under the key "cmView", but that field
+     is a ContentView wrapper - the EditorView itself sits on its "view"
+     property (and may be nested one level deeper), so unwrap before
+     validating. NOTE: no backticks/`${}` are allowed inside this template
+     literal (see v0.1.10 lesson). */
+  function asEditorView(candidate) {
+    var hop = candidate
+    for (var depth = 0; hop && depth < 4; depth++) {
+      try {
+        if (hop.state && hop.state.doc && typeof hop.dispatch === 'function') return hop
+      } catch (err) {}
+      hop = hop.view
+    }
+    return undefined
+  }
+
   function findCm6() {
     try {
       var roots = document.querySelectorAll('.cm-editor')
       for (var i = 0; i < roots.length; i++) {
         var holder = roots[i]
-        var candidate = holder.cmView
-          || (holder.domEventHandlers && holder.domEventHandlers.view)
-          || (holder.parentNode && holder.parentNode.__codemirrorView)
-          || holder.editor
-        if (candidate && candidate.state && typeof candidate.dispatch === 'function') return candidate
+        var direct = asEditorView(holder.cmView)
+          || asEditorView(holder.editor)
+          || asEditorView(holder.parentNode && holder.parentNode.__codemirrorView)
+        if (direct) return direct
         var inner = holder.querySelector && holder.querySelector('.cm-scroller')
-        if (inner && inner.cmView && inner.cmView.state) return inner.cmView
+        if (inner) {
+          var viaInner = asEditorView(inner.cmView)
+          if (viaInner) return viaInner
+        }
+      }
+      /* Last resort: scan own properties of editor DOM nodes for an object
+         shaped like an EditorView (state.doc + dispatch). */
+      var nodes = document.querySelectorAll('.cm-editor, .cm-content, .cm-scroller')
+      for (var n = 0; n < nodes.length; n++) {
+        var keys = Object.keys(nodes[n] || {})
+        for (var k = 0; k < keys.length; k++) {
+          var value = null
+          try { value = nodes[n][keys[k]] } catch (err) { continue }
+          var found = asEditorView(value)
+          if (found) return found
+        }
       }
       return undefined
     } catch (err) {
