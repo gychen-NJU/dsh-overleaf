@@ -37,9 +37,28 @@ const HOP_BY_HOP = new Set([
   'te', 'trailer', 'transfer-encoding', 'upgrade',
 ])
 
-/** Rebase one root-relative reference against the proxy prefix. */
+/** Rebase one root-relative reference against the proxy prefix. URLs already
+ *  carrying the prefix (double-rebase guard) or pointing at the plugin's own
+ *  routes are left untouched. */
 function rebaseAttributeUrl(url: string, prefix: string): string {
-  return url.startsWith('/') ? `${prefix}${url}` : url
+  if (!url.startsWith('/')) return url
+  if (url.startsWith(`${prefix}/`) || url.startsWith('/overleaf/workbench/')) return url
+  return `${prefix}${url}`
+}
+
+/**
+ * Rebase CSS url(...) / @import references inside one stylesheet body.
+ * (text/css responses are otherwise passed through untouched - un-rebased
+ * `url(/overleaf-logo.svg)`-style references resolve against the shell origin
+ * and 404 in a loop.)
+ */
+export function rewriteCss(css: string, prefix: string): string {
+  const rebased = css.replace(/url\(\s*(['"]?)(\/[^)'"]+)(['"]?)\s*\)/gi,
+    (_match, quote: string, pathValue: string, tail: string) =>
+      `url(${quote}${rebaseAttributeUrl(pathValue, prefix)}${tail})`)
+  return rebased.replace(/(@import\s+)(?!url\()(["'])(\/[^"']+)\2/gi,
+    (_match, lead: string, quote: string, pathValue: string) =>
+      `${lead}${quote}${rebaseAttributeUrl(pathValue, prefix)}${quote}`)
 }
 
 /**
@@ -73,6 +92,7 @@ export function extractCspNonce(csp: string | undefined, html: string | undefine
  *     carrying the response's CSP nonce when one exists ('strict-dynamic'
  *     pages would otherwise block it).
  */
+/** Rewrite root-relative resource references inside one HTML body. */
 export function rewriteHtml(
   html: string,
   prefix: string,
@@ -104,6 +124,12 @@ export function rewriteHtml(
   if (targetOrigin !== undefined && targetOrigin !== '') {
     out = out.split(targetOrigin).join(prefix)
   }
+  // 3. Inline <style> blocks and style="...url(...)" attributes: rebasing
+  //    url(/x) inside them (the duplicate-rebase guard in
+  //    rebaseAttributeUrl keeps already-prefixed URLs intact).
+  out = out.replace(/url\(\s*(['"]?)(\/[^)'"]+)(['"]?)\s*\)/gi,
+    (_match, quote: string, pathValue: string, tail: string) =>
+      `url(${quote}${rebaseAttributeUrl(pathValue, prefix)}${tail})`)
   if (injectScriptSrc !== undefined && !html.includes('dsh-overleaf-bridge')) {
     const nonceAttr = cspNonce !== undefined && cspNonce !== '' ? ` nonce="${cspNonce}"` : ''
     // Bootstrap FIRST: the WS tunnel port the bridge wrappers redirect
@@ -441,9 +467,51 @@ async function deliverResponse(
   const contentTypeHeader = upstreamRes.headers['content-type']
   const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader.toLowerCase() : ''
   const isHtml = contentType.includes('text/html')
+  const isCss = contentType.includes('text/css')
   const { headers, hadFrameCsp } = buildResponseHeaders(upstreamRes.headers, PROXY_PREFIX, target, wsAllowOrigin)
   if (hadFrameCsp && process.env.DSH_OVERLEAF_DEBUG === '1') {
     console.warn('[dsh-overleaf] stripped frame-ancestors CSP for', target.pathname)
+  }
+
+  if (isCss) {
+    // Stylesheets carry url(/x) and @import "/x" references that resolve
+    // against the SHELL origin unless rebased - the editor logo loop-404
+    // was exactly this. Bounded bodies get rebased; huge ones stream raw.
+    const chunksCss: Buffer[] = []
+    let sizeCss = 0
+    let overflowCss = false
+    upstreamRes.on('data', (chunk: Buffer) => {
+      if (overflowCss) return
+      sizeCss += chunk.byteLength
+      if (sizeCss > MAX_REWRITE_BODY_BYTES) {
+        overflowCss = true
+        res.writeHead(upstreamRes.statusCode ?? 502, headers)
+        const remaining = upstreamRes.readableLength > 0 ? [upstreamRes.read()] : []
+        for (const buffered of [...chunksCss, ...remaining.filter(item => item !== null)]) res.write(buffered)
+        upstreamRes.pipe(res)
+        return
+      }
+      chunksCss.push(chunk)
+    })
+    upstreamRes.on('close', settle)
+    upstreamRes.on('end', () => {
+      if (overflowCss) {
+        settle()
+        return
+      }
+      try {
+        const body = rewriteCss(Buffer.concat(chunksCss).toString('utf8'), PROXY_PREFIX)
+        const payload = Buffer.from(body, 'utf8')
+        const finalHeaders: Record<string, string | string[]> = { ...headers }
+        finalHeaders['content-length'] = String(payload.byteLength)
+        res.writeHead(upstreamRes.statusCode ?? 502, finalHeaders)
+        res.end(payload)
+      } catch {
+        res.destroy()
+      }
+      settle()
+    })
+    return
   }
 
   if (!isHtml) {

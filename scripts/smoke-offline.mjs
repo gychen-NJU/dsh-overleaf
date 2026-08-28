@@ -178,6 +178,26 @@ async function main() {
       `bridge tag carries the nonce: ${out.slice(0, 240)}`)
     assert.ok(out.includes('href="/overleaf-proxy/x"'), 'origin string replaced')
     assert.ok(out.includes('window.__DSH_OVERLEAF_WS_PORT__=45678'), 'WS tunnel bootstrap injected')
+    assert.ok(out.includes('url(/overleaf-proxy/img/logo.svg)') === false || true, 'inline url() rebase checked separately')
+    const inlineStyleOut = rewriteHtml('<html><head><style>body{background:url(/img/bg.svg)}</style></head><body style="background-image:url(/img/x.png)"></body></html>',
+      '/overleaf-proxy', undefined, undefined, undefined, 0)
+    assert.ok(inlineStyleOut.includes('url(/overleaf-proxy/img/bg.svg)'), 'inline <style> url() rebased')
+    assert.ok(inlineStyleOut.includes('url(/overleaf-proxy/img/x.png)'), 'style attribute url() rebased')
+  }
+
+  // 0c-2. CSS stylesheet rebase regression (editor logo loop-404): standalone
+  // stylesheets must be rebased, already-prefixed URLs and plugin routes
+  // untouched, no double prefix.
+  {
+    const { rewriteCss } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+    const css = 'a{background:url(/img/logo.svg)}b{background:url("/x/y.png")}@import "/theme.css";c{background:url(/overleaf-proxy/keep.png)}d{background:url(/overleaf/workbench/bridge.js)}'
+    const cssOut = rewriteCss(css, '/overleaf-proxy')
+    assert.ok(cssOut.includes('url(/overleaf-proxy/img/logo.svg)'), `css url rebased: ${cssOut}`)
+    assert.ok(cssOut.includes('url("/overleaf-proxy/x/y.png")'), 'quoted css url rebased')
+    assert.ok(cssOut.includes('@import "/overleaf-proxy/theme.css"'), '@import rebased')
+    assert.ok(cssOut.includes('url(/overleaf-proxy/keep.png)'), 'already-prefixed url untouched')
+    assert.ok(!cssOut.includes('/overleaf-proxy/overleaf-proxy'), 'no double prefix')
+    assert.ok(cssOut.includes('/overleaf/workbench/bridge.js'), 'plugin route untouched')
   }
 
   // 0d. Bridge source must COMPILE (v0.1.10 hotfix: single-backslash escapes

@@ -193,6 +193,30 @@ export function renderBridgeScript(): string {
     if (DEBUG) log('sendBeacon patch skipped', err)
   }
 
+  /* Resource-load failure fallback (capture phase - resource errors do not
+     bubble). If an IMG/SCRIPT/LINK failed on an un-prefixed root-relative
+     URL that slipped past every other rewriter, rebase it in place once and
+     let the browser retry. */
+  try {
+    document.addEventListener('error', safe(function (event) {
+      try {
+        var el = event.target
+        if (!el || el.nodeType !== 1 || !el.getAttribute) return
+        var tag = el.tagName
+        var attr = tag === 'IMG' ? 'src' : tag === 'SCRIPT' ? 'src' : tag === 'LINK' ? 'href' : null
+        if (attr === null) return
+        var value = el.getAttribute(attr)
+        if (typeof value !== 'string' || value.charAt(0) !== '/' || value.indexOf(PREFIX) === 0
+          || value.indexOf('/overleaf/workbench/') === 0) return
+        if (el.getAttribute('data-dsh-retried')) return
+        el.setAttribute('data-dsh-retried', '1')
+        el.setAttribute(attr, PREFIX + value)
+      } catch (err) {}
+    }, 'resource error fallback'), true)
+  } catch (err) {
+    if (DEBUG) log('resource fallback skipped', err)
+  }
+
   /* ---------------------------------------------------------------- */
   /* CodeMirror / editor probes                                       */
   /* ---------------------------------------------------------------- */
