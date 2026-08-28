@@ -13,7 +13,7 @@ import {
 } from './workbench.ts'
 import { postWorkbench } from './wire.ts'
 import type { EmbedInfo, LoginStatusWire, WorkbenchStatusWire } from './wire.ts'
-import { cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
+import { buildSelectionAgentPrompt, cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
 import type { InsertFileSnapshot } from './ai-output.ts'
 
 /** Message shape sent by the embedded bridge script. */
@@ -44,6 +44,14 @@ interface AiOutputWatch {
   cwd: string
   baselineSignature: string
   startedAt: number
+  purpose: 'insert' | 'selection-replace'
+  selection?: EditorSelectionTarget | undefined
+}
+
+interface EditorSelectionTarget {
+  text: string
+  selectionId?: string | undefined
+  engine: 'cm5' | 'cm6' | 'dom'
 }
 
 /** Editor engine reported by the bridge capabilities probe. */
@@ -167,8 +175,12 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [selectedText, setSelectedText] = useState<string | undefined>(undefined)
   const [note, setNote] = useState<{ ok: boolean; text: string } | undefined>(undefined)
   const [panelOpen, setPanelOpen] = useState(false)
-  const [panelTab, setPanelTab] = useState<'insert' | 'outline' | 'status' | 'ai'>('insert')
+  const [panelTab, setPanelTab] = useState<'insert' | 'selection' | 'outline' | 'status'>('insert')
   const [insertDraft, setInsertDraft] = useState('')
+  const [selectionTarget, setSelectionTarget] = useState<EditorSelectionTarget | undefined>(undefined)
+  const [selectionPrompt, setSelectionPrompt] = useState('')
+  const [selectionDraft, setSelectionDraft] = useState('')
+  const [pendingReplacement, setPendingReplacement] = useState<EditorSelectionTarget | undefined>(undefined)
   const [outlineItems, setOutlineItems] = useState<OutlineItem[] | undefined>(undefined)
   const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
   const [cookieValue, setCookieValue] = useState('')
@@ -281,13 +293,22 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   // Bridge message pump.
   useEffect(() => {
     const handler = (event: MessageEvent): void => {
+      if (event.source !== frameRef.current?.contentWindow) return
       const data = event.data as BridgeMessage | undefined
       if (data === undefined || data.ns !== 'dsh-overleaf') return
       switch (data.type) {
         case 'selection': {
-          if (!selectionQuoteEnabled) return
           const text = typeof (data as { text?: unknown }).text === 'string' ? (data as { text: string }).text : undefined
-          if (text !== undefined && text.trim() !== '') setSelectedText(text.trim())
+          if (text === undefined || text.trim() === '') return
+          const rawEngine = (data as unknown as { engine?: unknown }).engine
+          const selectionId = typeof (data as unknown as { selectionId?: unknown }).selectionId === 'string'
+            ? (data as unknown as { selectionId: string }).selectionId
+            : undefined
+          const selectionEngine: EditorSelectionTarget['engine'] = rawEngine === 'cm5' || rawEngine === 'cm6'
+            ? rawEngine
+            : 'dom'
+          setSelectionTarget({ text, selectionId, engine: selectionEngine })
+          if (selectionQuoteEnabled) setSelectedText(text)
           return
         }
         case 'selection-cleared':
@@ -303,6 +324,24 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           const done = data as unknown as { ok?: boolean; error?: string }
           if (done.ok === true) setNote({ ok: true, text: 'OK' })
           else setNote({ ok: false, text: done.error ?? '' })
+          return
+        }
+        case 'selection-replace-done': {
+          const done = data as unknown as { ok?: boolean; error?: string }
+          if (done.ok === true) {
+            setSelectionDraft('')
+            setPendingReplacement(undefined)
+            setSelectionTarget(undefined)
+            setSelectedText(undefined)
+            setNote({ ok: true, text: tt('selection.replaced') })
+          } else {
+            setNote({
+              ok: false,
+              text: done.error === 'selection-stale' || done.error === 'selection-expired'
+                ? tt('selection.stale')
+                : tt('selection.replaceFailed'),
+            })
+          }
           return
         }
         case 'cursor-context': {
@@ -328,7 +367,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
-  }, [selectionQuoteEnabled])
+  }, [selectionQuoteEnabled, tt])
 
   const refreshStatus = useCallback((): void => {
     void postWorkbench<WorkbenchStatusWire>('/overleaf/workbench/status')
@@ -477,8 +516,14 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           setNote({ ok: false, text: tt('ai.outputEmpty') })
           return
         }
-        setInsertDraft(clean)
-        setNote({ ok: true, text: tt('ai.outputReady') })
+        if (aiOutputWatch.purpose === 'selection-replace' && aiOutputWatch.selection !== undefined) {
+          setSelectionDraft(clean)
+          setPendingReplacement(aiOutputWatch.selection)
+          setNote({ ok: true, text: tt('selection.outputReady') })
+        } else {
+          setInsertDraft(clean)
+          setNote({ ok: true, text: tt('ai.outputReady') })
+        }
       } catch { /* transient; keep polling */ }
     }
     const interval = window.setInterval(() => { void tick() }, 2_000)
@@ -568,7 +613,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         inputActions?.submit()
         setAiPrompt('')
         if (cwd !== undefined && baseline !== undefined) {
-          setAiOutputWatch({ cwd, baselineSignature: insertFileSignature(baseline), startedAt: Date.now() })
+          setAiOutputWatch({ cwd, baselineSignature: insertFileSignature(baseline), startedAt: Date.now(), purpose: 'insert' })
           setNote({ ok: true, text: tt('ai.sent') })
         } else {
           setNote({ ok: false, text: tt('ai.autoCaptureUnavailable') })
@@ -580,6 +625,82 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       }
     })()
   }, [aiPrompt, aiOutputWatch, attachContext, attachFullDoc, inputActions, sendToFrame, sessionId, tt])
+
+  const sendSelectionToAgent = useCallback((mode: 'ask' | 'modify'): void => {
+    const target = selectionTarget
+    const requestedText = selectionPrompt.trim()
+    if (target === undefined || target.text.trim() === '') {
+      setNote({ ok: false, text: tt('selection.empty') })
+      sendToFrame({ type: 'selection-request' })
+      return
+    }
+    if (requestedText === '') {
+      setNote({ ok: false, text: tt('selection.requirementEmpty') })
+      return
+    }
+    if (mode === 'modify' && (target.selectionId === undefined || target.engine === 'dom')) {
+      setNote({ ok: false, text: tt('selection.notReplaceable') })
+      return
+    }
+    if (inputActions?.setDraft === undefined || inputActions?.submit === undefined) {
+      setNote({ ok: false, text: tt('ai.composerUnavailable') })
+      return
+    }
+    if (aiOutputWatch !== undefined || aiBusy) return
+    setAiBusy(true)
+    void (async () => {
+      try {
+        const prompt = buildSelectionAgentPrompt(mode, requestedText, target.text)
+        if (mode === 'ask') {
+          inputActions.setDraft(prompt)
+          inputActions.submit()
+          setSelectionPrompt('')
+          setNote({ ok: true, text: tt('selection.askSent') })
+          return
+        }
+
+        const cwd = sessionId === undefined ? undefined : sessionWorkspaceHint(sessionId)
+        const baseline = cwd === undefined
+          ? undefined
+          : await postWorkbench<InsertFileSnapshot>('/overleaf/workbench/read-insert-file', { cwd }, 15_000)
+              .catch(() => undefined)
+        await new Promise<void>(resolve => setTimeout(resolve, 250))
+        inputActions.setDraft(prompt)
+        inputActions.submit()
+        setSelectionPrompt('')
+        setSelectionDraft('')
+        setPendingReplacement(undefined)
+        if (cwd !== undefined && baseline !== undefined) {
+          setAiOutputWatch({
+            cwd,
+            baselineSignature: insertFileSignature(baseline),
+            startedAt: Date.now(),
+            purpose: 'selection-replace',
+            selection: target,
+          })
+          setNote({ ok: true, text: tt('selection.modifySent') })
+        } else {
+          setNote({ ok: false, text: tt('ai.autoCaptureUnavailable') })
+        }
+      } catch (error) {
+        setNote({ ok: false, text: String(error) })
+      } finally {
+        setAiBusy(false)
+      }
+    })()
+  }, [aiBusy, aiOutputWatch, inputActions, selectionPrompt, selectionTarget, sessionId, sendToFrame, tt])
+
+  const replaceSelectedText = useCallback((): void => {
+    if (selectionDraft.trim() === '') {
+      setNote({ ok: false, text: tt('selection.outputEmpty') })
+      return
+    }
+    if (pendingReplacement?.selectionId === undefined) {
+      setNote({ ok: false, text: tt('selection.stale') })
+      return
+    }
+    sendToFrame({ type: 'replace-selection', selectionId: pendingReplacement.selectionId, text: selectionDraft })
+  }, [pendingReplacement, selectionDraft, sendToFrame, tt])
 
   return (
     <div className="dso-root">
@@ -629,6 +750,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                 </div>
                 <div className="dso-tabs">
                   {([['insert', tt('panel.tabInsert'), () => setPanelTab('insert')],
+                    ['selection', tt('panel.tabSelection'), () => { setPanelTab('selection'); sendToFrame({ type: 'selection-request' }) }],
                     ['outline', tt('panel.tabOutline'), openOutlineTab],
                     ['status', tt('panel.tabStatus'), () => setPanelTab('status')]] as Array<[string, string, () => void]>).map(([id, label, run]) => (
                       <button
@@ -667,7 +789,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                           <span>{tt('ai.preparing')}</span>
                         </div>
                       )}
-                      {aiOutputWatch !== undefined && (
+                      {aiOutputWatch?.purpose === 'insert' && (
                         <div className="dso-ai-wait" role="status" aria-live="polite">
                           <span className="dso-ai-spinner" aria-hidden="true" />
                           <span style={{ flex: 1 }}>{tt('ai.waiting').replace('{seconds}', String(aiWaitSeconds))}</span>
@@ -690,6 +812,72 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                       />
                       <button className="dso-btn dso-btn-primary" disabled={!cursorInsertEnabled} onClick={() => onInsert(insertDraft)}>{tt('insert.action')}</button>
                       {!cursorInsertEnabled && <div className="dso-muted">R6 insert is disabled in settings.</div>}
+                    </>
+                  )}
+                  {panelTab === 'selection' && (
+                    <>
+                      <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('selection.title')}</div>
+                      <div className="dso-muted">{tt('selection.hint')}</div>
+                      <button className="dso-btn" onClick={() => sendToFrame({ type: 'selection-request' })}>{tt('selection.refresh')}</button>
+                      <textarea
+                        className="dso-textarea"
+                        readOnly
+                        value={selectionTarget?.text ?? ''}
+                        placeholder={tt('selection.empty')}
+                        style={{ minHeight: 96 }}
+                      />
+                      {selectionTarget !== undefined && (
+                        <div className="dso-muted">
+                          {tt('selection.detected')
+                            .replace('{chars}', String(selectionTarget.text.length))
+                            .replace('{engine}', selectionTarget.engine)}
+                        </div>
+                      )}
+                      <textarea
+                        className="dso-textarea"
+                        value={selectionPrompt}
+                        onChange={event => setSelectionPrompt(event.target.value)}
+                        placeholder={tt('selection.placeholder')}
+                      />
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                        <button
+                          className="dso-btn"
+                          disabled={aiBusy || aiOutputWatch !== undefined || selectionTarget === undefined}
+                          onClick={() => sendSelectionToAgent('ask')}
+                        >{tt('selection.ask')}</button>
+                        <button
+                          className="dso-btn dso-btn-primary"
+                          disabled={aiBusy || aiOutputWatch !== undefined || selectionTarget?.selectionId === undefined}
+                          onClick={() => sendSelectionToAgent('modify')}
+                        >{tt('selection.modify')}</button>
+                      </div>
+                      {aiBusy && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span>{tt('ai.preparing')}</span>
+                        </div>
+                      )}
+                      {aiOutputWatch?.purpose === 'selection-replace' && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span style={{ flex: 1 }}>{tt('selection.waiting').replace('{seconds}', String(aiWaitSeconds))}</span>
+                          <button className="dso-btn" onClick={() => { setAiOutputWatch(undefined); setNote({ ok: true, text: tt('ai.waitCanceled') }) }}>{tt('ai.cancelWait')}</button>
+                        </div>
+                      )}
+                      <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('selection.result')}</div>
+                      <textarea
+                        className="dso-textarea"
+                        value={selectionDraft}
+                        onChange={event => setSelectionDraft(event.target.value)}
+                        placeholder={tt('selection.resultPlaceholder')}
+                        style={{ minHeight: 110 }}
+                      />
+                      <button
+                        className="dso-btn dso-btn-primary"
+                        disabled={!cursorInsertEnabled || pendingReplacement?.selectionId === undefined || selectionDraft.trim() === ''}
+                        onClick={replaceSelectedText}
+                      >{tt('selection.replace')}</button>
+                      <div className="dso-muted">{tt('selection.safety')}</div>
                     </>
                   )}
                   {panelTab === 'outline' && (

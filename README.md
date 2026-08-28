@@ -14,7 +14,7 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 |  |  full Overleaf editor, compiler, and PDF preview          | |
 |  +----------------------------------------------------------+ |
 |  floating quote CTA - selection bridge                        |
-|  status strip / assist panel (insert at caret, outline...)    |
+|  status strip / assist panel (AI write, selection AI, outline)|
 +--------------------------------------------------------------+
 |  DSH composer (native, untouched)                             |
 +--------------------------------------------------------------+
@@ -37,8 +37,8 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 | R3 · original site features usable | Streaming reverse proxy preserves paths and query strings; responses pass through minus framing headers; small HTML bodies get link/asset rebasing plus the bridge script |
 | R4 · native composer below | The view replaces only the message area; composer, workspace recording, deliverables untouched |
 | R5 · selection quoting | `selectionchange` in the iframe surfaces a floating quote button; clicking inserts a structured quote chip through the official reference pipeline (`inputTriggers.registerSource({name:'quote-ref'})` codec), falling back to plain-text block quotes when absent |
-| R6 · generate at caret | Template inserts (section/subsection/figure/table/equation/BibTeX) and free-form paste write to the live cursor through CodeMirror APIs (CM5 primary, CM6 probe, editable fallback). Auto-writing model replies is on the roadmap; lane type documented as required by the spec |
-| R7 · assist features | Assist panel: document outline extracted from the live editor buffer with jump-to-line flashing; login/logout/cookie management; status reporting (`editorAssistEnabled` toggle = `assistPanelEnabled`) |
+| R6 · generate at caret | Template inserts and free-form/agent-generated LaTeX write to the live cursor through CodeMirror APIs (CM5 primary, CM6 probe, editable fallback); agent output is captured into a review box before insertion |
+| R7 · assist features | Assist panel: ask the agent about an editor selection or generate a reviewable, conflict-checked replacement; document outline with jump-to-line flashing; login/logout/cookie management; status reporting (`editorAssistEnabled` toggle = `assistPanelEnabled`) |
 
 ## Installation
 
@@ -126,7 +126,7 @@ Request path summary:
 4. `text/html` bodies up to 4 MB are buffered once: root-relative `href/src/action/poster/data-src` and `srcset` references get the prefix, and `<base href="/overleaf-proxy/">` plus the bridge script are injected right after `<head>`. Larger HTML and every other content type stream untouched.
 5. WebSockets: the real webserver dispatches exact upgrade paths to a TCP/TLS tunnel that replays the handshake toward the upstream and splices both directions byte-for-byte.
 
-Inside the proxied document the bridge script installs defensive wrappers (`fetch`, `XMLHttpRequest.open`, `EventSource`, `WebSocket`) so late-created root-relative URLs also land under the prefix, reports selection changes to the parent window, exposes caret insertion/outline/reveal commands, and keeps a localStorage snapshot before each mutation for rollback.
+Inside the proxied document the bridge script installs defensive wrappers (`fetch`, `XMLHttpRequest.open`, `EventSource`, `WebSocket`) so late-created root-relative URLs also land under the prefix, reports CodeMirror-native selections with safe anchor tokens, exposes caret insertion/conflict-checked selection replacement/outline/reveal commands, and keeps a localStorage snapshot before each mutation for rollback.
 
 ## Login
 

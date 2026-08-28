@@ -12,7 +12,7 @@ import { LOCALE_NS, ZH_DICTIONARY, EN_DICTIONARY } from './locales.ts'
 import type { WorkbenchDictionary } from './locales.ts'
 import { bindRootContext, quoteRefSourceDescriptor, bindTranslate } from './workbench.ts'
 
-export { cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
+export { buildSelectionAgentPrompt, cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
 
 /** Client module display name (shown in diagnostics). */
 export const name = 'dsh-overleaf'

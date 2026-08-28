@@ -399,6 +399,107 @@ export function renderBridgeScript(): string {
     return 'unknown'
   }
 
+  var savedSelection = undefined
+  var selectionSequence = 0
+
+  /* Capture editor-native offsets, not just DOM selection text. The stable
+     token lets the shell request a delayed replacement after an agent run. */
+  function captureEditorSelection() {
+    try {
+      var cm5 = findCm5()
+      if (cm5 && typeof cm5.getCursor === 'function' && typeof cm5.indexFromPos === 'function') {
+        var doc5 = String(cm5.getValue())
+        var anchor5 = cm5.indexFromPos(cm5.getCursor('anchor'))
+        var head5 = cm5.indexFromPos(cm5.getCursor('head'))
+        var from5 = Math.min(anchor5, head5)
+        var to5 = Math.max(anchor5, head5)
+        if (from5 !== to5) return rememberEditorSelection('cm5', cm5, from5, to5, doc5)
+      }
+      var cm6 = findCm6()
+      if (cm6 && cm6.state && cm6.state.selection) {
+        var main6 = cm6.state.selection.main
+        var from6 = Math.min(main6.from, main6.to)
+        var to6 = Math.max(main6.from, main6.to)
+        if (from6 !== to6) return rememberEditorSelection('cm6', cm6, from6, to6, cm6.state.doc.toString())
+      }
+    } catch (err) {
+      if (DEBUG) log('editor selection capture failed', err)
+    }
+    return undefined
+  }
+
+  function rememberEditorSelection(engine, editor, from, to, doc) {
+    var text = doc.slice(from, to)
+    if (!text.trim()) return undefined
+    if (savedSelection && savedSelection.engine === engine && savedSelection.editor === editor && savedSelection.from === from
+      && savedSelection.to === to && savedSelection.text === text) return savedSelection
+    selectionSequence += 1
+    savedSelection = {
+      id: 'selection-' + Date.now() + '-' + selectionSequence,
+      engine: engine,
+      editor: editor,
+      from: from,
+      to: to,
+      text: text,
+      before: doc.slice(Math.max(0, from - 48), from),
+      after: doc.slice(to, Math.min(doc.length, to + 48)),
+    }
+    return savedSelection
+  }
+
+  function replacementTargetStillMatches(target, doc) {
+    if (doc.slice(target.from, target.to) !== target.text) return false
+    var beforeStart = Math.max(0, target.from - target.before.length)
+    if (doc.slice(beforeStart, target.from) !== target.before) return false
+    return doc.slice(target.to, target.to + target.after.length) === target.after
+  }
+
+  function selectionEditorIsAttached(target) {
+    try {
+      var node = target.engine === 'cm5' && target.editor && typeof target.editor.getWrapperElement === 'function'
+        ? target.editor.getWrapperElement()
+        : target.editor && (target.editor.dom || target.editor.scrollDOM)
+      return !!node && document.documentElement.contains(node)
+    } catch (err) {
+      return false
+    }
+  }
+
+  function replaceSavedEditorSelection(id, replacement) {
+    if (!savedSelection || savedSelection.id !== id) {
+      sendToParent({ type: 'selection-replace-done', ok: false, error: 'selection-expired' })
+      return
+    }
+    var target = savedSelection
+    try {
+      if (target.engine === 'cm5') {
+        var cm5 = target.editor
+        var doc5 = cm5 && String(cm5.getValue())
+        if (!cm5 || !selectionEditorIsAttached(target) || !replacementTargetStillMatches(target, doc5)) throw new Error('selection-stale')
+        rememberSnapshot(doc5)
+        cm5.replaceRange(replacement, cm5.posFromIndex(target.from), cm5.posFromIndex(target.to))
+        cm5.setCursor(cm5.posFromIndex(target.from + replacement.length))
+        cm5.focus()
+      } else if (target.engine === 'cm6') {
+        var cm6 = target.editor
+        var doc6 = cm6 && cm6.state.doc.toString()
+        if (!cm6 || !selectionEditorIsAttached(target) || !replacementTargetStillMatches(target, doc6)) throw new Error('selection-stale')
+        rememberSnapshot(doc6)
+        cm6.dispatch({
+          changes: { from: target.from, to: target.to, insert: replacement },
+          selection: { anchor: target.from + replacement.length },
+        })
+        cm6.focus()
+      } else {
+        throw new Error('selection-engine-unavailable')
+      }
+      savedSelection = undefined
+      sendToParent({ type: 'selection-replace-done', ok: true, engine: target.engine })
+    } catch (err) {
+      sendToParent({ type: 'selection-replace-done', ok: false, error: err && err.message })
+    }
+  }
+
   function insertViaCm5(cm, text) {
     var snapshot = String(cm.getValue())
     rememberSnapshot(snapshot)
@@ -502,6 +603,7 @@ export function renderBridgeScript(): string {
   /* ---------------------------------------------------------------- */
 
   window.addEventListener('message', safe(function (event) {
+    if (event.source !== window.parent) return
     var data = event.data
     if (!data || data.ns !== NS) return
     if (data.type === 'insert') {
@@ -531,7 +633,11 @@ export function renderBridgeScript(): string {
       return
     }
     if (data.type === 'selection-request') {
-      emitSelection()
+      emitSelection(true)
+      return
+    }
+    if (data.type === 'replace-selection') {
+      replaceSavedEditorSelection(String(data.selectionId || ''), String(data.text || ''))
       return
     }
     if (data.type === 'reveal') {
@@ -606,8 +712,22 @@ export function renderBridgeScript(): string {
   /* ---------------------------------------------------------------- */
 
   var lastSelectionSentAt = 0
-  function emitSelection() {
+  function emitSelection(force) {
     try {
+      var editorSelection = captureEditorSelection()
+      if (editorSelection) {
+        var editorNow = Date.now()
+        if (!force && editorNow - lastSelectionSentAt < 80) return
+        lastSelectionSentAt = editorNow
+        sendToParent({
+          type: 'selection',
+          text: editorSelection.text,
+          selectionId: editorSelection.id,
+          engine: editorSelection.engine,
+          rect: { left: 0, top: 0, right: 0, bottom: 0 },
+        })
+        return
+      }
       var sel = window.getSelection()
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
         sendToParent({ type: 'selection-cleared' })
@@ -619,7 +739,7 @@ export function renderBridgeScript(): string {
         return
       }
       var now = Date.now()
-      if (now - lastSelectionSentAt < 80) return
+      if (!force && now - lastSelectionSentAt < 80) return
       lastSelectionSentAt = now
       var range = sel.getRangeAt(0)
       var rect = { left: 0, top: 0, right: 0, bottom: 0 }
@@ -627,13 +747,13 @@ export function renderBridgeScript(): string {
         var box = range.getBoundingClientRect()
         rect = { left: box.left, top: box.top, right: box.right, bottom: box.bottom }
       } catch (ignoredRectError) {}
-      sendToParent({ type: 'selection', text: text, rect: rect })
+      sendToParent({ type: 'selection', text: text, engine: 'dom', rect: rect })
     } catch (err) {
       if (DEBUG) log('selection emit failed', err)
     }
   }
-  document.addEventListener('selectionchange', safe(emitSelection, 'selectionchange'), true)
-  document.addEventListener('keyup', safe(emitSelection, 'keyup-selection'), true)
+  document.addEventListener('selectionchange', safe(function () { emitSelection(false) }, 'selectionchange'), true)
+  document.addEventListener('keyup', safe(function () { emitSelection(false) }, 'keyup-selection'), true)
 
   /* ---------------------------------------------------------------- */
   /* Reveal + flash (chip jump-back target)                           */
