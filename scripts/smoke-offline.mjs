@@ -178,6 +178,14 @@ async function main() {
       `bridge tag carries the nonce: ${out.slice(0, 240)}`)
     assert.ok(out.includes('href="/overleaf-proxy/x"'), 'origin string replaced')
     assert.ok(out.includes('window.__DSH_OVERLEAF_WS_PORT__=45678'), 'WS tunnel bootstrap injected')
+    // <base> injected so RELATIVE (no leading slash) requests resolve against
+    // the proxy root — the sse/users/bare-id request class from the field log.
+    assert.ok(out.includes('<base href="/overleaf-proxy/">'), '<base> injected')
+    assert.ok(out.indexOf('<base ') < out.indexOf('<a href'), 'base precedes body content')
+    // A page that already declares <base> keeps its own.
+    const withBase = rewriteHtml('<html><head><base href="/custom/"></head><body></body></html>',
+      '/overleaf-proxy', undefined, undefined, undefined, 0)
+    assert.equal((withBase.match(/<base\s/g) ?? []).length, 1, 'existing base preserved')
     assert.ok(out.includes('url(/overleaf-proxy/img/logo.svg)') === false || true, 'inline url() rebase checked separately')
     const inlineStyleOut = rewriteHtml('<html><head><style>body{background:url(/img/bg.svg)}</style></head><body style="background-image:url(/img/x.png)"></body></html>',
       '/overleaf-proxy', undefined, undefined, undefined, 0)

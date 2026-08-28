@@ -130,6 +130,22 @@ export function rewriteHtml(
   out = out.replace(/url\(\s*(['"]?)(\/[^)'"]+)(['"]?)\s*\)/gi,
     (_match, quote: string, pathValue: string, tail: string) =>
       `url(${quote}${rebaseAttributeUrl(pathValue, prefix)}${tail})`)
+  // 4. <base href="{prefix}/">: the deployed app assumes it lives at the site
+  //    ROOT, so its RELATIVE (no leading slash) requests — `sse?userToken=`,
+  //    `users?sessionId=`, bare project ids — must resolve against the proxy
+  //    root, not the deep document directory. base restores exactly that.
+  //    (Root-relative `/x` references ignore base and are handled by the
+  //    attribute rewriting above.)
+  if (!/<base\s/i.test(out)) {
+    const baseTag = `<base href="${prefix}/">`
+    if (/<head[^>]*>/i.test(out)) {
+      out = out.replace(/<head[^>]*>/i, match => `${match}\n${baseTag}\n`)
+    } else if (/<html[^>]*>/i.test(out)) {
+      out = out.replace(/<html[^>]*>/i, match => `${match}\n${baseTag}\n`)
+    } else {
+      out = `${baseTag}\n${out}`
+    }
+  }
   if (injectScriptSrc !== undefined && !html.includes('dsh-overleaf-bridge')) {
     const nonceAttr = cspNonce !== undefined && cspNonce !== '' ? ` nonce="${cspNonce}"` : ''
     // Bootstrap FIRST: the WS tunnel port the bridge wrappers redirect
