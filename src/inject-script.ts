@@ -108,16 +108,22 @@ export function renderBridgeScript(): string {
     if (DEBUG) log('xhr patch skipped', err)
   }
 
-  /* EventSource wrapper */
+  /* EventSource wrapper.
+
+     MUST use class extends: EventSource is a real DOM constructor and cannot
+     be invoked via .call() — the previous prototype-shuffle wrapper made
+     EVERY new EventSource(...) on the page throw
+     "Failed to construct 'EventSource'" and broke all SSE consumers. */
   try {
     if (typeof window.EventSource === 'function') {
       var OriginalEventSource = window.EventSource
-      function PatchedEventSource(url, config) {
-        if (typeof url === 'string') url = routeUrl(url)
-        this.__proto__ = OriginalEventSource.prototype
-        OriginalEventSource.call(this, url, config)
+      class PatchedEventSource extends OriginalEventSource {
+        constructor(url, config) {
+          if (typeof url === 'string') url = routeUrl(url)
+          super(url, config)
+        }
       }
-      PatchedEventSource.prototype = OriginalEventSource.prototype
+      Object.defineProperty(PatchedEventSource, 'name', { value: 'EventSource' })
       window.EventSource = PatchedEventSource
     }
   } catch (err) {

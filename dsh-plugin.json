@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "dsh.overleaf",
   "name": "dsh-overleaf",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "facets": {
     "host": {
       "entry": "lib/index.js",

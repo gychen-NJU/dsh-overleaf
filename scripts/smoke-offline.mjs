@@ -191,6 +191,12 @@ async function main() {
     assert.ok(bridge.includes("split('\\n')"), 'outline split keeps its newline escape')
     assert.ok(bridge.includes('\\s*\\{([^}]*)\\}'), 'outline regex keeps \\s/\\{ escapes')
     assert.ok(bridge.includes('sendBeacon'), 'sendBeacon wrapper present')
+    // EventSource is a DOM constructor: the wrapper MUST be a class subclass
+    // (a .call()-based shim made every new EventSource(...) throw, breaking
+    // all SSE consumers on the page).
+    assert.ok(bridge.includes('class PatchedEventSource extends OriginalEventSource'),
+      'EventSource wrapper uses class extends')
+    assert.ok(!bridge.includes('OriginalEventSource.call('), 'no .call() on the DOM constructor')
   }
 
   // 1. Mount against a fake context and confirm every route family lands.
