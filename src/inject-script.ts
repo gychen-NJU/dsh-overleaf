@@ -279,8 +279,8 @@ export function renderBridgeScript(): string {
      view on the .cm-editor DOM node under the key "cmView", but that field
      is a ContentView wrapper - the EditorView itself sits on its "view"
      property (and may be nested one level deeper), so unwrap before
-     validating. NOTE: no backticks/`${}` are allowed inside this template
-     literal (see v0.1.10 lesson). */
+     validating. NOTE: no backticks or dollar-brace sequences are allowed
+     inside this template literal (see v0.1.10 lesson). */
   function asEditorView(candidate) {
     var hop = candidate
     for (var depth = 0; hop && depth < 4; depth++) {
@@ -385,6 +385,38 @@ export function renderBridgeScript(): string {
       return undefined
     }
   }
+
+  /* Cursor context for AI prompts: the text around the caret plus the caret
+     offset, so the agent can ground its edit in the real document. */
+  function readCursorContext(radius) {
+    try {
+      var docValue = readDocValue()
+      if (docValue === undefined) return undefined
+      var text = String(docValue)
+      var cursor = -1
+      var cm5 = findCm5()
+      if (cm5) {
+        try { cursor = cm5.indexFromPos(cm5.getCursor()) } catch (err) { cursor = -1 }
+      } else {
+        var cm6 = findCm6()
+        if (cm6) {
+          try { cursor = cm6.state.selection.main.head } catch (err2) { cursor = -1 }
+        }
+      }
+      if (cursor < 0) cursor = 0
+      var r = Number(radius) || 1200
+      var from = Math.max(0, cursor - r)
+      var to = Math.min(text.length, cursor + r)
+      return {
+        cursor: cursor,
+        docLength: text.length,
+        before: text.slice(from, cursor),
+        after: text.slice(cursor, to),
+      }
+    } catch (err) {
+      return undefined
+    }
+  }
   function rememberSnapshot(docValue) {
     try {
       if (docValue === undefined || docValue === null) return
@@ -441,6 +473,19 @@ export function renderBridgeScript(): string {
     }
     if (data.type === 'outline-request') {
       sendOutline()
+      return
+    }
+    if (data.type === 'cursor-context-request') {
+      try {
+        var cc = readCursorContext(data.radius)
+        if (cc === undefined) {
+          sendToParent({ type: 'cursor-context', error: 'no-editor' })
+        } else {
+          sendToParent({ type: 'cursor-context', cursor: cc.cursor, docLength: cc.docLength, before: cc.before, after: cc.after })
+        }
+      } catch (err) {
+        sendToParent({ type: 'cursor-context', error: err && err.message })
+      }
       return
     }
     if (data.type === 'debug') {

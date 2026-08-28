@@ -34,6 +34,8 @@ export interface OverleafViewProps {
   t?: Translate | undefined
   /** Feature switches resolved from embed-info. */
   features?: EmbedInfo | undefined
+  /** Standard-kit composer actions (submit the edited draft). */
+  inputActions?: { submit(): unknown; setDraft(text: string): unknown } | undefined
 }
 
 /** Editor engine reported by the bridge capabilities probe. */
@@ -110,7 +112,7 @@ function ensureStyles(): void {
 /** OverleafView — registered under the conversation.view slot. */
 export function OverleafView(props: OverleafViewProps): ReactNode {
   ensureStyles()
-  const { sessionId, t: tr, features } = props
+  const { sessionId, t: tr, features, inputActions } = props
   const tt = tr ?? (key => String(key))
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const [nonce, setNonce] = useState(0)
@@ -120,7 +122,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [selectedText, setSelectedText] = useState<string | undefined>(undefined)
   const [note, setNote] = useState<{ ok: boolean; text: string } | undefined>(undefined)
   const [panelOpen, setPanelOpen] = useState(false)
-  const [panelTab, setPanelTab] = useState<'insert' | 'outline' | 'status'>('insert')
+  const [panelTab, setPanelTab] = useState<'insert' | 'outline' | 'status' | 'ai'>('insert')
   const [insertDraft, setInsertDraft] = useState('')
   const [outlineItems, setOutlineItems] = useState<OutlineItem[] | undefined>(undefined)
   const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
@@ -128,6 +130,10 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [busy, setBusy] = useState<'login' | 'cookie' | undefined>(undefined)
   const [frameEscaped, setFrameEscaped] = useState(false)
   const [embeddedLoginHint, setEmbeddedLoginHint] = useState(false)
+  const [aiPrompt, setAiPrompt] = useState('')
+  const [attachContext, setAttachContext] = useState(true)
+  const [aiBusy, setAiBusy] = useState(false)
+  const cursorContextRef = useRef<{ before: string; after: string; cursor: number } | undefined>(undefined)
 
   // Same-origin detection: if the iframe document navigated itself outside
   // the proxy prefix (site anti-framing JS), surface a hint instead of a
@@ -191,6 +197,13 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           const done = data as unknown as { ok?: boolean; error?: string }
           if (done.ok === true) setNote({ ok: true, text: 'OK' })
           else setNote({ ok: false, text: done.error ?? '' })
+          return
+        }
+        case 'cursor-context': {
+          const cc = data as unknown as { before?: string; after?: string; cursor?: number; error?: string }
+          cursorContextRef.current = cc.error === undefined && typeof cc.before === 'string'
+            ? { before: cc.before, after: cc.after ?? '', cursor: cc.cursor ?? 0 }
+            : undefined
           return
         }
         case 'url-change': {
@@ -339,6 +352,55 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     [tt('insert.bibitem'), LATex_TEMPLATES.bibitem],
   ]
 
+  const captureSelection = useCallback((): void => {
+    try {
+      const sel = window.getSelection()
+      const text = sel?.toString() ?? ''
+      if (text.trim() === '') {
+        setNote({ ok: false, text: tt('ai.captureEmpty') })
+        return
+      }
+      setInsertDraft(text)
+      setNote({ ok: true, text: tt('ai.captured') })
+    } catch (error) {
+      setNote({ ok: false, text: String(error) })
+    }
+  }, [tt])
+
+  const sendToAgent = useCallback((): void => {
+    if (aiPrompt.trim() === '') {
+      setNote({ ok: false, text: tt('insert.emptyInput') })
+      return
+    }
+    if (inputActions?.setDraft === undefined || inputActions?.submit === undefined) {
+      setNote({ ok: false, text: tt('ai.composerUnavailable') })
+      return
+    }
+    setAiBusy(true)
+    cursorContextRef.current = undefined
+    sendToFrame({ type: 'cursor-context-request', radius: 1200 })
+    setTimeout(() => {
+      try {
+        const parts: string[] = [`【任务】${aiPrompt.trim()}`]
+        parts.push('【输出要求】只输出最终需要插入或替换的 LaTeX 内容本身，不要解释，不要使用代码块围栏。')
+        const ctx = cursorContextRef.current
+        if (attachContext && ctx !== undefined) {
+          parts.push('【光标前的文档内容】\n' + ctx.before)
+          parts.push('【光标后的文档内容】\n' + ctx.after)
+        }
+        const prompt = parts.join('\n')
+        inputActions?.setDraft(prompt)
+        inputActions?.submit()
+        setNote({ ok: true, text: tt('ai.sent') })
+        setAiPrompt('')
+      } catch (error) {
+        setNote({ ok: false, text: String(error) })
+      } finally {
+        setAiBusy(false)
+      }
+    }, 350)
+  }, [aiPrompt, attachContext, inputActions, sendToFrame, tt])
+
   return (
     <div className="dso-root">
       <div className="dso-toolbar">
@@ -406,7 +468,26 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                 <div className="dso-panel-body">
                   {panelTab === 'insert' && (
                     <>
-                      <div className="dso-muted">{tt('insert.templateLabel')}</div>
+                      <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('ai.title')}</div>
+                      <textarea
+                        className="dso-textarea"
+                        value={aiPrompt}
+                        onChange={event => setAiPrompt(event.target.value)}
+                        placeholder={tt('ai.placeholder')}
+                      />
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+                        <input type="checkbox" checked={attachContext} onChange={event => setAttachContext(event.target.checked)} />
+                        <span>{tt('ai.attachContext')}</span>
+                      </label>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button className="dso-btn dso-btn-primary" disabled={aiBusy} onClick={sendToAgent}>{tt('ai.send')}</button>
+                        <button className="dso-btn" onClick={captureSelection}>{tt('ai.captureSelection')}</button>
+                      </div>
+                      {insertDraft !== '' && (
+                        <button className="dso-btn" disabled={!cursorInsertEnabled} onClick={() => onInsert(insertDraft)}>{tt('insert.action')}</button>
+                      )}
+                      <div className="dso-muted">{tt('ai.hint')}</div>
+                      <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('insert.templateLabel')}</div>
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                         {templates.map(([label, snippet]) => (
                           <button key={label} className="dso-btn" disabled={!cursorInsertEnabled} onClick={() => onInsert(snippet)}>{label}</button>
