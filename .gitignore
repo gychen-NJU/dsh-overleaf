@@ -5,3 +5,4 @@ lib/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+.commit-msg
