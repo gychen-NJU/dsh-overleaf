@@ -201,6 +201,14 @@ export function allowSelfInCsp(value: string, extraOrigins: string[] = []): { va
     const values = (match[2] ?? '').trim()
     if (name === 'script-src') hasScriptSrc = true
     if (name === 'default-src') hasDefaultSrc = true
+    // base-uri 'none' blocks the injected <base> that gives RELATIVE requests
+    // root-relative semantics under the proxy. Relax it to 'self' (the base
+    // we inject is same-origin), keeping the directive's guard intent.
+    if (name === 'base-uri' && /'none'/i.test(values)) {
+      changed = true
+      kept.push("base-uri 'self'")
+      continue
+    }
     if (SELF_NEEDED_DIRECTIVES.has(name) && !/(?:^|\s)'self'(?:\s|$)/i.test(values)) {
       changed = true
       kept.push(values === '' ? `${name} 'self'` : `${name} ${values} 'self'`)

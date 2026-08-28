@@ -161,6 +161,12 @@ async function main() {
 
     const alreadySelf = allowSelfInCsp("script-src 'self' https://x.example")
     assert.equal(alreadySelf.value, "script-src 'self' https://x.example", 'no duplicate self')
+
+    // base-uri 'none' blocks the injected <base> (user log: editor page).
+    // The rewriter relaxes it to 'self' — same-origin base only.
+    const withBaseUriNone = allowSelfInCsp("script-src 'nonce-x' 'strict-dynamic'; base-uri 'none'; object-src 'none'")
+    assert.ok(/base-uri 'self'/.test(withBaseUriNone.value), `base-uri relaxed: ${withBaseUriNone.value}`)
+    assert.ok(!withBaseUriNone.value.includes("'none';") || withBaseUriNone.value.includes("object-src 'none'"), 'other directives preserved')
   }
 
   // 0c. Nonce-tagged bridge injection (the v0.1.8 gap): under 'strict-dynamic'
