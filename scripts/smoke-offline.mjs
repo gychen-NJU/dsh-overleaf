@@ -110,7 +110,12 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, mergeProxyCookieHeaders, allowSelfInCsp, extractCspNonce, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, mergeProxyCookieHeaders, allowSelfInCsp, extractCspNonce, requestTimeoutFor, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+
+  assert.equal(requestTimeoutFor(new URL('https://example.test/project/demo/compile?auto_compile=true')), 600_000,
+    'synchronous compile calls receive the extended timeout')
+  assert.equal(requestTimeoutFor(new URL('https://example.test/project/demo/output.pdf')), 60_000,
+    'ordinary proxy traffic retains the bounded timeout')
 
   // 0. Cookie authority regression (the v0.1.5 login-page bug): a browser-side
   // anonymous/stale twin of the session cookie must NEVER override the stored
@@ -245,6 +250,18 @@ async function main() {
       'WebSocket wrapper inherits native static constants')
     assert.ok(bridge.includes('PatchedWebSocket.prototype = OriginalWebSocket.prototype'),
       'WebSocket wrapper preserves instanceof behavior')
+    // Compile output regression: Overleaf constructs PDF/log URLs as
+    // window.origin + file.url, producing an absolute loopback URL outside
+    // the proxy. String, Request and runtime DOM attribute paths must all
+    // route those absolute same-origin URLs back under /overleaf-proxy.
+    assert.ok(bridge.includes('parsed.origin === window.location.origin'),
+      'absolute same-origin output URLs are detected')
+    assert.ok(bridge.includes('window.location.origin + PREFIX + parsed.pathname'),
+      'absolute compile output URLs are re-rooted under the proxy')
+    assert.ok(bridge.includes('new Request(routedRequestUrl, input)'),
+      'fetch Request objects preserve options while rerouting PDF loads')
+    assert.ok(bridge.includes('var routed = routeUrl(value)'),
+      'dynamic iframe/link/resource attributes share runtime URL routing')
   }
 
   // 1. Mount against a fake context and confirm every route family lands.
@@ -302,7 +319,7 @@ async function main() {
       'content-type': 'text/html; charset=utf-8',
       'x-frame-options': 'SAMEORIGIN',
       'set-cookie': 'overleaf_session2=abc123; Domain=.tex.example.edu; Path=/; HttpOnly',
-      'location': '/elsewhere',
+      'location': 'output.pdf?build=1',
     })
     upstreamRes.end('<html><head><link href="/styles/main.css"></head><body><a href="/project/x">P</a></body></html>')
   })
@@ -324,6 +341,8 @@ async function main() {
   assert.ok(body2.includes('/overleaf/workbench/bridge.js'), 'bridge script injected')
   assert.ok(res2.headers['set-cookie'] !== undefined && !String(res2.headers['set-cookie']).includes('Domain='), 'cookie domain stripped')
   assert.equal(res2.headers['x-frame-options'], undefined, 'x-frame-options dropped')
+  assert.equal(res2.headers.location, '/overleaf-proxy/project/output.pdf?build=1',
+    'relative upstream redirects resolve against the complete request URL')
 
   // 4. Binary pass-through stays untouched (no rebase flags).
   upstream.close()
@@ -362,6 +381,22 @@ async function main() {
   /* ---------------------------------------------------------------- */
 
   const bundleSource = await readFile(join(root, 'lib', 'client.js'), 'utf8')
+  const viewSource = await readFile(join(root, 'src', 'client', 'view.tsx'), 'utf8')
+  assert.match(
+    viewSource,
+    /const panelWidth = panelOpen \? Math\.min\(320, Math\.round\(rect\.width \* 0\.9\)\) : 0/,
+    'persistent iframe yields the right-side hit area while the assist panel is open',
+  )
+  assert.ok(
+    viewSource.includes('}, [checkFrameLocation, panelOpen])'),
+    'iframe geometry re-syncs when the assist panel toggles',
+  )
+  assert.ok(viewSource.includes('setInsertDraft(clean)'),
+    'fresh agent output fills the reviewable custom-content box')
+  assert.ok(!viewSource.includes('onInsertRef.current(content)'),
+    'agent output is not inserted into Overleaf before user review')
+  assert.ok(viewSource.includes('role="status" aria-live="polite"'),
+    'AI generation wait is announced as a live status')
   const registered = []
   const sandboxWindow = {
     __ModuleLoader__: {
@@ -402,6 +437,23 @@ async function main() {
   assert.equal(exportsObject.name, 'dsh-overleaf')
   assert.ok(Array.isArray(exportsObject.inject))
   assert.equal(typeof exportsObject.apply, 'function')
+  assert.equal(
+    exportsObject.cleanAgentInsertContent('```latex\r\n\\section{Ready}\r\n```'),
+    '\\section{Ready}',
+    'agent handoff strips one outer LaTeX fence and normalizes line endings',
+  )
+  assert.equal(exportsObject.cleanAgentInsertContent('  plain \\LaTeX  '), 'plain \\LaTeX',
+    'plain payload is preserved apart from surrounding whitespace')
+  assert.notEqual(
+    exportsObject.insertFileSignature({ exists: false }),
+    exportsObject.insertFileSignature({ exists: true, content: 'same', mtimeMs: 1 }),
+    'first-created handoff file differs from a missing baseline',
+  )
+  assert.notEqual(
+    exportsObject.insertFileSignature({ exists: true, content: 'same', mtimeMs: 1 }),
+    exportsObject.insertFileSignature({ exists: true, content: 'same', mtimeMs: 2 }),
+    'rewriting identical content still creates a fresh handoff revision',
+  )
 
   // Activate against a fake client context; must not throw, must register
   // dictionaries, quote source, and the conversation.view entry.

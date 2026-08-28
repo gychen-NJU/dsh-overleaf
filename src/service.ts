@@ -327,8 +327,9 @@ export class OverleafWorkbenchService extends Service {
     }))
     // Agent-output handoff: the assistant is asked (in its prompt) to write
     // the final content into dsh-overleaf-insert.md inside the workspace; the
-    // panel polls this route and inserts new content at the caret. Reads are
-    // limited to that single fixed filename inside the workspace directory.
+    // panel polls this route and fills its reviewable custom-content box with
+    // a new stable revision. Reads are limited to that single fixed filename
+    // inside the workspace directory.
     this.route('/overleaf/workbench/read-insert-file', async payload => {
       const cwd = stringField(payload, 'cwd')
       if (cwd === undefined || cwd.trim() === '' || !isAbsolute(cwd.trim())) {

@@ -6,9 +6,10 @@
  *   1. HTML rebase + bridge injection over real HTTP,
  *   2. Set-Cookie host-scoping + X-Frame-Options removal,
  *   3. binary streaming untouched,
- *   4. JSON workbench routes,
- *   5. a genuine WebSocket upgrade tunneled end-to-end (echo round trip),
- *   6. bridge.js asset route serving the injected script.
+ *   4. compile JSON + ranged PDF retrieval through the proxy,
+ *   5. JSON workbench routes,
+ *   6. a genuine WebSocket upgrade tunneled end-to-end (echo round trip),
+ *   7. bridge.js asset route serving the injected script.
  *
  * Run: node scripts/smoke-live.mjs
  */
@@ -62,6 +63,7 @@ async function main() {
 
   /* ------------------------- fixture upstream ------------------------- */
   let upgradesSeen = 0
+  const fixturePdf = Buffer.from('%PDF-1.7\nfixture-pdf-body\n%%EOF')
   const upstream = http.createServer((req, res) => {
     if (req.url === '/big.bin') {
       res.writeHead(200, { 'content-type': 'application/octet-stream' })
@@ -89,6 +91,41 @@ async function main() {
       // can assert prefix-less pass-through and credential injection.
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
       res.end(`poll-ok url=${req.url} cookie=${String(req.headers.cookie ?? '')}`)
+      return
+    }
+    if (req.method === 'POST' && req.url?.startsWith('/project/demo/compile?')) {
+      req.resume()
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({
+        status: 'success',
+        outputFiles: [{
+          path: 'output.pdf',
+          url: '/project/demo/build/build-123/output/output.pdf',
+          type: 'pdf',
+          build: 'build-123',
+        }],
+        clsiServerId: 'clsi-fixture',
+        compileGroup: 'group-fixture',
+      }))
+      return
+    }
+    if (req.url?.startsWith('/project/demo/build/build-123/output/output.pdf')) {
+      if (req.headers.range === 'bytes=0-7') {
+        res.writeHead(206, {
+          'content-type': 'application/pdf',
+          'accept-ranges': 'bytes',
+          'content-range': `bytes 0-7/${fixturePdf.length}`,
+          'content-length': '8',
+        })
+        res.end(fixturePdf.subarray(0, 8))
+      } else {
+        res.writeHead(200, {
+          'content-type': 'application/pdf',
+          'accept-ranges': 'bytes',
+          'content-length': String(fixturePdf.length),
+        })
+        res.end(fixturePdf)
+      }
       return
     }
     res.writeHead(200, {
@@ -198,7 +235,27 @@ async function main() {
   const binBuf = Buffer.from(await binRes.arrayBuffer())
   assert.deepStrictEqual([...binBuf], [0, 1, 2, 3, 250, 251])
 
-  // 4. Status route through the REAL server.
+  // 4. Compile completion JSON and the subsequent PDF.js range request both
+  // stay under /overleaf-proxy. Preserve the range headers and exact bytes.
+  const compileRes = await fetch(`${base}/overleaf-proxy/project/demo/compile?enable_pdf_caching=true`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-csrf-token': 'fixture-token' },
+    body: JSON.stringify({ rootDoc_id: 'root-doc', draft: false, check: 'silent' }),
+  })
+  assert.equal(compileRes.status, 200, `compile proxy status ${compileRes.status}`)
+  const compileBody = await compileRes.json()
+  assert.equal(compileBody.status, 'success')
+  assert.equal(compileBody.outputFiles[0].path, 'output.pdf')
+  const pdfRes = await fetch(`${base}/overleaf-proxy${compileBody.outputFiles[0].url}`, {
+    headers: { range: 'bytes=0-7' },
+  })
+  assert.equal(pdfRes.status, 206, `PDF range status ${pdfRes.status}`)
+  assert.equal(pdfRes.headers.get('content-type'), 'application/pdf')
+  assert.equal(pdfRes.headers.get('content-range'), `bytes 0-7/${fixturePdf.length}`)
+  assert.equal(pdfRes.headers.get('content-length'), '8')
+  assert.deepStrictEqual(Buffer.from(await pdfRes.arrayBuffer()), fixturePdf.subarray(0, 8))
+
+  // 5. Status route through the REAL server.
   const statusRes = await fetch(`${base}/overleaf/workbench/status`, { method: 'POST' })
   const statusEnvelope = await statusRes.json()
   assert.equal(statusEnvelope.ok, true)

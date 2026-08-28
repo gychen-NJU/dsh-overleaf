@@ -13,6 +13,8 @@ import {
 } from './workbench.ts'
 import { postWorkbench } from './wire.ts'
 import type { EmbedInfo, LoginStatusWire, WorkbenchStatusWire } from './wire.ts'
+import { cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
+import type { InsertFileSnapshot } from './ai-output.ts'
 
 /** Message shape sent by the embedded bridge script. */
 export interface BridgeMessage {
@@ -36,6 +38,12 @@ export interface OverleafViewProps {
   features?: EmbedInfo | undefined
   /** Standard-kit composer actions (submit the edited draft). */
   inputActions?: { submit(): unknown; setDraft(text: string): unknown } | undefined
+}
+
+interface AiOutputWatch {
+  cwd: string
+  baselineSignature: string
+  startedAt: number
 }
 
 /** Editor engine reported by the bridge capabilities probe. */
@@ -105,6 +113,10 @@ function ensureStyles(): void {
 .dso-modal{width:min(520px,94%);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:8px;box-shadow:0 12px 40px rgba(0,0,0,.28)}
 .dso-modal h3{margin:0;font-size:13px;color:var(--dsw-alias-label-primary)}
 .dso-muted{font-size:11px;color:var(--dsw-alias-label-secondary);line-height:1.6}
+.dso-ai-wait{display:flex;align-items:center;gap:7px;padding:7px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:11px;line-height:1.5}
+.dso-ai-spinner{width:12px;height:12px;box-sizing:border-box;border:2px solid var(--dsw-alias-border-l1);border-top-color:var(--dsw-alias-brand-primary);border-radius:50%;animation:dso-ai-spin .8s linear infinite;flex:none}
+@keyframes dso-ai-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.dso-ai-spinner{animation:none}}
 `
   document.head.appendChild(style)
 }
@@ -166,9 +178,9 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [aiPrompt, setAiPrompt] = useState('')
   const [attachContext, setAttachContext] = useState(true)
   const [attachFullDoc, setAttachFullDoc] = useState(false)
-  const [autoFetchOutput, setAutoFetchOutput] = useState(false)
+  const [aiOutputWatch, setAiOutputWatch] = useState<AiOutputWatch | undefined>(undefined)
+  const [aiWaitSeconds, setAiWaitSeconds] = useState(0)
   const [aiBusy, setAiBusy] = useState(false)
-  const onInsertRef = useRef<(text: string) => void>(() => undefined)
   const cursorContextRef = useRef<{ before: string; after: string; cursor: number } | undefined>(undefined)
   const stageRef = useRef<HTMLDivElement | null>(null)
 
@@ -206,14 +218,21 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       frame.style.position = 'fixed'
       frame.style.left = `${Math.round(rect.left)}px`
       frame.style.top = `${Math.round(rect.top)}px`
-      frame.style.width = `${Math.round(rect.width)}px`
+      // The iframe is a body-level root stacking-context child with a very
+      // high z-index. A React child rendered inside the stage cannot paint on
+      // top of it, regardless of the child's own z-index. When the assist
+      // panel opens, reserve the same width as `.dso-panel` (min(320px, 90%))
+      // so the iframe no longer covers the panel's hit-testing/paint area.
+      const panelWidth = panelOpen ? Math.min(320, Math.round(rect.width * 0.9)) : 0
+      const frameWidth = Math.max(0, Math.round(rect.width) - panelWidth)
+      frame.style.width = `${frameWidth}px`
       frame.style.height = `${Math.round(rect.height)}px`
       // The frame lives under <body> (root stacking context); DSH shell
       // containers commonly use mid-range z-indexes, so claim a high one —
       // the frame only ever covers the stage rectangle, nothing else.
       frame.style.zIndex = '99999'
       frame.style.border = 'none'
-      try { document.documentElement.setAttribute('data-dsh-frame', `visible ${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`) } catch {}
+      try { document.documentElement.setAttribute('data-dsh-frame', `visible ${frameWidth}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)} panel:${panelWidth}`) } catch {}
     }
     sync()
     const observer = new ResizeObserver(() => sync())
@@ -232,7 +251,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       hidePersistentFrame()
       frameRef.current = null
     }
-  }, [checkFrameLocation])
+  }, [checkFrameLocation, panelOpen])
 
   const selectionQuoteEnabled = embedInfo?.selectionQuoteEnabled ?? true
   const cursorInsertEnabled = embedInfo?.cursorInsertEnabled ?? true
@@ -338,7 +357,6 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     setNote({ ok: true, text: tt('insert.action') })
     setInsertDraft('')
   }, [sendToFrame, tt])
-  onInsertRef.current = onInsert
 
   const requestOutline = useCallback((): void => {
     setOutlineItems(undefined)
@@ -425,42 +443,63 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     [sessionId],
   )
 
-  // After sending a request (which instructs the agent to write its final
-  // content into dsh-overleaf-insert.md), poll the host for that file and
-  // auto-insert NEW content at the caret — no tab switching needed.
+  // Poll the fixed workspace handoff file after submission. A changed
+  // revision must remain identical across two polls before it is accepted, so
+  // a partially-written file never lands in the custom-content box.
   useEffect(() => {
-    if (!autoFetchOutput) return
-    if (sessionId === undefined || sessionId === '') return
-    const cwd = sessionWorkspaceHint(sessionId)
-    if (cwd === undefined) return
+    if (aiOutputWatch === undefined) return
     let disposed = false
-    let lastSeen = ''
+    let candidateSignature = ''
+    let candidateFirstSeenAt = 0
     const tick = async (): Promise<void> => {
       if (disposed) return
+      if (Date.now() - aiOutputWatch.startedAt > 10 * 60_000) {
+        setAiOutputWatch(undefined)
+        setNote({ ok: false, text: tt('ai.outputTimeout') })
+        return
+      }
       try {
-        const result = await postWorkbench<{ exists: boolean; content?: string; mtimeMs?: number }>(
-          '/overleaf/workbench/read-insert-file', { cwd }, 15_000,
+        const result = await postWorkbench<InsertFileSnapshot>(
+          '/overleaf/workbench/read-insert-file', { cwd: aiOutputWatch.cwd }, 15_000,
         )
         if (disposed) return
-        if (result.exists === true && typeof result.content === 'string' && result.content.trim() !== '') {
-          const content = result.content
-          if (content !== lastSeen && lastSeen !== '') {
-            onInsertRef.current(content)
-            setNote({ ok: true, text: tt('ai.outputInserted') })
-            setAutoFetchOutput(false)
-            return
-          }
-          lastSeen = content
+        const signature = insertFileSignature(result)
+        if (!result.exists || signature === aiOutputWatch.baselineSignature || typeof result.content !== 'string') return
+        if (signature !== candidateSignature) {
+          candidateSignature = signature
+          candidateFirstSeenAt = Date.now()
+          return
         }
+        if (Date.now() - candidateFirstSeenAt < 1_000) return
+        const clean = cleanAgentInsertContent(result.content)
+        setAiOutputWatch(undefined)
+        if (clean === '') {
+          setNote({ ok: false, text: tt('ai.outputEmpty') })
+          return
+        }
+        setInsertDraft(clean)
+        setNote({ ok: true, text: tt('ai.outputReady') })
       } catch { /* transient; keep polling */ }
     }
-    const interval = window.setInterval(() => { void tick() }, 4_000)
+    const interval = window.setInterval(() => { void tick() }, 2_000)
     void tick()
     return () => {
       disposed = true
       window.clearInterval(interval)
     }
-  }, [autoFetchOutput, sessionId, tt])
+  }, [aiOutputWatch, tt])
+
+  // Keep the waiting hint live while the agent is generating its response.
+  useEffect(() => {
+    if (aiOutputWatch === undefined) {
+      setAiWaitSeconds(0)
+      return
+    }
+    const update = (): void => setAiWaitSeconds(Math.max(0, Math.round((Date.now() - aiOutputWatch.startedAt) / 1_000)))
+    update()
+    const interval = window.setInterval(update, 1_000)
+    return () => window.clearInterval(interval)
+  }, [aiOutputWatch])
 
   // Entry point: land directly on the project dashboard instead of the site
   // root, removing the root->dashboard redirect chain (and any ambiguity
@@ -493,7 +532,8 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   }, [tt])
 
   const sendToAgent = useCallback((): void => {
-    if (aiPrompt.trim() === '') {
+    const requestedText = aiPrompt.trim()
+    if (requestedText === '') {
       setNote({ ok: false, text: tt('insert.emptyInput') })
       return
     }
@@ -501,14 +541,23 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       setNote({ ok: false, text: tt('ai.composerUnavailable') })
       return
     }
+    if (aiOutputWatch !== undefined) return
     setAiBusy(true)
     cursorContextRef.current = undefined
+    const cwd = sessionId === undefined ? undefined : sessionWorkspaceHint(sessionId)
     sendToFrame({ type: 'cursor-context-request', radius: attachFullDoc ? 200_000 : 1200 })
-    setTimeout(() => {
+    void (async () => {
       try {
-        const parts: string[] = [`【任务】${aiPrompt.trim()}`]
+        const [baseline] = await Promise.all([
+          cwd === undefined
+            ? Promise.resolve<InsertFileSnapshot | undefined>(undefined)
+            : postWorkbench<InsertFileSnapshot>('/overleaf/workbench/read-insert-file', { cwd }, 15_000)
+                .catch(() => undefined),
+          new Promise<void>(resolve => setTimeout(resolve, 350)),
+        ])
+        const parts: string[] = [`【任务】${requestedText}`]
         parts.push('【输出要求】只输出最终需要插入或替换的 LaTeX 内容本身，不要解释，不要使用代码块围栏。')
-        parts.push('【重要】完成后，请把最终要插入的完整 LaTeX 内容原样写入当前工作区文件 dsh-overleaf-insert.md（纯内容，不要代码块围栏，不要解释）。')
+        parts.push('【重要交付】全部生成完成后，请把最终要插入的完整 LaTeX 内容原样写入当前工作区文件 dsh-overleaf-insert.md。该文件只能包含最终内容，不要代码块围栏、标题、解释或过程文字；写完文件后再结束回复。')
         const ctx = cursorContextRef.current
         if (attachContext && ctx !== undefined) {
           parts.push('【光标前的文档内容】\n' + ctx.before)
@@ -517,16 +566,20 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         const prompt = parts.join('\n')
         inputActions?.setDraft(prompt)
         inputActions?.submit()
-        setNote({ ok: true, text: tt('ai.sent') })
         setAiPrompt('')
-        setAutoFetchOutput(true)
+        if (cwd !== undefined && baseline !== undefined) {
+          setAiOutputWatch({ cwd, baselineSignature: insertFileSignature(baseline), startedAt: Date.now() })
+          setNote({ ok: true, text: tt('ai.sent') })
+        } else {
+          setNote({ ok: false, text: tt('ai.autoCaptureUnavailable') })
+        }
       } catch (error) {
         setNote({ ok: false, text: String(error) })
       } finally {
         setAiBusy(false)
       }
-    }, 350)
-  }, [aiPrompt, attachContext, attachFullDoc, inputActions, sendToFrame, tt])
+    })()
+  }, [aiPrompt, aiOutputWatch, attachContext, attachFullDoc, inputActions, sendToFrame, sessionId, tt])
 
   return (
     <div className="dso-root">
@@ -551,7 +604,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
               </>
         }
         {assistPanelEnabled
-          ? <button className="dso-btn" data-open={panelOpen ? '1' : undefined} onClick={() => { if (!panelOpen) { setPanelOpen(true); setPanelTab(prev => prev) } else setPanelOpen(false) }}>{tt('toolbar.panel')}</button>
+          ? <button className="dso-btn" data-open={panelOpen ? '1' : undefined} onClick={() => setPanelOpen(open => !open)}>{tt('toolbar.panel')}</button>
           : null}
       </div>
       <div className="dso-hint">
@@ -605,11 +658,21 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                         <span>{tt('ai.attachFullDoc')}</span>
                       </label>
                       <div style={{ display: 'flex', gap: 4 }}>
-                        <button className="dso-btn dso-btn-primary" disabled={aiBusy} onClick={sendToAgent}>{tt('ai.send')}</button>
+                        <button className="dso-btn dso-btn-primary" disabled={aiBusy || aiOutputWatch !== undefined} onClick={sendToAgent}>{tt('ai.send')}</button>
                         <button className="dso-btn" onClick={captureSelection}>{tt('ai.captureSelection')}</button>
                       </div>
-                      {insertDraft !== '' && (
-                        <button className="dso-btn" disabled={!cursorInsertEnabled} onClick={() => onInsert(insertDraft)}>{tt('insert.action')}</button>
+                      {aiBusy && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span>{tt('ai.preparing')}</span>
+                        </div>
+                      )}
+                      {aiOutputWatch !== undefined && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span style={{ flex: 1 }}>{tt('ai.waiting').replace('{seconds}', String(aiWaitSeconds))}</span>
+                          <button className="dso-btn" onClick={() => { setAiOutputWatch(undefined); setNote({ ok: true, text: tt('ai.waitCanceled') }) }}>{tt('ai.cancelWait')}</button>
+                        </div>
                       )}
                       <div className="dso-muted">{tt('ai.hint')}</div>
                       <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('insert.templateLabel')}</div>

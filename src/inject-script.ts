@@ -81,14 +81,26 @@ export function renderBridgeScript(): string {
     try {
       if (raw instanceof URL) raw = raw.toString()
       if (typeof raw !== 'string') return raw
-      // Absolute URLs pointing at THIS loopback shell outside the proxy are
-      // re-rooted under the proxy; other hosts stay untouched.
+      // Root-relative upstream URLs are re-rooted under the proxy.
       if (raw.charAt(0) === '/') {
         if (!isProxyUrl(raw)) return PREFIX + raw
         return raw
       }
-      // Protocol-relative or absolute same-host URLs keep their scheme choice;
-      // proxy-resolved already; leave everything else alone.
+      // Overleaf's compile result builder deliberately turns output-file paths
+      // into absolute URLs with window.origin + file.url. Inside the embedded
+      // page, window.origin is the DSH loopback shell, so those PDF/log fetches
+      // bypass the proxy unless absolute same-origin URLs are re-rooted too.
+      // Relative strings are left alone so the injected <base> keeps handling
+      // their root semantics; external/CDN/blob/data origins remain untouched.
+      var isAbsolute = raw.indexOf('//') === 0 || /^[a-z][a-z0-9+.-]*:/i.test(raw)
+      if (isAbsolute) {
+        var parsed = new URL(raw.indexOf('//') === 0 ? location.protocol + raw : raw)
+        var isWorkbenchRoute = parsed.pathname.indexOf('/overleaf/workbench/') === 0
+        var isAlreadyProxied = parsed.pathname === PREFIX || parsed.pathname.indexOf(PREFIX + '/') === 0
+        if (parsed.origin === window.location.origin && !isWorkbenchRoute && !isAlreadyProxied) {
+          return window.location.origin + PREFIX + parsed.pathname + parsed.search + parsed.hash
+        }
+      }
       return raw
     } catch (err) {
       return raw
@@ -102,6 +114,16 @@ export function renderBridgeScript(): string {
     window.fetch = safe(function (input, init) {
       if (typeof input === 'string' || input instanceof URL) {
         arguments[0] = routeUrl(input)
+      } else if (typeof Request === 'function' && input instanceof Request) {
+        // Some PDF loaders pre-build a Request from the absolute output URL.
+        // Clone it with the routed URL so method, headers, body and signal are
+        // retained while the destination moves under /overleaf-proxy.
+        try {
+          var routedRequestUrl = routeUrl(input.url)
+          if (routedRequestUrl !== input.url) arguments[0] = new Request(routedRequestUrl, input)
+        } catch (requestError) {
+          if (DEBUG) log('request url fix failed', requestError)
+        }
       }
       return originalFetch.apply(window, arguments)
     }, 'fetch wrap')
@@ -637,12 +659,9 @@ export function renderBridgeScript(): string {
         if (!el.hasAttribute(attr)) continue
         var value = el.getAttribute(attr)
         if (typeof value !== 'string') continue
-        /* Only single-leading-slash URLs: leaves #fragments, //host, and
-           schemes untouched, and skips anything already proxied or the
-           bridge script itself. */
-        if (value.charAt(0) !== '/' || value.charAt(1) === '/') continue
-        if (value.indexOf(PREFIX + '/') === 0 || value.indexOf('/overleaf/workbench/') === 0) continue
-        el.setAttribute(attr, PREFIX + value)
+        if (value.indexOf('/overleaf/workbench/') === 0) continue
+        var routed = routeUrl(value)
+        if (routed !== value) el.setAttribute(attr, routed)
       }
     } catch (err) {
       if (DEBUG) log('fixResourceNode failed', err)

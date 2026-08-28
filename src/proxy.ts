@@ -28,6 +28,9 @@ const MAX_REWRITE_BODY_BYTES = 4 * 1024 * 1024
 /** Upstream connection timeout for regular proxied requests. */
 const REQUEST_TIMEOUT_MS = 60_000
 
+/** Compile is a synchronous long-poll and legitimately outlives asset calls. */
+const COMPILE_REQUEST_TIMEOUT_MS = 10 * 60_000
+
 /** Timeout granted to establish the tunneled upstream TCP/TLS connection. */
 const UPGRADE_CONNECT_TIMEOUT_MS = 10_000
 
@@ -339,6 +342,13 @@ export function subPathOf(rawUrl: string | undefined, prefix: string): string {
   return raw
 }
 
+/** Give synchronous Overleaf compile calls enough time without weakening every route. */
+export function requestTimeoutFor(target: URL): number {
+  return /\/project\/[^/]+\/compile\/?$/.test(target.pathname)
+    ? COMPILE_REQUEST_TIMEOUT_MS
+    : REQUEST_TIMEOUT_MS
+}
+
 /** Forward selection of inbound request headers toward one upstream request. */
 export function buildUpstreamHeaders(
   req: IncomingMessage,
@@ -383,7 +393,7 @@ function buildResponseHeaders(
   for (const [name, value] of Object.entries(upstreamHeaders)) {
     const lower = name.toLowerCase()
     if (HOP_BY_HOP.has(lower)) continue
-    if (lower === 'content-length' || lower === 'x-frame-options') continue
+    if (lower === 'x-frame-options') continue
     if (lower === 'content-security-policy') continue
     if (lower === 'set-cookie') {
       const cookies = Array.isArray(value) ? value : [value]
@@ -394,7 +404,9 @@ function buildResponseHeaders(
     if (value === undefined) continue
     if (lower === 'location' && typeof value === 'string') {
       try {
-        const resolved = new URL(value, target.origin)
+        // Relative redirects are relative to the actual upstream request URL,
+        // not merely its origin (important for project-scoped PDF downloads).
+        const resolved = new URL(value, target)
         headers[name] = resolved.origin === target.origin
           ? `${prefix}${resolved.pathname}${resolved.search}${resolved.hash}`
           : value
@@ -463,7 +475,7 @@ export class ReverseProxy {
         upstream = requestlib.request(target, {
           method: req.method,
           headers: upstreamHeaders,
-          timeout: REQUEST_TIMEOUT_MS,
+          timeout: requestTimeoutFor(target),
         }, upstreamRes => {
           void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, this.wsAllowOrigin, this.wsPort, settle)
         })
