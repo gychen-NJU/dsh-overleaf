@@ -12,6 +12,8 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import http from 'node:http'
+import { readFile, stat } from 'node:fs/promises'
+import { isAbsolute, join as joinPath } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type {} from '@deepseek-ai/dsh-credentials'
@@ -29,6 +31,13 @@ import type {
 
 /** Stable Cordis plugin name (the patch row `name:` must match package.json). */
 export const name = 'overleaf-workbench'
+
+/**
+ * Fixed workspace filename the agent is asked to write its final insert
+ * content into (see the AI-write flow). MUST match the constant in
+ * src/client/view.tsx. Reads are restricted to exactly this filename.
+ */
+export const INSERT_FILE_NAME = 'dsh-overleaf-insert.md'
 
 /** Services required before the host plugin can mount. */
 export const inject = ['webServer', 'credentials']
@@ -316,6 +325,21 @@ export class OverleafWorkbenchService extends Service {
       cursorInsertEnabled: this.config.cursorInsertEnabled,
       assistPanelEnabled: this.config.assistPanelEnabled,
     }))
+    // Agent-output handoff: the assistant is asked (in its prompt) to write
+    // the final content into dsh-overleaf-insert.md inside the workspace; the
+    // panel polls this route and inserts new content at the caret. Reads are
+    // limited to that single fixed filename inside the workspace directory.
+    this.route('/overleaf/workbench/read-insert-file', async payload => {
+      const cwd = stringField(payload, 'cwd')
+      if (cwd === undefined || cwd.trim() === '' || !isAbsolute(cwd.trim())) {
+        throw new Error('dsh-overleaf: read-insert-file requires an absolute cwd')
+      }
+      const target = joinPath(cwd.trim(), INSERT_FILE_NAME)
+      const stats = await stat(target).catch(() => undefined)
+      if (stats === undefined || !stats.isFile()) return { exists: false }
+      const content = await readFile(target, 'utf8')
+      return { exists: true, content, mtimeMs: stats.mtimeMs }
+    })
 
     // Bridge script asset (served from its own exact route; loopback-fenced).
     this.ctx.effect(() => this.ctx.webServer.register({

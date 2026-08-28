@@ -1,0 +1,22 @@
+﻿feat(panel): keep-alive iframe + agent-output auto-fetch (tab-switch UX + hands-off insert)
+
+User field feedback (three issues):
+
+1. "Cannot get the generated content without switching tabs" — the panel now
+   instructs the agent (in the composed prompt) to write its final content
+   into the workspace file dsh-overleaf-insert.md; the host exposes
+   read-insert-file (fixed filename inside the session cwd only) and the
+   panel polls it every 4s, auto-inserting NEW content at the caret. No tab
+   switching needed.
+2. "Tab switches lose the open project" — the conversation view unmounts on
+   tab switches, destroying a React-owned iframe. The persistent iframe now
+   lives at body level for the whole page lifetime and is positioned over
+   the stage with fixed geometry (ResizeObserver + interval re-sync);
+   unmount merely hides it. The open project, login state, and scroll
+   survive every tab switch. Reload button uses location.reload().
+3. "Talk about the project text with the agent" — AI write gained an
+   attach-full-document option (context radius 200k chars).
+
+Also: rebaseAttributeUrl double-prefix guard now also covers html inline
+style url(); locales zh/en for the new controls.
+version 0.3.1.

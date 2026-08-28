@@ -109,13 +109,45 @@ function ensureStyles(): void {
   document.head.appendChild(style)
 }
 
+/* ------------------------------------------------------------------ */
+/* Persistent iframe (tab-switch keep-alive)                            */
+/*                                                                      */
+/* DSH unmounts the inactive conversation view, which would destroy a   */
+/* React-owned iframe and reload /project on every tab switch. The      */
+/* iframe instead lives at body level for the whole page lifetime and   */
+/* is POSITIONED over the view's stage area with fixed geometry; on     */
+/* unmount it is merely hidden. The document (login state, scroll,      */
+/* open project) survives every tab switch.                             */
+/* ------------------------------------------------------------------ */
+
+let persistentFrame: HTMLIFrameElement | undefined
+let frameParking: HTMLDivElement | undefined
+
+function ensurePersistentFrame(): HTMLIFrameElement {
+  if (persistentFrame !== undefined) return persistentFrame
+  const frame = document.createElement('iframe')
+  frame.className = 'dso-frame'
+  frame.title = 'Overleaf'
+  frame.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen')
+  frame.src = '/overleaf-proxy/project'
+  frameParking = document.createElement('div')
+  frameParking.style.display = 'none'
+  document.body.appendChild(frameParking)
+  frameParking.appendChild(frame)
+  persistentFrame = frame
+  return frame
+}
+
+function hidePersistentFrame(): void {
+  if (persistentFrame !== undefined) persistentFrame.style.display = 'none'
+}
+
 /** OverleafView — registered under the conversation.view slot. */
 export function OverleafView(props: OverleafViewProps): ReactNode {
   ensureStyles()
   const { sessionId, t: tr, features, inputActions } = props
   const tt = tr ?? (key => String(key))
   const frameRef = useRef<HTMLIFrameElement | null>(null)
-  const [nonce, setNonce] = useState(0)
   const [status, setStatus] = useState<WorkbenchStatusWire | undefined>(undefined)
   const [embedInfo, setEmbedInfo] = useState<EmbedInfo | undefined>(features)
   const [engine, setEngine] = useState<EditorEngine>('none')
@@ -132,8 +164,12 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [embeddedLoginHint, setEmbeddedLoginHint] = useState(false)
   const [aiPrompt, setAiPrompt] = useState('')
   const [attachContext, setAttachContext] = useState(true)
+  const [attachFullDoc, setAttachFullDoc] = useState(false)
+  const [autoFetchOutput, setAutoFetchOutput] = useState(false)
   const [aiBusy, setAiBusy] = useState(false)
+  const onInsertRef = useRef<(text: string) => void>(() => undefined)
   const cursorContextRef = useRef<{ before: string; after: string; cursor: number } | undefined>(undefined)
+  const stageRef = useRef<HTMLDivElement | null>(null)
 
   // Same-origin detection: if the iframe document navigated itself outside
   // the proxy prefix (site anti-framing JS), surface a hint instead of a
@@ -146,6 +182,48 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       /* navigation still in flight; ignore */
     }
   }, [])
+
+  // Keep-alive: adopt the persistent iframe, position it over the stage area
+  // with fixed geometry, and re-sync on layout changes. On unmount the frame
+  // is hidden (NOT destroyed) so the open project survives tab switches.
+  useEffect(() => {
+    const frame = ensurePersistentFrame()
+    frameRef.current = frame
+    const sync = (): void => {
+      const stage = stageRef.current
+      if (stage === null) {
+        hidePersistentFrame()
+        return
+      }
+      const rect = stage.getBoundingClientRect()
+      if (rect.width < 40 || rect.height < 40) {
+        hidePersistentFrame()
+        return
+      }
+      frame.style.display = 'block'
+      frame.style.position = 'fixed'
+      frame.style.left = `${Math.round(rect.left)}px`
+      frame.style.top = `${Math.round(rect.top)}px`
+      frame.style.width = `${Math.round(rect.width)}px`
+      frame.style.height = `${Math.round(rect.height)}px`
+      frame.style.zIndex = '5'
+      frame.style.border = 'none'
+    }
+    sync()
+    const observer = new ResizeObserver(() => sync())
+    if (stageRef.current !== null) observer.observe(stageRef.current)
+    window.addEventListener('resize', sync)
+    const interval = window.setInterval(sync, 400)
+    frame.addEventListener('load', checkFrameLocation)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', sync)
+      window.clearInterval(interval)
+      frame.removeEventListener('load', checkFrameLocation)
+      hidePersistentFrame()
+      frameRef.current = null
+    }
+  }, [checkFrameLocation])
 
   const selectionQuoteEnabled = embedInfo?.selectionQuoteEnabled ?? true
   const cursorInsertEnabled = embedInfo?.cursorInsertEnabled ?? true
@@ -251,6 +329,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     setNote({ ok: true, text: tt('insert.action') })
     setInsertDraft('')
   }, [sendToFrame, tt])
+  onInsertRef.current = onInsert
 
   const requestOutline = useCallback((): void => {
     setOutlineItems(undefined)
@@ -337,6 +416,43 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     [sessionId],
   )
 
+  // After sending a request (which instructs the agent to write its final
+  // content into dsh-overleaf-insert.md), poll the host for that file and
+  // auto-insert NEW content at the caret — no tab switching needed.
+  useEffect(() => {
+    if (!autoFetchOutput) return
+    if (sessionId === undefined || sessionId === '') return
+    const cwd = sessionWorkspaceHint(sessionId)
+    if (cwd === undefined) return
+    let disposed = false
+    let lastSeen = ''
+    const tick = async (): Promise<void> => {
+      if (disposed) return
+      try {
+        const result = await postWorkbench<{ exists: boolean; content?: string; mtimeMs?: number }>(
+          '/overleaf/workbench/read-insert-file', { cwd }, 15_000,
+        )
+        if (disposed) return
+        if (result.exists === true && typeof result.content === 'string' && result.content.trim() !== '') {
+          const content = result.content
+          if (content !== lastSeen && lastSeen !== '') {
+            onInsertRef.current(content)
+            setNote({ ok: true, text: tt('ai.outputInserted') })
+            setAutoFetchOutput(false)
+            return
+          }
+          lastSeen = content
+        }
+      } catch { /* transient; keep polling */ }
+    }
+    const interval = window.setInterval(() => { void tick() }, 4_000)
+    void tick()
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
+    }
+  }, [autoFetchOutput, sessionId, tt])
+
   // Entry point: land directly on the project dashboard instead of the site
   // root, removing the root->dashboard redirect chain (and any ambiguity
   // around cached/restored intermediate pages).
@@ -378,11 +494,12 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     }
     setAiBusy(true)
     cursorContextRef.current = undefined
-    sendToFrame({ type: 'cursor-context-request', radius: 1200 })
+    sendToFrame({ type: 'cursor-context-request', radius: attachFullDoc ? 200_000 : 1200 })
     setTimeout(() => {
       try {
         const parts: string[] = [`【任务】${aiPrompt.trim()}`]
         parts.push('【输出要求】只输出最终需要插入或替换的 LaTeX 内容本身，不要解释，不要使用代码块围栏。')
+        parts.push('【重要】完成后，请把最终要插入的完整 LaTeX 内容原样写入当前工作区文件 dsh-overleaf-insert.md（纯内容，不要代码块围栏，不要解释）。')
         const ctx = cursorContextRef.current
         if (attachContext && ctx !== undefined) {
           parts.push('【光标前的文档内容】\n' + ctx.before)
@@ -393,19 +510,20 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         inputActions?.submit()
         setNote({ ok: true, text: tt('ai.sent') })
         setAiPrompt('')
+        setAutoFetchOutput(true)
       } catch (error) {
         setNote({ ok: false, text: String(error) })
       } finally {
         setAiBusy(false)
       }
     }, 350)
-  }, [aiPrompt, attachContext, inputActions, sendToFrame, tt])
+  }, [aiPrompt, attachContext, attachFullDoc, inputActions, sendToFrame, tt])
 
   return (
     <div className="dso-root">
       <div className="dso-toolbar">
         <span className="dso-toolbar-title">Overleaf</span>
-        <button className="dso-btn" title={tt('toolbar.reload')} onClick={() => setNonce(n => n + 1)}>⟳</button>
+        <button className="dso-btn" title={tt('toolbar.reload')} onClick={() => { try { frameRef.current?.contentWindow?.location.reload() } catch { /* cross-doc reload race */ } }}>⟳</button>
         <button
           className="dso-btn"
           title={tt('toolbar.openWindow')}
@@ -431,16 +549,10 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         {status?.baseUrl ?? ''}
         {workspaceHint !== undefined ? ` · ${workspaceHint}` : ''}
       </div>
-      <div className="dso-stage">
-        <iframe
-          ref={frameRef}
-          key={nonce}
-          className="dso-frame"
-          src={embedEntry}
-          title="Overleaf"
-          allow="clipboard-read; clipboard-write; fullscreen"
-          onLoad={checkFrameLocation}
-        />
+      <div className="dso-stage" ref={stageRef}>
+        {/* The persistent iframe lives at body level (see ensurePersistentFrame)
+            and is positioned over this stage area via fixed geometry; it is
+            hidden — never destroyed — when the tab or session changes. */}
         {frameEscaped && <div className="dso-hint" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>{tt('status.frameBust')}</div>}
         {embeddedLoginHint && <div className="dso-hint" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>{tt('status.embeddedLoginHint')}</div>}
         {selectedText !== undefined
@@ -478,6 +590,10 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                       <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
                         <input type="checkbox" checked={attachContext} onChange={event => setAttachContext(event.target.checked)} />
                         <span>{tt('ai.attachContext')}</span>
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
+                        <input type="checkbox" checked={attachFullDoc} onChange={event => setAttachFullDoc(event.target.checked)} />
+                        <span>{tt('ai.attachFullDoc')}</span>
                       </label>
                       <div style={{ display: 'flex', gap: 4 }}>
                         <button className="dso-btn dso-btn-primary" disabled={aiBusy} onClick={sendToAgent}>{tt('ai.send')}</button>
