@@ -1,7 +1,7 @@
 {
   "name": "dsh-overleaf",
   "description": "Embedded Overleaf workbench tab for DeepSeek Harness Web: same-origin reverse proxy for self-hosted or public Overleaf (no X-Frame-Options limits), direct-CDP login with credential storage, selection quoting into the composer, agent-driven cursor insertion, and LaTeX workflow helpers",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

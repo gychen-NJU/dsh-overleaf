@@ -68,6 +68,18 @@ async function main() {
       res.end(Buffer.from([0, 1, 2, 3, 250, 251]))
       return
     }
+    if (req.url === '/socket.io/socket.io.js') {
+      res.writeHead(200, { 'content-type': 'application/javascript' })
+      res.end('/* socket.io client fixture */')
+      return
+    }
+    if (req.url?.startsWith('/socket.io/')) {
+      // Classic socket.io polling endpoint: echo path + cookie so the test
+      // can assert prefix-less pass-through and credential injection.
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+      res.end(`poll-ok url=${req.url} cookie=${String(req.headers.cookie ?? '')}`)
+      return
+    }
     res.writeHead(200, {
       'content-type': 'text/html; charset=utf-8',
       'x-frame-options': 'DENY',
@@ -176,6 +188,25 @@ async function main() {
   assert.equal(echo.firstFrameText, 'pong-echo', 'initial push routed back')
   assert.equal(echo.echoedText, 'hello-tunnel', 'client frame echoed through tunnel')
   assert.ok(upgradesSeen >= 1, 'fixture saw the upgraded connection')
+
+  // 5b. Un-prefixed socket.io channels (classic clients connect at the
+  // current origin without any prefix): polling HTTP + WebSocket upgrade
+  // must both tunnel to the upstream with the ORIGINAL path and the
+  // stored credential injected.
+  const pollRes = await fetch(`${base}/socket.io/?EIO=4&transport=polling`, {
+    headers: { cookie: 'overleaf_session2=conflicting-browser-value' },
+  })
+  assert.equal(pollRes.status, 200, `socket.io polling status ${pollRes.status}`)
+  const pollBody = await pollRes.text()
+  assert.ok(pollBody.startsWith('poll-ok url=/socket.io/?EIO=4&transport=polling'),
+    `prefix-less polling pass-through: ${pollBody.slice(0, 200)}`)
+  assert.ok(pollBody.includes('overleaf_session2=stored-token'), 'credential injected into socket.io polling')
+  assert.ok(!pollBody.includes('conflicting-browser-value'), 'browser twin not leaked into socket.io polling')
+  const clientJsRes = await fetch(`${base}/overleaf-proxy/socket.io/socket.io.js`)
+  assert.equal(clientJsRes.status, 200, 'socket.io client asset served through prefix')
+  const unprefixedEcho = await wsEcho(PORT, '/socket.io/?EIO=4&transport=websocket')
+  assert.equal(unprefixedEcho.received101, true, 'prefix-less WS upgrade reaches the tunnel')
+  assert.equal(unprefixedEcho.echoedText, 'hello-tunnel', 'prefix-less tunnel echo works')
 
   // 6. Bridge asset route.
   const bridgeRes = await fetch(`${base}/overleaf/workbench/bridge.js`)

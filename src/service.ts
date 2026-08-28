@@ -295,7 +295,7 @@ export class OverleafWorkbenchService extends Service {
       },
     }), 'dsh-overleaf: reverse proxy')
 
-    for (const wsPath of ['/overleaf-proxy/socket.io/', '/overleaf-proxy/socket.io']) {
+    for (const wsPath of ['/overleaf-proxy/socket.io/', '/overleaf-proxy/socket.io', '/socket.io/', '/socket.io']) {
       this.ctx.effect(() => this.ctx.webServer.registerUpgrade({
         path: wsPath,
         handler: (req: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -307,6 +307,26 @@ export class OverleafWorkbenchService extends Service {
         },
       }), `dsh-overleaf: upgrade ${wsPath}`)
     }
+
+    // Classic socket.io clients (Overleaf's editor ships the 0.x/1.x client)
+    // connect to the CURRENT origin at the un-prefixed resource path
+    // `/socket.io/` - polling requests and the WebSocket upgrade both. DSH
+    // core and every known plugin leave that path unclaimed, so the proxy
+    // claims it as an alias of the prefixed channel (same loopback fence).
+    this.ctx.effect(() => this.ctx.webServer.register({
+      kind: 'prefix',
+      path: '/socket.io',
+      handler: async (req, res) => {
+        if (!isLoopback(req)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: { code: 'dsh-overleaf-loopback-only', message: 'proxy routes are loopback-only' },
+          })
+          return
+        }
+        await this.proxy.handle(req, res)
+      },
+    }), 'dsh-overleaf: socket.io polling alias')
   }
 
   /** Read current account state plus embed descriptors for the toolbar. */
