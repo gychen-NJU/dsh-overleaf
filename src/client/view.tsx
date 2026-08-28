@@ -121,7 +121,6 @@ function ensureStyles(): void {
 /* ------------------------------------------------------------------ */
 
 let persistentFrame: HTMLIFrameElement | undefined
-let frameParking: HTMLDivElement | undefined
 
 function ensurePersistentFrame(): HTMLIFrameElement {
   if (persistentFrame !== undefined) return persistentFrame
@@ -130,10 +129,12 @@ function ensurePersistentFrame(): HTMLIFrameElement {
   frame.title = 'Overleaf'
   frame.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen')
   frame.src = '/overleaf-proxy/project'
-  frameParking = document.createElement('div')
-  frameParking.style.display = 'none'
-  document.body.appendChild(frameParking)
-  frameParking.appendChild(frame)
+  // Attach DIRECTLY to body and keep it there forever. Moving an iframe in
+  // the DOM reloads it, so after creation the node is never re-parented —
+  // show/hide is done purely via inline styles. It starts hidden; the view
+  // effect reveals it with fixed geometry once the stage is measured.
+  frame.style.display = 'none'
+  document.body.appendChild(frame)
   persistentFrame = frame
   return frame
 }
@@ -198,6 +199,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       const rect = stage.getBoundingClientRect()
       if (rect.width < 40 || rect.height < 40) {
         hidePersistentFrame()
+        try { document.documentElement.setAttribute('data-dsh-frame', 'hidden:stage-too-small') } catch {}
         return
       }
       frame.style.display = 'block'
@@ -206,18 +208,25 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       frame.style.top = `${Math.round(rect.top)}px`
       frame.style.width = `${Math.round(rect.width)}px`
       frame.style.height = `${Math.round(rect.height)}px`
-      frame.style.zIndex = '5'
+      // The frame lives under <body> (root stacking context); DSH shell
+      // containers commonly use mid-range z-indexes, so claim a high one —
+      // the frame only ever covers the stage rectangle, nothing else.
+      frame.style.zIndex = '99999'
       frame.style.border = 'none'
+      try { document.documentElement.setAttribute('data-dsh-frame', `visible ${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`) } catch {}
     }
     sync()
     const observer = new ResizeObserver(() => sync())
     if (stageRef.current !== null) observer.observe(stageRef.current)
     window.addEventListener('resize', sync)
+    // Any scrollable ancestor changes the stage's viewport rect.
+    window.addEventListener('scroll', sync, true)
     const interval = window.setInterval(sync, 400)
     frame.addEventListener('load', checkFrameLocation)
     return () => {
       observer.disconnect()
       window.removeEventListener('resize', sync)
+      window.removeEventListener('scroll', sync, true)
       window.clearInterval(interval)
       frame.removeEventListener('load', checkFrameLocation)
       hidePersistentFrame()
