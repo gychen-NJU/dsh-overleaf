@@ -152,11 +152,237 @@ export function renderBridgeScript(): string {
     }
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Compile-log capture (auto-fix source)                             */
+  /*                                                                    */
+  /* The panel's compile-fix tab needs the raw compiler output. Every    */
+  /* compile POST and every output.pdf load passes the fetch/XHR        */
+  /* wrappers below; when one is seen, the same build's output.log      */
+  /* (and .blg) are fetched through the proxy and published to the      */
+  /* shell. NOTE: this file is generated from a TS template literal -   */
+  /* every regex backslash must be doubled, and no backtick or dollar-  */
+  /* brace sequence may appear (even in comments).                      */
+  /* ---------------------------------------------------------------- */
+  var lastCompileStatus = undefined
+  var lastCompileLogs = undefined
+  var logFetchInFlight = false
+
+  function pathnameOf(rawUrl) {
+    try {
+      if (rawUrl instanceof URL) rawUrl = rawUrl.toString()
+      if (typeof rawUrl !== 'string' || rawUrl === '') return ''
+      var absolute = rawUrl.indexOf('//') === 0
+        ? location.protocol + rawUrl
+        : (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl) ? rawUrl : location.origin + (rawUrl.charAt(0) === '/' ? rawUrl : '/' + rawUrl))
+      return new URL(absolute).pathname
+    } catch (err) {
+      return ''
+    }
+  }
+
+  function isCompilePost(rawUrl) {
+    return /^\\/project\\/[^/]+\\/compile\\/?$/.test(pathnameOf(rawUrl))
+  }
+
+  function isOutputPdf(rawUrl) {
+    return /\\/output\\/output\\.pdf(?:[?#]|$)/.test(pathnameOf(rawUrl))
+  }
+
+  function truncateText(text, max) {
+    if (typeof text !== 'string') return ''
+    return text.length > max ? text.slice(0, max) + '\\n...[truncated]' : text
+  }
+
+  function fetchWithTimeout(url) {
+    try {
+      var controller = typeof AbortController === 'function' ? new AbortController() : undefined
+      if (controller) setTimeout(function () { try { controller.abort() } catch (err) {} }, 30000)
+      return window.fetch(url, {
+        cache: 'no-store',
+        signal: controller ? controller.signal : undefined,
+      })
+    } catch (err) {
+      return Promise.reject(err)
+    }
+  }
+
+  function publishCompileLog() {
+    sendToParent({
+      type: 'compile-log',
+      status: lastCompileStatus || 'unknown',
+      files: lastCompileLogs || [],
+    })
+  }
+
+  function fetchAndPublishLog(fullUrl, pathName) {
+    if (logFetchInFlight) return
+    logFetchInFlight = true
+    fetchWithTimeout(fullUrl)
+      .then(function (response) {
+        if (!response.ok) return { path: pathName, text: '', error: 'HTTP ' + response.status }
+        return response.text().then(function (text) {
+          return { path: pathName, text: truncateText(text, 262144) }
+        })
+      })
+      .then(function (captured) {
+        var previous = lastCompileLogs || []
+        var rest = previous.filter(function (item) { return item && item.path !== pathName })
+        lastCompileLogs = rest.concat([captured])
+        publishCompileLog()
+      })
+      .catch(function (err) {
+        if (DEBUG) log('compile log fetch failed', err)
+      })
+      .finally(function () { logFetchInFlight = false })
+  }
+
+  /* Observed on a compile POST response: read outputFiles, fetch every
+     .log/.blg through the proxy with the same compileGroup/clsiServerId
+     query the frontend uses. */
+  function captureCompileResponse(json) {
+    try {
+      if (!json || !json.outputFiles || !Array.isArray(json.outputFiles)) return
+      if (typeof json.status === 'string') lastCompileStatus = json.status
+      var pdfDomain = typeof json.pdfDownloadDomain === 'string' ? json.pdfDownloadDomain : ''
+      var params = new URLSearchParams()
+      if (json.compileGroup) params.set('compileGroup', String(json.compileGroup))
+      if (json.clsiServerId) params.set('clsiserverid', String(json.clsiServerId))
+      params.set('enable_pdf_caching', 'true')
+      var query = params.toString()
+      var found = []
+      for (var i = 0; i < json.outputFiles.length; i++) {
+        var entry = json.outputFiles[i]
+        var filePath = entry && typeof entry.path === 'string' ? entry.path : ''
+        var relUrl = entry && typeof entry.url === 'string' ? entry.url : ''
+        if (!/\\.(?:log|blg)$/i.test(filePath) || relUrl === '' || found.length >= 4) continue
+        var target = pdfDomain !== '' && relUrl.charAt(0) === '/'
+          ? pdfDomain + relUrl
+          : relUrl
+        found.push({ path: filePath, url: target + (query !== '' ? '?' + query : '') })
+      }
+      for (var j = 0; j < found.length; j++) {
+        fetchAndPublishLog(found[j].url, found[j].path)
+      }
+    } catch (err) {
+      if (DEBUG) log('compile capture failed', err)
+    }
+  }
+
+  /* Fallback: an output.pdf load also reveals the build path - fetch the
+     companion output.log with the SAME query the pdf request carried. */
+  function captureLogFromOutputPdf(rawUrl) {
+    try {
+      var absolute = rawUrl.indexOf('//') === 0
+        ? location.protocol + rawUrl
+        : (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl) ? rawUrl : location.origin + rawUrl)
+      var parsed = new URL(absolute)
+      if (!/\\.pdf$/i.test(parsed.pathname)) return
+      parsed.pathname = parsed.pathname.replace(/\\.pdf$/i, '.log')
+      fetchAndPublishLog(parsed.toString(), 'output.log')
+    } catch (err) {
+      if (DEBUG) log('pdf log fallback failed', err)
+    }
+  }
+
+  function currentDocName() {
+    try {
+      var candidates = document.querySelectorAll('.document-title, [class*="document-title"], [class*="doc-title"], [class*="file-tree"] [class*="name"]')
+      for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i] && candidates[i].textContent) {
+          var text = String(candidates[i].textContent).trim()
+          if (text !== '' && text.length < 120) return text
+        }
+      }
+    } catch (err) {}
+    return 'current-document'
+  }
+
+  /* Apply a validated edit list (each old must match once) to the live
+     editor document, from the LAST edit backwards so ranges stay valid. */
+  function applyFixEdits(edits) {
+    try {
+      if (!Array.isArray(edits) || edits.length === 0) {
+        sendToParent({ type: 'fix-applied', ok: false, error: 'no-edits' })
+        return
+      }
+      var cm5 = findCm5()
+      if (cm5) {
+        var doc5 = String(cm5.getValue())
+        var steps5 = buildFixSteps(edits, doc5)
+        if (!steps5.ok) { sendToParent({ type: 'fix-applied', ok: false, error: steps5.error, detail: steps5.detail }); return }
+        rememberSnapshot(doc5)
+        var sorted5 = steps5.steps.slice().sort(function (a, b) { return b.from - a.from })
+        for (var s5 = 0; s5 < sorted5.length; s5++) {
+          cm5.replaceRange(sorted5[s5].replacement, cm5.posFromIndex(sorted5[s5].from), cm5.posFromIndex(sorted5[s5].to))
+        }
+        cm5.focus()
+        sendToParent({ type: 'fix-applied', ok: true, applied: sorted5.length })
+        return
+      }
+      var cm6 = findCm6()
+      if (cm6) {
+        var doc6 = cm6.state.doc.toString()
+        var steps6 = buildFixSteps(edits, doc6)
+        if (!steps6.ok) { sendToParent({ type: 'fix-applied', ok: false, error: steps6.error, detail: steps6.detail }); return }
+        rememberSnapshot(doc6)
+        var sorted6 = steps6.steps.slice().sort(function (a, b) { return b.from - a.from })
+        cm6.dispatch({
+          changes: sorted6.map(function (step) { return { from: step.from, to: step.to, insert: step.replacement } }),
+        })
+        cm6.focus()
+        sendToParent({ type: 'fix-applied', ok: true, applied: sorted6.length })
+        return
+      }
+      sendToParent({ type: 'fix-applied', ok: false, error: 'no-editor' })
+    } catch (err) {
+      sendToParent({ type: 'fix-applied', ok: false, error: err && err.message ? err.message : String(err) })
+    }
+  }
+
+  function buildFixSteps(edits, doc) {
+    var steps = []
+    for (var i = 0; i < edits.length; i++) {
+      var edit = edits[i]
+      var oldText = edit && typeof edit.old === 'string' ? edit.old : ''
+      var newText = edit && typeof edit.new === 'string' ? edit.new : ''
+      if (oldText === '') return { ok: false, error: 'empty-old' }
+      if (oldText.length > doc.length) return { ok: false, error: 'not-found', detail: oldText.slice(0, 80) }
+      var first = doc.indexOf(oldText)
+      if (first < 0) return { ok: false, error: 'not-found', detail: oldText.slice(0, 80) }
+      if (doc.indexOf(oldText, first + 1) >= 0) return { ok: false, error: 'not-unique', detail: oldText.slice(0, 80) }
+      steps.push({ from: first, to: first + oldText.length, replacement: newText })
+    }
+    return { ok: true, steps: steps }
+  }
+
+  function clickRecompile() {
+    try {
+      var candidates = document.querySelectorAll('button, [role="button"], [aria-label]')
+      for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i]
+        var aria = String(el.getAttribute && el.getAttribute('aria-label') || '')
+        var title = String(el.getAttribute && el.getAttribute('title') || '')
+        var label = String(el.textContent || '').trim()
+        if (/^(recompile|compile|重新编译|编译)$/i.test(label) || /^recompile$/i.test(aria) || /^recompile$/i.test(title)) {
+          (function (target) {
+            setTimeout(function () { try { target.click() } catch (err) {} }, 0)
+          })(el)
+          sendToParent({ type: 'recompile-clicked', ok: true })
+          return
+        }
+      }
+      sendToParent({ type: 'recompile-clicked', ok: false })
+    } catch (err) {
+      sendToParent({ type: 'recompile-clicked', ok: false })
+    }
+  }
+
   /* fetch wrapper */
   var originalFetch = null
   if (typeof window.fetch === 'function') {
     originalFetch = window.fetch
     window.fetch = safe(function (input, init) {
+      var rawUrl = typeof input === 'string' ? input : (typeof Request === 'function' && input instanceof Request ? input.url : '')
       if (typeof input === 'string' || input instanceof URL) {
         arguments[0] = routeUrl(input)
       } else if (typeof Request === 'function' && input instanceof Request) {
@@ -170,7 +396,28 @@ export function renderBridgeScript(): string {
           if (DEBUG) log('request url fix failed', requestError)
         }
       }
-      return originalFetch.apply(window, arguments)
+      var routedResult = originalFetch.apply(window, arguments)
+      // Compile-fix source: compile POST responses reveal output.log/.blg URLs;
+      // an output.pdf load reveals the build path as a fallback.
+      if (rawUrl !== '' && isCompilePost(rawUrl)) {
+        var fetchMethod = String((init && init.method) || (typeof Request === 'function' && input instanceof Request ? input.method : 'GET')).toUpperCase()
+        if (fetchMethod === 'POST') {
+          routedResult
+            .then(function (response) {
+              try {
+                response.clone().json()
+                  .then(function (json) { captureCompileResponse(json) })
+                  .catch(function () {})
+              } catch (err) {
+                if (DEBUG) log('compile clone failed', err)
+              }
+            })
+            .catch(function () {})
+        }
+      } else if (rawUrl !== '' && isOutputPdf(rawUrl)) {
+        setTimeout(function () { captureLogFromOutputPdf(rawUrl) }, 0)
+      }
+      return routedResult
     }, 'fetch wrap')
   }
 
@@ -180,8 +427,31 @@ export function renderBridgeScript(): string {
     if (proto && typeof proto.open === 'function') {
       var originalOpen = proto.open
       proto.open = safe(function (method, url) {
+        var rawUrl = typeof url === 'string' ? url : ''
         if (typeof url === 'string') {
           arguments[1] = routeUrl(url)
+        }
+        // XHR backup for the compile-log source (some deployments/issues use
+        // XHR for the compile POST - the fetch wrapper alone would miss them).
+        if (rawUrl !== '' && typeof this.addEventListener === 'function') {
+          try {
+            var xhr = this
+            xhr.addEventListener('readystatechange', function () {
+              if (xhr.readyState !== 4) return
+              try {
+                if (isCompilePost(rawUrl) && xhr.status === 200 && typeof xhr.responseText === 'string' && xhr.responseText !== '') {
+                  var parsedPayload = JSON.parse(xhr.responseText)
+                  if (parsedPayload) captureCompileResponse(parsedPayload)
+                } else if (isOutputPdf(rawUrl)) {
+                  captureLogFromOutputPdf(rawUrl)
+                }
+              } catch (err) {
+                if (DEBUG) log('xhr compile capture failed', err)
+              }
+            })
+          } catch (err) {
+            if (DEBUG) log('xhr hook failed', err)
+          }
         }
         return originalOpen.apply(this, arguments)
       }, 'xhr wrap')
@@ -638,6 +908,38 @@ export function renderBridgeScript(): string {
     }
     if (data.type === 'replace-selection') {
       replaceSavedEditorSelection(String(data.selectionId || ''), String(data.text || ''))
+      return
+    }
+    if (data.type === 'compile-log-request') {
+      publishCompileLog()
+      return
+    }
+    if (data.type === 'document-request') {
+      try {
+        var docText = readDocValue()
+        if (docText === undefined) {
+          sendToParent({ type: 'document', name: 'current-document', text: '', error: 'no-editor' })
+          return
+        }
+        var fullDoc = String(docText)
+        var cappedDoc = truncateText(fullDoc, 200000)
+        sendToParent({
+          type: 'document',
+          name: currentDocName(),
+          text: cappedDoc,
+          truncated: cappedDoc.length < fullDoc.length,
+        })
+      } catch (err) {
+        sendToParent({ type: 'document', name: 'current-document', text: '', error: err && err.message })
+      }
+      return
+    }
+    if (data.type === 'apply-fix-edits') {
+      applyFixEdits(data.edits)
+      return
+    }
+    if (data.type === 'recompile-click') {
+      clickRecompile()
       return
     }
     if (data.type === 'reveal') {

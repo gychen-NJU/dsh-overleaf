@@ -38,7 +38,7 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 | R4 · 底部原生输入框 | 视图只替换消息区域；composer、工作区记录、交付物一概不动 |
 | R5 · 选区引用 | iframe 内 `selectionchange` 浮出引用按钮；点击经官方引用管线写入 chip（`inputTriggers.registerSource({name:'quote-ref'})` codec），管线缺失时退化为纯文本块引用 |
 | R6 · 光标处生成 | 模板插入（section/subsection/figure/table/equation/BibTeX）与自由粘贴通过 CodeMirror API 写入实时光标（CM5 主通道，CM6 探测，可编辑兜底）。自动写入模型回复列入后续计划；按任务书要求注明所属 lane |
-| R7 · 辅助功能 | 辅助面板：AI 写入；针对编辑器选区向智能体提问或生成可审阅的替换内容；从编辑器缓冲抽取文档大纲并可跳转闪烁；登录/登出/Cookie 管理；状态上报（`assistPanelEnabled` 开关控制面板显隐） |
+| R7 · 辅助功能 | 辅助面板：AI 写入；针对编辑器选区向智能体提问或生成可审阅的替换内容；读取编译日志并让智能体自动修复错误/警告（生成可审阅的编辑清单，每条 old 唯一匹配后才应用）；从编辑器缓冲抽取文档大纲并可跳转闪烁；登录/登出/Cookie 管理；状态上报（`assistPanelEnabled` 开关控制面板显隐） |
 
 ## 安装
 
@@ -124,7 +124,7 @@ scripts/
 4. 不超过 4MB 的 `text/html` 缓冲一次处理：根相对的 `href/src/action/poster/data-src` 与 `srcset` 加前缀，并在 `<head>` 后注入 `<base href="/overleaf-proxy/">` 与桥接脚本。超大 HTML 及其他类型一律原样流式。
 5. WebSocket：真实 webserver 把精确升级路径分派给 TCP/TLS 隧道——向上游重放握手字节再双向逐字节拼接。
 
-在被代理文档内，桥接脚本安装防御性包装（`fetch`、`XMLHttpRequest.open`、`EventSource`、`WebSocket`），让运行期新建的根相对 URL 也落回前缀；通过 CodeMirror API 上报选区及安全锚点；暴露光标写入、带冲突检测的选区替换、大纲和跳转命令；并在每次变更前保存 localStorage 快照供回滚。
+在被代理文档内，桥接脚本安装防御性包装（`fetch`、`XMLHttpRequest.open`、`EventSource`、`WebSocket`），让运行期新建的根相对 URL 也落回前缀；通过 CodeMirror API 上报选区及安全锚点；监测编译响应并抓取本次构建的 output.log 供自动修复面板使用；暴露光标写入、带冲突检测的选区替换、大纲和跳转命令；并在每次变更前保存 localStorage 快照供回滚。
 
 ## 登录
 

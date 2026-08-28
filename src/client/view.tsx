@@ -13,8 +13,11 @@ import {
 } from './workbench.ts'
 import { postWorkbench } from './wire.ts'
 import type { EmbedInfo, LoginStatusWire, WorkbenchStatusWire } from './wire.ts'
-import { buildSelectionAgentPrompt, cleanAgentInsertContent, insertFileSignature } from './ai-output.ts'
-import type { InsertFileSnapshot } from './ai-output.ts'
+import {
+  buildFixCompilePrompt, buildSelectionAgentPrompt, cleanAgentInsertContent, insertFileSignature,
+  parseCompileLog, parseFixEdits,
+} from './ai-output.ts'
+import type { CompileLogItem, FixEditParse, InsertFileSnapshot } from './ai-output.ts'
 
 /** Message shape sent by the embedded bridge script. */
 export interface BridgeMessage {
@@ -44,7 +47,7 @@ interface AiOutputWatch {
   cwd: string
   baselineSignature: string
   startedAt: number
-  purpose: 'insert' | 'selection-replace'
+  purpose: 'insert' | 'selection-replace' | 'fix'
   selection?: EditorSelectionTarget | undefined
 }
 
@@ -117,6 +120,12 @@ function ensureStyles(): void {
 .dso-textarea{width:100%;box-sizing:border-box;min-height:72px;resize:vertical;font-family:var(--ds-font-family-code,monospace);font-size:12px;padding:6px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dso-outline-row{display:flex;align-items:center;gap:6px;justify-content:space-between;padding:2px 0;cursor:pointer}
 .dso-outline-row:hover{color:var(--dsw-alias-brand-primary)}
+.dso-log-list{display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;padding:4px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
+.dso-log-row{display:flex;gap:6px;align-items:flex-start;font-size:11px;line-height:1.45}
+.dso-log-badge{flex:none;min-width:16px;text-align:center;border-radius:4px;font-weight:700;font-size:10px;padding:0 3px;background:var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary)}
+.dso-log-row[data-level="error"] .dso-log-badge{background:var(--dsw-alias-state-error-primary,#c0392b);color:#fff}
+.dso-log-row[data-level="warning"] .dso-log-badge{background:var(--dsw-alias-state-warning-primary,#b8860b);color:#fff}
+.dso-log-text{word-break:break-word;color:var(--dsw-alias-label-primary)}
 .dso-modal-scrim{position:absolute;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:40}
 .dso-modal{width:min(520px,94%);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:8px;box-shadow:0 12px 40px rgba(0,0,0,.28)}
 .dso-modal h3{margin:0;font-size:13px;color:var(--dsw-alias-label-primary)}
@@ -175,13 +184,24 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [selectedText, setSelectedText] = useState<string | undefined>(undefined)
   const [note, setNote] = useState<{ ok: boolean; text: string } | undefined>(undefined)
   const [panelOpen, setPanelOpen] = useState(false)
-  const [panelTab, setPanelTab] = useState<'insert' | 'selection' | 'outline' | 'status'>('insert')
+  const [panelTab, setPanelTab] = useState<'insert' | 'selection' | 'compile' | 'outline' | 'status'>('insert')
   const [insertDraft, setInsertDraft] = useState('')
   const [selectionTarget, setSelectionTarget] = useState<EditorSelectionTarget | undefined>(undefined)
   const [selectionPrompt, setSelectionPrompt] = useState('')
   const [selectionDraft, setSelectionDraft] = useState('')
   const [pendingReplacement, setPendingReplacement] = useState<EditorSelectionTarget | undefined>(undefined)
   const [outlineItems, setOutlineItems] = useState<OutlineItem[] | undefined>(undefined)
+  const [compileInfo, setCompileInfo] = useState<{
+    status: string
+    files: Array<{ path: string; text: string; error?: string | undefined }>
+    items: CompileLogItem[]
+    errors: number
+    warnings: number
+    at: number
+  } | undefined>(undefined)
+  const [fixDraft, setFixDraft] = useState('')
+  const [fixParsed, setFixParsed] = useState<FixEditParse | undefined>(undefined)
+  const docRef = useRef<{ name: string; text: string } | undefined>(undefined)
   const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
   const [cookieValue, setCookieValue] = useState('')
   const [busy, setBusy] = useState<'login' | 'cookie' | undefined>(undefined)
@@ -351,6 +371,56 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
             : undefined
           return
         }
+        case 'compile-log': {
+          const report = data as unknown as {
+            status?: string
+            files?: Array<{ path?: string; text?: string; error?: string }>
+          }
+          const files = Array.isArray(report.files)
+            ? report.files.map(file => ({
+                path: typeof file?.path === 'string' ? file.path : 'unknown',
+                text: typeof file?.text === 'string' ? file.text : '',
+                ...(typeof file?.error === 'string' ? { error: file.error } : {}),
+              }))
+            : []
+          const combined = files.map(file => file.text).join('\n')
+          const parsed = parseCompileLog(combined)
+          setCompileInfo({
+            status: typeof report.status === 'string' ? report.status : 'unknown',
+            files,
+            items: parsed.items,
+            errors: parsed.errors,
+            warnings: parsed.warnings,
+            at: Date.now(),
+          })
+          return
+        }
+        case 'document': {
+          const doc = data as unknown as { name?: string; text?: string; error?: string }
+          if (doc.error === undefined && typeof doc.text === 'string') {
+            docRef.current = { name: typeof doc.name === 'string' ? doc.name : 'current-document', text: doc.text }
+          }
+          return
+        }
+        case 'fix-applied': {
+          const done = data as unknown as { ok?: boolean; applied?: number; error?: string; detail?: string }
+          if (done.ok === true) {
+            setFixDraft('')
+            setFixParsed(undefined)
+            setNote({ ok: true, text: tt('compile.applied').replace('{count}', String(done.applied ?? 0)) })
+          } else {
+            const detail = done.error === 'no-editor'
+              ? tt('compile.applyFailed').replace('{detail}', 'no-editor')
+              : tt('compile.applyFailed').replace('{detail}', String(done.detail ?? done.error ?? '').slice(0, 120))
+            setNote({ ok: false, text: detail })
+          }
+          return
+        }
+        case 'recompile-clicked': {
+          const done = data as unknown as { ok?: boolean }
+          setNote({ ok: done.ok === true, text: done.ok === true ? tt('compile.recompileSent') : tt('compile.recompileFailed') })
+          return
+        }
         case 'url-change': {
           const href = typeof (data as { href?: unknown }).href === 'string'
             ? (data as { href: string }).href
@@ -499,7 +569,8 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       }
       try {
         const result = await postWorkbench<InsertFileSnapshot>(
-          '/overleaf/workbench/read-insert-file', { cwd: aiOutputWatch.cwd }, 15_000,
+          aiOutputWatch.purpose === 'fix' ? '/overleaf/workbench/read-fix-file' : '/overleaf/workbench/read-insert-file',
+          { cwd: aiOutputWatch.cwd }, 15_000,
         )
         if (disposed) return
         const signature = insertFileSignature(result)
@@ -520,10 +591,20 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           setSelectionDraft(clean)
           setPendingReplacement(aiOutputWatch.selection)
           setNote({ ok: true, text: tt('selection.outputReady') })
-        } else {
-          setInsertDraft(clean)
-          setNote({ ok: true, text: tt('ai.outputReady') })
+          return
         }
+        if (aiOutputWatch.purpose === 'fix') {
+          const parsed = parseFixEdits(clean)
+          setFixDraft(clean)
+          setFixParsed(parsed)
+          setNote({
+            ok: parsed.ok,
+            text: parsed.ok ? tt('compile.fixReady') : tt('compile.fixEmpty'),
+          })
+          return
+        }
+        setInsertDraft(clean)
+        setNote({ ok: true, text: tt('ai.outputReady') })
       } catch { /* transient; keep polling */ }
     }
     const interval = window.setInterval(() => { void tick() }, 2_000)
@@ -702,6 +783,88 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     sendToFrame({ type: 'replace-selection', selectionId: pendingReplacement.selectionId, text: selectionDraft })
   }, [pendingReplacement, selectionDraft, sendToFrame, tt])
 
+  const openCompileTab = useCallback((): void => {
+    setPanelTab('compile')
+    sendToFrame({ type: 'compile-log-request' })
+  }, [sendToFrame])
+
+  const sendFixToAgent = useCallback((): void => {
+    if (inputActions?.setDraft === undefined || inputActions?.submit === undefined) {
+      setNote({ ok: false, text: tt('ai.composerUnavailable') })
+      return
+    }
+    if (aiOutputWatch !== undefined || aiBusy) return
+    if (compileInfo === undefined || compileInfo.items.length === 0) {
+      setNote({ ok: false, text: tt('compile.empty') })
+      sendToFrame({ type: 'compile-log-request' })
+      return
+    }
+    setAiBusy(true)
+    docRef.current = undefined
+    const docRequest = new Promise<{ name: string; text: string } | undefined>(resolve => {
+      const started = Date.now()
+      const timer = window.setInterval(() => {
+        if (docRef.current !== undefined) {
+          window.clearInterval(timer)
+          resolve(docRef.current)
+        } else if (Date.now() - started > 4_500) {
+          window.clearInterval(timer)
+          resolve(undefined)
+        }
+      }, 100)
+      sendToFrame({ type: 'document-request' })
+    })
+    void (async () => {
+      try {
+        const documentSnapshot = await docRequest
+        if (documentSnapshot === undefined || documentSnapshot.text.trim() === '') {
+          setNote({ ok: false, text: tt('compile.staleDoc') })
+          return
+        }
+        const cwd = sessionId === undefined ? undefined : sessionWorkspaceHint(sessionId)
+        const baseline = cwd === undefined
+          ? undefined
+          : await postWorkbench<InsertFileSnapshot>('/overleaf/workbench/read-fix-file', { cwd }, 15_000)
+              .catch(() => undefined)
+        const logText = compileInfo.files.map(file => file.text).join('\n')
+        const prompt = buildFixCompilePrompt({
+          logText: logText.slice(0, 120_000),
+          docText: documentSnapshot.text.slice(0, 120_000),
+          docName: documentSnapshot.name,
+          errors: compileInfo.errors,
+          warnings: compileInfo.warnings,
+        })
+        inputActions?.setDraft(prompt)
+        inputActions?.submit()
+        setFixDraft('')
+        setFixParsed(undefined)
+        if (cwd !== undefined && baseline !== undefined) {
+          setAiOutputWatch({ cwd, baselineSignature: insertFileSignature(baseline), startedAt: Date.now(), purpose: 'fix' })
+          setNote({ ok: true, text: tt('compile.fixSent') })
+        } else {
+          setNote({ ok: false, text: tt('ai.autoCaptureUnavailable') })
+        }
+      } catch (error) {
+        setNote({ ok: false, text: String(error) })
+      } finally {
+        setAiBusy(false)
+      }
+    })()
+  }, [aiBusy, aiOutputWatch, compileInfo, inputActions, sendToFrame, sessionId, tt])
+
+  const applyFix = useCallback((): void => {
+    if (fixDraft.trim() === '') {
+      setNote({ ok: false, text: tt('compile.fixEmpty') })
+      return
+    }
+    const parsed = parseFixEdits(fixDraft)
+    if (!parsed.ok) {
+      setNote({ ok: false, text: tt('compile.fixEmpty') })
+      return
+    }
+    sendToFrame({ type: 'apply-fix-edits', edits: parsed.edits.map(edit => ({ old: edit.old, new: edit.new })) })
+  }, [fixDraft, sendToFrame, tt])
+
   return (
     <div className="dso-root">
       <div className="dso-toolbar">
@@ -751,6 +914,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                 <div className="dso-tabs">
                   {([['insert', tt('panel.tabInsert'), () => setPanelTab('insert')],
                     ['selection', tt('panel.tabSelection'), () => { setPanelTab('selection'); sendToFrame({ type: 'selection-request' }) }],
+                    ['compile', tt('panel.tabCompile'), openCompileTab],
                     ['outline', tt('panel.tabOutline'), openOutlineTab],
                     ['status', tt('panel.tabStatus'), () => setPanelTab('status')]] as Array<[string, string, () => void]>).map(([id, label, run]) => (
                       <button
@@ -878,6 +1042,90 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                         onClick={replaceSelectedText}
                       >{tt('selection.replace')}</button>
                       <div className="dso-muted">{tt('selection.safety')}</div>
+                    </>
+                  )}
+                  {panelTab === 'compile' && (
+                    <>
+                      <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('compile.title')}</div>
+                      <div className="dso-muted">{tt('compile.hint')}</div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                        <button className="dso-btn" onClick={() => sendToFrame({ type: 'compile-log-request' })}>{tt('compile.refresh')}</button>
+                        <button className="dso-btn" onClick={() => sendToFrame({ type: 'recompile-click' })}>{tt('compile.recompile')}</button>
+                      </div>
+                      {compileInfo === undefined ? (
+                        <div className="dso-muted">{tt('compile.empty')}</div>
+                      ) : (
+                        <>
+                          <div className="dso-muted">
+                            {tt('compile.summary')
+                              .replace('{status}', compileInfo.status)
+                              .replace('{errors}', String(compileInfo.errors))
+                              .replace('{warnings}', String(compileInfo.warnings))}
+                          </div>
+                          <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('compile.listTitle')}</div>
+                          {compileInfo.items.length === 0
+                            ? <div className="dso-muted">{tt('compile.noIssue')}</div>
+                            : (
+                                <div className="dso-log-list">
+                                  {compileInfo.items.slice(0, 40).map((item, index) => (
+                                    <div key={`${index}-${item.message.slice(0, 12)}`} className="dso-log-row" data-level={item.level}>
+                                      <span className="dso-log-badge">{item.level === 'error' ? 'E' : 'W'}</span>
+                                      <span className="dso-log-text">
+                                        {item.file !== undefined ? `${item.file}${item.line !== undefined ? `:${item.line}` : ''} ` : ''}
+                                        {item.message}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                          <button
+                            className="dso-btn dso-btn-primary"
+                            disabled={aiBusy || aiOutputWatch !== undefined || compileInfo.items.length === 0}
+                            onClick={sendFixToAgent}
+                          >{tt('compile.fix')}</button>
+                        </>
+                      )}
+                      {aiBusy && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span>{tt('ai.preparing')}</span>
+                        </div>
+                      )}
+                      {aiOutputWatch?.purpose === 'fix' && (
+                        <div className="dso-ai-wait" role="status" aria-live="polite">
+                          <span className="dso-ai-spinner" aria-hidden="true" />
+                          <span style={{ flex: 1 }}>{tt('compile.waiting').replace('{seconds}', String(aiWaitSeconds))}</span>
+                          <button className="dso-btn" onClick={() => { setAiOutputWatch(undefined); setNote({ ok: true, text: tt('ai.waitCanceled') }) }}>{tt('ai.cancelWait')}</button>
+                        </div>
+                      )}
+                      {fixDraft !== '' && (
+                        <>
+                          <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('compile.result')}</div>
+                          {fixParsed !== undefined && (
+                            <div className="dso-muted">
+                              {fixParsed.ok
+                                ? tt('compile.editsCount').replace('{count}', String(fixParsed.edits.length))
+                                : fixParsed.remark !== undefined
+                                  ? tt('compile.fixRemark').replace('{remark}', fixParsed.remark.slice(0, 240))
+                                  : tt('compile.fixEmpty')}
+                            </div>
+                          )}
+                          <textarea
+                            className="dso-textarea"
+                            value={fixDraft}
+                            onChange={event => { setFixDraft(event.target.value); setFixParsed(parseFixEdits(event.target.value)) }}
+                            style={{ minHeight: 130 }}
+                          />
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                            <button
+                              className="dso-btn dso-btn-primary"
+                              disabled={!cursorInsertEnabled || fixDraft.trim() === ''}
+                              onClick={applyFix}
+                            >{tt('compile.apply')}</button>
+                          </div>
+                          <div className="dso-muted">{tt('compile.reviewNote')}</div>
+                        </>
+                      )}
                     </>
                   )}
                   {panelTab === 'outline' && (

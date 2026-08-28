@@ -39,6 +39,13 @@ export const name = 'overleaf-workbench'
  */
 export const INSERT_FILE_NAME = 'dsh-overleaf-insert.md'
 
+/**
+ * Fixed workspace filename the agent writes its compile-fix edit list into
+ * (see the compile-fix panel flow). MUST match the constant in
+ * src/client/view.tsx; reads are restricted to exactly this filename.
+ */
+export const FIX_FILE_NAME = 'dsh-overleaf-fix.md'
+
 /** Services required before the host plugin can mount. */
 export const inject = ['webServer', 'credentials']
 
@@ -336,6 +343,19 @@ export class OverleafWorkbenchService extends Service {
         throw new Error('dsh-overleaf: read-insert-file requires an absolute cwd')
       }
       const target = joinPath(cwd.trim(), INSERT_FILE_NAME)
+      const stats = await stat(target).catch(() => undefined)
+      if (stats === undefined || !stats.isFile()) return { exists: false }
+      const content = await readFile(target, 'utf8')
+      return { exists: true, content, mtimeMs: stats.mtimeMs }
+    })
+    // Compile-fix handoff: same stable-revision contract as read-insert-file,
+    // but for the edit list the agent writes into dsh-overleaf-fix.md.
+    this.route('/overleaf/workbench/read-fix-file', async payload => {
+      const cwd = stringField(payload, 'cwd')
+      if (cwd === undefined || cwd.trim() === '' || !isAbsolute(cwd.trim())) {
+        throw new Error('dsh-overleaf: read-fix-file requires an absolute cwd')
+      }
+      const target = joinPath(cwd.trim(), FIX_FILE_NAME)
       const stats = await stat(target).catch(() => undefined)
       if (stats === undefined || !stats.isFile()) return { exists: false }
       const content = await readFile(target, 'utf8')
