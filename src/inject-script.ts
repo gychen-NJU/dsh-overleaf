@@ -152,6 +152,26 @@ export function renderBridgeScript(): string {
     if (DEBUG) log('websocket patch skipped', err)
   }
 
+  /* navigator.sendBeacon wrapper (analytics endpoints like /event/* are
+     POSTed through it and would otherwise bypass the proxy). */
+  try {
+    if (navigator.sendBeacon && !navigator.sendBeacon.__dshOverleafWrapped) {
+      var originalSendBeacon = navigator.sendBeacon.bind(navigator)
+      var wrappedSendBeacon = function (url, data) {
+        try {
+          if (typeof url === 'string') url = routeUrl(url)
+        } catch (err) {
+          if (DEBUG) log('beacon url fix failed', err)
+        }
+        return originalSendBeacon(url, data)
+      }
+      wrappedSendBeacon.__dshOverleafWrapped = true
+      Object.defineProperty(navigator, 'sendBeacon', { value: wrappedSendBeacon, configurable: true })
+    }
+  } catch (err) {
+    if (DEBUG) log('sendBeacon patch skipped', err)
+  }
+
   /* ---------------------------------------------------------------- */
   /* CodeMirror / editor probes                                       */
   /* ---------------------------------------------------------------- */
@@ -324,9 +344,12 @@ export function renderBridgeScript(): string {
         sendToParent({ type: 'outline', items: [], error: 'no-editor' })
         return
       }
-      var lines = String(docValue).split('\n')
+      /* NOTE: inside this TS template literal every backslash that must
+         survive into the generated JS is doubled (\\n, \\s, \\{). A single
+         \n here becomes a REAL newline in the served script and breaks it. */
+      var lines = String(docValue).split('\\n')
       var items = []
-      var pattern = /^\\(part|chapter|section|subsection|subsubsection)\s*\{([^}]*)\}/
+      var pattern = /^(part|chapter|section|subsection|subsubsection)\\s*\\{([^}]*)\\}/
       for (var i = 0; i < lines.length; i++) {
         var match = pattern.exec(lines[i])
         if (!match) continue

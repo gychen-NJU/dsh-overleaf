@@ -179,6 +179,19 @@ async function main() {
     assert.ok(out.includes('href="/overleaf-proxy/x"'), 'origin string replaced')
   }
 
+  // 0d. Bridge source must COMPILE (v0.1.10 hotfix: single-backslash escapes
+  // inside the TS template literal produced a real newline in the served
+  // script — SyntaxError at bridge.js:303 — killing every wrapper).
+  {
+    const { renderBridgeScript } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+    const bridge = renderBridgeScript()
+    // new Function compiles without executing: any SyntaxError throws here.
+    new Function(bridge)
+    assert.ok(bridge.includes("split('\\n')"), 'outline split keeps its newline escape')
+    assert.ok(bridge.includes('\\s*\\{([^}]*)\\}'), 'outline regex keeps \\s/\\{ escapes')
+    assert.ok(bridge.includes('sendBeacon'), 'sendBeacon wrapper present')
+  }
+
   // 1. Mount against a fake context and confirm every route family lands.
   const { ctx, routes, upgrades, credentialsStore } = fakeCtx()
   // Attach a stub settings service so the namespace-registration branch runs:
