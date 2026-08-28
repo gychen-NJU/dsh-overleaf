@@ -124,21 +124,36 @@ export function renderBridgeScript(): string {
     if (DEBUG) log('eventsource patch skipped', err)
   }
 
-  /* WebSocket transport (socket.io websocket upgrade path) */
+  /* WebSocket transport (socket.io websocket upgrade path).
+
+     The webserver's upgrade registry is exact-path only and cannot host
+     socket.io's dynamic upgrade URLs, so the plugin runs a companion tunnel
+     on its own loopback port (injected as __DSH_OVERLEAF_WS_PORT__). When
+     that port is known, same-origin WebSocket targets are redirected there;
+     the tunnel forwards the request verbatim to the upstream origin. */
   try {
     var OriginalWebSocket = window.WebSocket
     if (typeof OriginalWebSocket === 'function') {
+      var WS_PORT = parseInt(window.__DSH_OVERLEAF_WS_PORT__, 10) || 0
       function PatchedWebSocket(url, protocols) {
         try {
           if (typeof url === 'string' && url.indexOf('//') === 0) {
             url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + url
           }
           if (typeof url === 'string' && url.charAt(0) === '/') {
-            url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + window.location.host + PREFIX + url
+            if (WS_PORT > 0) {
+              url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '127.0.0.1:' + WS_PORT + url
+            } else {
+              url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + window.location.host + PREFIX + url
+            }
           } else if (typeof url === 'string' && url.indexOf(window.location.host) !== -1 && !isProxyUrl(url)) {
-            /* absolute loopback URL without the prefix yet: splice the prefix in */
-            url = url.replace(location.protocol + '//' + window.location.host,
-              location.protocol + '//' + window.location.host + PREFIX)
+            if (WS_PORT > 0) {
+              var parts = url.split(window.location.host)
+              url = parts[0] + '127.0.0.1:' + WS_PORT + parts.slice(1).join(window.location.host)
+            } else {
+              url = url.replace(location.protocol + '//' + window.location.host,
+                location.protocol + '//' + window.location.host + PREFIX)
+            }
           }
         } catch (err) {
           if (DEBUG) log('ws url fix failed', err)

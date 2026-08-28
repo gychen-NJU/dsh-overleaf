@@ -173,10 +173,11 @@ async function main() {
       'nonce fallback from HTML script tag')
     assert.equal(extractCspNonce(undefined, '<html><body>hi'), undefined, 'no nonce anywhere')
     const out = rewriteHtml('<html><head><title>t</title></head><body><a href="https://www.overleaf.com/x">l</a></body></html>',
-      '/overleaf-proxy', '/overleaf/workbench/bridge.js', 'https://www.overleaf.com', 'abc123==')
+      '/overleaf-proxy', '/overleaf/workbench/bridge.js', 'https://www.overleaf.com', 'abc123==', 45678)
     assert.ok(out.includes('src="/overleaf/workbench/bridge.js" nonce="abc123=="'),
       `bridge tag carries the nonce: ${out.slice(0, 240)}`)
     assert.ok(out.includes('href="/overleaf-proxy/x"'), 'origin string replaced')
+    assert.ok(out.includes('window.__DSH_OVERLEAF_WS_PORT__=45678'), 'WS tunnel bootstrap injected')
   }
 
   // 0d. Bridge source must COMPILE (v0.1.10 hotfix: single-backslash escapes

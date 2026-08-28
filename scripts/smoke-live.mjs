@@ -144,7 +144,11 @@ async function main() {
   // browser-side jar.
   credentialsStore.set('OVERLEAF_WORKBENCH_COOKIE', 'overleaf_session2=stored-token')
   const workbench = new OverleafWorkbenchService(ctxB, { baseUrl: `http://127.0.0.1:${upstreamPort}` })
-  void workbench
+  // Wait for the companion WS tunnel port to come up.
+  for (let i = 0; i < 100 && workbench.wsTunnelPort === 0; i++) {
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  if (workbench.wsTunnelPort === 0) throw new Error('WS tunnel did not start')
 
   const PORT = serverB.port
   if (!PORT) throw new Error('webserver did not report a bound port')
@@ -207,6 +211,13 @@ async function main() {
   const unprefixedEcho = await wsEcho(PORT, '/socket.io/?EIO=4&transport=websocket')
   assert.equal(unprefixedEcho.received101, true, 'prefix-less WS upgrade reaches the tunnel')
   assert.equal(unprefixedEcho.echoedText, 'hello-tunnel', 'prefix-less tunnel echo works')
+
+  // 5c. Companion WS tunnel port: the bootstrap global must be injected and
+  // the tunnel must echo through it with an arbitrary dynamic path.
+  assert.ok(htmlBody.includes('window.__DSH_OVERLEAF_WS_PORT__='), 'WS tunnel bootstrap injected into HTML')
+  const tunnelEcho = await wsEcho(workbench.wsTunnelPort, '/socket.io/1/websocket/1700000000000')
+  assert.equal(tunnelEcho.received101, true, 'tunnel-port upgrade accepted')
+  assert.equal(tunnelEcho.echoedText, 'hello-tunnel', 'tunnel-port echo works')
 
   // 6. Bridge asset route.
   const bridgeRes = await fetch(`${base}/overleaf/workbench/bridge.js`)

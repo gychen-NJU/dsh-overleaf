@@ -79,6 +79,7 @@ export function rewriteHtml(
   injectScriptSrc: string | undefined,
   targetOrigin: string | undefined,
   cspNonce: string | undefined,
+  wsPort: number,
 ): string {
   let out = html.replaceAll('"//', '"https://')
   // 1. Root-relative attribute references become proxy-rooted first. (The
@@ -105,7 +106,13 @@ export function rewriteHtml(
   }
   if (injectScriptSrc !== undefined && !html.includes('dsh-overleaf-bridge')) {
     const nonceAttr = cspNonce !== undefined && cspNonce !== '' ? ` nonce="${cspNonce}"` : ''
-    const tag = `<script src="${injectScriptSrc}"${nonceAttr} data-dsh-overleaf-bridge></script>`
+    // Bootstrap FIRST: the WS tunnel port the bridge wrappers redirect
+    // socket.io connections to (the webserver's upgrade registry is
+    // exact-path only and cannot handle socket.io's dynamic paths).
+    const bootstrap = wsPort > 0
+      ? `<script${nonceAttr}>window.__DSH_OVERLEAF_WS_PORT__=${wsPort};</script>\n`
+      : ''
+    const tag = `${bootstrap}<script src="${injectScriptSrc}"${nonceAttr} data-dsh-overleaf-bridge></script>`
     if (/<head[^>]*>/i.test(out)) {
       out = out.replace(/<head[^>]*>/i, match => `${match}\n${tag}\n`)
     } else if (/<html[^>]*>/i.test(out)) {
@@ -132,11 +139,12 @@ const SELF_NEEDED_DIRECTIVES = new Set([
   'media-src', 'worker-src', 'child-src',
 ])
 
-export function allowSelfInCsp(value: string): { value: string; changed: boolean } {
+export function allowSelfInCsp(value: string, extraOrigins: string[] = []): { value: string; changed: boolean } {
   let changed = false
   const kept: string[] = []
   let hasScriptSrc = false
   let hasDefaultSrc = false
+  const extras = extraOrigins.filter(origin => origin !== '' && !value.includes(origin))
   for (const rawDirective of value.split(';').map(item => item.trim()).filter(Boolean)) {
     if (/^frame-ancestors\b/i.test(rawDirective)) {
       changed = true
@@ -156,6 +164,11 @@ export function allowSelfInCsp(value: string): { value: string; changed: boolean
       kept.push(values === '' ? `${name} 'self'` : `${name} ${values} 'self'`)
       continue
     }
+    if (name === 'connect-src' && extras.length > 0) {
+      changed = true
+      kept.push(values === '' ? `${name} ${extras.join(' ')}` : `${name} ${values} ${extras.join(' ')}`)
+      continue
+    }
     kept.push(rawDirective)
   }
   if (!hasScriptSrc && hasDefaultSrc) {
@@ -163,9 +176,13 @@ export function allowSelfInCsp(value: string): { value: string; changed: boolean
     const directive = index >= 0 ? kept[index] : undefined
     if (directive !== undefined) {
       const values = directive.replace(/^default-src\b/i, '').trim()
-      if (!/(?:^|\s)'self'(?:\s|$)/i.test(values)) {
+      const additions = [
+        ...(!/(?:^|\s)'self'(?:\s|$)/i.test(values) ? ["'self'"] : []),
+        ...extras,
+      ]
+      if (additions.length > 0) {
         changed = true
-        kept[index] = values === '' ? "default-src 'self'" : `default-src ${values} 'self'`
+        kept[index] = values === '' ? `default-src ${additions.join(' ')}` : `default-src ${values} ${additions.join(' ')}`
       }
     }
   }
@@ -263,6 +280,7 @@ function buildResponseHeaders(
   upstreamHeaders: http.IncomingHttpHeaders,
   prefix: string,
   target: URL,
+  wsAllowOrigin: string | undefined,
 ): { headers: Record<string, string | string[]>; hadFrameCsp: boolean } {
   const headers: Record<string, string | string[]> = {}
   let hadFrameCsp = false
@@ -294,7 +312,7 @@ function buildResponseHeaders(
   const csp = upstreamHeaders['content-security-policy']
   if (csp !== undefined) {
     const joined = Array.isArray(csp) ? csp.join('; ') : csp
-    const adjusted = allowSelfInCsp(joined)
+    const adjusted = allowSelfInCsp(joined, wsAllowOrigin !== undefined ? [wsAllowOrigin] : [])
     hadFrameCsp = adjusted.changed
     if (adjusted.value !== '') headers['content-security-policy'] = adjusted.value
   }
@@ -317,6 +335,12 @@ export class ReverseProxy {
 
   /** Bridge script src injected into rewritten HTML bodies (undefined disables). */
   public injectScriptSrc: string | undefined = undefined
+
+  /** Loopback origin of the companion WS tunnel port (ws://127.0.0.1:port). */
+  public wsAllowOrigin: string | undefined = undefined
+
+  /** Port of the companion WS tunnel server (0 until it starts listening). */
+  public wsPort = 0
 
   /** Whether the given raw request URL belongs to this proxy. */
   matches(rawUrl: string | undefined): boolean {
@@ -345,7 +369,7 @@ export class ReverseProxy {
           headers: upstreamHeaders,
           timeout: REQUEST_TIMEOUT_MS,
         }, upstreamRes => {
-          void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, settle)
+          void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, this.wsAllowOrigin, this.wsPort, settle)
         })
       } catch (error) {
         respondBadGateway(res, error)
@@ -410,12 +434,14 @@ async function deliverResponse(
   upstreamRes: http.IncomingMessage,
   target: URL,
   injectScriptSrc: string | undefined,
+  wsAllowOrigin: string | undefined,
+  wsPort: number,
   settle: () => void,
 ): Promise<void> {
   const contentTypeHeader = upstreamRes.headers['content-type']
   const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader.toLowerCase() : ''
   const isHtml = contentType.includes('text/html')
-  const { headers, hadFrameCsp } = buildResponseHeaders(upstreamRes.headers, PROXY_PREFIX, target)
+  const { headers, hadFrameCsp } = buildResponseHeaders(upstreamRes.headers, PROXY_PREFIX, target, wsAllowOrigin)
   if (hadFrameCsp && process.env.DSH_OVERLEAF_DEBUG === '1') {
     console.warn('[dsh-overleaf] stripped frame-ancestors CSP for', target.pathname)
   }
@@ -457,7 +483,7 @@ async function deliverResponse(
       const cspHeader = upstreamRes.headers['content-security-policy']
       const cspJoined = Array.isArray(cspHeader) ? cspHeader.join('; ') : cspHeader
       const cspNonce = extractCspNonce(cspJoined, htmlString)
-      const body = rewriteHtml(htmlString, PROXY_PREFIX, injectScriptSrc, target.origin, cspNonce)
+      const body = rewriteHtml(htmlString, PROXY_PREFIX, injectScriptSrc, target.origin, cspNonce, wsPort)
       const payload = Buffer.from(body, 'utf8')
       const finalHeaders: Record<string, string | string[]> = { ...headers }
       finalHeaders['content-length'] = String(payload.byteLength)

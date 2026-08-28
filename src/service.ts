@@ -11,6 +11,7 @@
  * `/overleaf/*` surface so the two plugins can coexist in one profile.
  */
 import { Context, Service } from '@deepseek-ai/cordis'
+import http from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type {} from '@deepseek-ai/dsh-credentials'
@@ -121,6 +122,54 @@ export class OverleafWorkbenchService extends Service {
       .catch(error => ctx.logger?.warn?.(`dsh-overleaf: credential probe failed: ${error instanceof Error ? error.message : String(error)}`))
     this.registerRoutes()
     this.registerSettingsNamespace()
+    this.startWsTunnel()
+  }
+
+  /**
+   * Companion WS tunnel on its OWN loopback port. The DSH webserver's upgrade
+   * registry is exact-path-only and socket.io's upgrade paths carry dynamic
+   * session ids (`/socket.io/<sid>/websocket/<t>`), which can never match.
+   * The bridge redirects the embedded site's WebSocket connections to this
+   * port, where every upgrade path is tunneled verbatim to the upstream.
+   */
+  private startWsTunnel(): void {
+    const server = http.createServer((_request, response) => {
+      // HTTP on this port is not a supported surface; upgrades only.
+      this.destroySafely(response)
+    })
+    server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+      if (!isLoopback(req)) {
+        socket.destroy()
+        return
+      }
+      this.proxy.tunnelUpgrade(req, socket, head)
+    })
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address !== null ? address.port : 0
+      if (port > 0) {
+        this.proxy.wsPort = port
+        this.proxy.wsAllowOrigin = `ws://127.0.0.1:${port} wss://127.0.0.1:${port}`
+      }
+    })
+    this.ctx.effect(() => () => {
+      server.close()
+      server.closeAllConnections?.()
+    }, 'dsh-overleaf: ws tunnel server')
+  }
+
+  /** Port of the companion WS tunnel (0 until listening; tests may read it). */
+  get wsTunnelPort(): number {
+    return this.proxy.wsPort
+  }
+
+  private destroySafely(response: ServerResponse): void {
+    try {
+      response.writeHead(404)
+      response.end()
+    } catch {
+      /* already gone */
+    }
   }
 
   /** Base layer handed to the settings service (the composed mount config). */
