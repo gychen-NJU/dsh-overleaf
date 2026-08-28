@@ -213,10 +213,17 @@ export class OverleafWorkbenchService extends Service {
   /** Swap runtime behavior after a settings commit (hot reload of the proxy). */
   private applyRuntimeConfig(next: ResolvedConfig): void {
     const staleCookie = this.proxy.extraCookie
+    const wsPort = this.proxy.wsPort
+    const wsAllowOrigin = this.proxy.wsAllowOrigin
     this.config = next
     this.proxy = new ReverseProxy(next.baseUrl)
     this.proxy.extraCookie = staleCookie
     this.proxy.injectScriptSrc = next.injectScriptEnabled ? '/overleaf/workbench/bridge.js' : undefined
+    // The companion server remains alive across settings commits. Preserve its
+    // published endpoint on the replacement proxy or editor pages loaded after
+    // any settings save silently lose their only dynamic WebSocket route.
+    this.proxy.wsPort = wsPort
+    this.proxy.wsAllowOrigin = wsAllowOrigin
   }
 
   /** Push the latest stored cookie into the proxy (re-read on every change). */

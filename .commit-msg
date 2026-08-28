@@ -1,0 +1,28 @@
+fix(proxy/bridge): editor Loading root causes found in field testing
+
+Field testing (user able to open projects) exposed three deeper defects:
+
+1. window.WebSocket wrapper dropped the native static constants
+   (CONNECTING/OPEN/CLOSING/CLOSED). Overleaf's connection manager compares
+   connection state against WebSocket.OPEN before creating a socket; both
+   sides were undefined so canReconnect() stayed false forever and the
+   editor never left its Loading screen. The wrapper now inherits the
+   native prototype and statics (also keeping instanceof semantics).
+
+2. Stored-credential authority silently dropped edge/load-balancer affinity
+   cookies (gclb etc.) that the socket.io handshake ROTATES. The subsequent
+   WebSocket upgrade then landed on a different backend and returned 502,
+   leaving the editor on Loading (matches the intermittent 502 observed in
+   field diagnostics). Routing cookies now keep the live browser value while
+   application-session cookies stay stored-authoritative
+   (mergeProxyCookieHeaders).
+
+3. applyRuntimeConfig rebuilt the ReverseProxy without preserving the
+   companion WS tunnel port/origin, so saving any setting silently removed
+   the editor's dynamic WebSocket route.
+
+Plus: bridge writes live diagnostics to <html data-dsh-overleaf-*> (ready /
+ws-port / ws-target / ws-state / last-error / last-rejection).
+
+Version 0.2.7 (codex field fix, reviewed and validated: build + both smoke
+suites green + reinstalled into the web profile).

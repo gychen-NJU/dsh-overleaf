@@ -29,6 +29,21 @@ export function renderBridgeScript(): string {
   if (window.__DSH_OVERLEAF_BRIDGE__) return
   window.__DSH_OVERLEAF_BRIDGE__ = true
   var DEBUG = false
+  function markDiagnostic(name, value) {
+    try {
+      if (document.documentElement) {
+        document.documentElement.setAttribute('data-dsh-overleaf-' + name, String(value).slice(0, 300))
+      }
+    } catch (err) {}
+  }
+  markDiagnostic('bridge', 'ready')
+  window.addEventListener('error', function (event) {
+    markDiagnostic('last-error', event && event.message ? event.message : 'script-error')
+  })
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event && event.reason
+    markDiagnostic('last-rejection', reason && reason.message ? reason.message : String(reason || 'unhandled-rejection'))
+  })
   function log() {
     if (!DEBUG || !console || !console.debug) return
     Function.prototype.apply.call(console.debug, console, ['[dsh-overleaf]'].concat([].slice.call(arguments)))
@@ -141,6 +156,7 @@ export function renderBridgeScript(): string {
     var OriginalWebSocket = window.WebSocket
     if (typeof OriginalWebSocket === 'function') {
       var WS_PORT = parseInt(window.__DSH_OVERLEAF_WS_PORT__, 10) || 0
+      markDiagnostic('ws-port', WS_PORT)
       function PatchedWebSocket(url, protocols) {
         try {
           if (typeof url === 'string' && url.indexOf('//') === 0) {
@@ -164,9 +180,30 @@ export function renderBridgeScript(): string {
         } catch (err) {
           if (DEBUG) log('ws url fix failed', err)
         }
-        return new OriginalWebSocket(url, protocols)
+        var socketUrl = String(url)
+        try {
+          var parsedSocketUrl = new URL(socketUrl)
+          markDiagnostic('ws-target', parsedSocketUrl.host)
+        } catch (err) {
+          markDiagnostic('ws-target', 'invalid-url')
+        }
+        markDiagnostic('ws-state', 'connecting')
+        var socket = new OriginalWebSocket(url, protocols)
+        socket.addEventListener('open', function () { markDiagnostic('ws-state', 'open') })
+        socket.addEventListener('error', function () { markDiagnostic('ws-state', 'error') })
+        socket.addEventListener('close', function (event) {
+          markDiagnostic('ws-state', 'closed:' + String(event && event.code || 0))
+        })
+        return socket
       }
       Object.defineProperty(PatchedWebSocket, 'name', { value: 'WebSocket' })
+      // Preserve the native constructor contract. Overleaf compares its
+      // connection state against WebSocket.OPEN/CLOSED before it ever creates
+      // a socket; dropping those static constants makes both sides undefined
+      // and canReconnect() stays false forever. Sharing the native prototype
+      // also keeps event.target instanceof WebSocket true after wrapping.
+      Object.setPrototypeOf(PatchedWebSocket, OriginalWebSocket)
+      PatchedWebSocket.prototype = OriginalWebSocket.prototype
       window.WebSocket = PatchedWebSocket
     }
   } catch (err) {

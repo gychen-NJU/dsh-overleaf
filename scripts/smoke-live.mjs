@@ -73,6 +73,17 @@ async function main() {
       res.end('/* socket.io client fixture */')
       return
     }
+    if (req.url?.startsWith('/socket.io/1/?')) {
+      // Real Socket.IO 0.9 ordering: the HTTP handshake chooses a worker and
+      // rotates its affinity cookie; the following WebSocket upgrade must echo
+      // that exact value or the sid is unknown on the selected backend.
+      res.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'set-cookie': ['GCLB=fresh-worker; Path=/; HttpOnly'],
+      })
+      res.end('fixture-sid:60:60:websocket,xhr-polling')
+      return
+    }
     if (req.url?.startsWith('/socket.io/')) {
       // Classic socket.io polling endpoint: echo path + cookie so the test
       // can assert prefix-less pass-through and credential injection.
@@ -89,6 +100,12 @@ async function main() {
   })
   upstream.on('upgrade', (req, socket) => {
     upgradesSeen += 1
+    if (req.url?.startsWith('/socket.io/1/websocket/fixture-sid')
+      && !String(req.headers.cookie ?? '').includes('GCLB=fresh-worker')) {
+      socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return
+    }
     const key = req.headers['sec-websocket-key']
     const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
@@ -138,11 +155,10 @@ async function main() {
   if (initSym === undefined) throw new Error('WebServer init symbol not found')
   await serverB[initSym]()
 
-  // Simulate a stored credential (as if the user pasted a cookie): seeded
-  // BEFORE construction so the boot-time credential probe picks it up, and
-  // the proxy must send it VERBATIM upstream, ignoring any conflicting
-  // browser-side jar.
-  credentialsStore.set('OVERLEAF_WORKBENCH_COOKIE', 'overleaf_session2=stored-token')
+  // Simulate a stored credential (as if the user pasted a cookie). The saved
+  // application session stays authoritative, while a fresher browser GCLB
+  // value must survive so Socket.IO handshake/upgrade affinity is preserved.
+  credentialsStore.set('OVERLEAF_WORKBENCH_COOKIE', 'overleaf_session2=stored-token; GCLB=stale-worker')
   const workbench = new OverleafWorkbenchService(ctxB, { baseUrl: `http://127.0.0.1:${upstreamPort}` })
   // Wait for the companion WS tunnel port to come up.
   for (let i = 0; i < 100 && workbench.wsTunnelPort === 0; i++) {
@@ -167,6 +183,8 @@ async function main() {
   assert.equal(htmlRes.headers.get('x-frame-options'), null, 'XFO removed')
   assert.ok(htmlBody.includes('overleaf_session2=stored-token'), 'stored credential rode upstream verbatim')
   assert.ok(!htmlBody.includes('conflicting-browser-value'), 'browser-side session cookie must not leak upstream')
+  assert.ok(htmlBody.includes('gclb=affinity'), 'fresh browser affinity cookie must reach upstream')
+  assert.ok(!htmlBody.includes('GCLB=stale-worker'), 'stale stored affinity cookie must not override the browser')
   // 7. siteUrl rebasing: the app's own origin string must become the proxy
   // prefix so SPA-built links never escape to the real site.
   assert.ok(htmlBody.includes('window.siteUrl = "/overleaf-proxy"'), `siteUrl rebased:\n${htmlBody.slice(0, 400)}`)
@@ -198,7 +216,7 @@ async function main() {
   // must both tunnel to the upstream with the ORIGINAL path and the
   // stored credential injected.
   const pollRes = await fetch(`${base}/socket.io/?EIO=4&transport=polling`, {
-    headers: { cookie: 'overleaf_session2=conflicting-browser-value' },
+    headers: { cookie: 'overleaf_session2=conflicting-browser-value; GCLB=fresh-handshake-worker' },
   })
   assert.equal(pollRes.status, 200, `socket.io polling status ${pollRes.status}`)
   const pollBody = await pollRes.text()
@@ -206,6 +224,8 @@ async function main() {
     `prefix-less polling pass-through: ${pollBody.slice(0, 200)}`)
   assert.ok(pollBody.includes('overleaf_session2=stored-token'), 'credential injected into socket.io polling')
   assert.ok(!pollBody.includes('conflicting-browser-value'), 'browser twin not leaked into socket.io polling')
+  assert.ok(pollBody.includes('GCLB=fresh-handshake-worker'), 'fresh handshake affinity reaches socket.io polling')
+  assert.ok(!pollBody.includes('GCLB=stale-worker'), 'stored affinity must not replace handshake affinity')
   const clientJsRes = await fetch(`${base}/overleaf-proxy/socket.io/socket.io.js`)
   assert.equal(clientJsRes.status, 200, 'socket.io client asset served through prefix')
   const unprefixedEcho = await wsEcho(PORT, '/socket.io/?EIO=4&transport=websocket')
@@ -218,6 +238,26 @@ async function main() {
   const tunnelEcho = await wsEcho(workbench.wsTunnelPort, '/socket.io/1/websocket/1700000000000')
   assert.equal(tunnelEcho.received101, true, 'tunnel-port upgrade accepted')
   assert.equal(tunnelEcho.echoedText, 'hello-tunnel', 'tunnel-port echo works')
+
+  // 5d. Regression for the real production failure: the handshake response
+  // rotates GCLB, then the browser sends that fresh value to the companion
+  // tunnel. It must override a stale GCLB captured with the saved credential,
+  // while the stored application session still replaces the browser's anon
+  // twin. The fixture returns 502 when affinity is lost.
+  const classicHandshake = await fetch(`${base}/socket.io/1/?projectId=demo&t=1`, {
+    headers: { cookie: 'overleaf_session2=browser-anon; GCLB=older-browser-worker' },
+  })
+  assert.equal(classicHandshake.status, 200, 'classic socket.io handshake succeeds')
+  assert.equal(await classicHandshake.text(), 'fixture-sid:60:60:websocket,xhr-polling')
+  assert.ok((classicHandshake.headers.getSetCookie?.() ?? []).some(line => line.includes('GCLB=fresh-worker')),
+    'handshake forwards the rotated affinity cookie')
+  const affinityEcho = await wsEcho(
+    workbench.wsTunnelPort,
+    '/socket.io/1/websocket/fixture-sid?projectId=demo',
+    'overleaf_session2=browser-anon; GCLB=fresh-worker',
+  )
+  assert.equal(affinityEcho.received101, true, 'fresh handshake affinity reaches websocket upgrade')
+  assert.equal(affinityEcho.echoedText, 'hello-tunnel', 'affinity-preserving websocket tunnel works')
 
   // 6. Bridge asset route.
   const bridgeRes = await fetch(`${base}/overleaf/workbench/bridge.js`)
@@ -235,7 +275,7 @@ async function main() {
 }
 
 /** Raw WebSocket client speaking just enough RFC6455 to test the tunnel. */
-function wsEcho(port, path) {
+function wsEcho(port, path, cookie = '') {
   return new Promise((resolvePromise, rejectPromise) => {
     const key = Buffer.from('dsh-overleaf-wstest!').toString('base64')
     const socket = net.connect({ host: '127.0.0.1', port })
@@ -256,7 +296,8 @@ function wsEcho(port, path) {
     socket.on('connect', () => {
       socket.write(
         `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
-        + `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nOrigin: http://127.0.0.1:${port}\r\n\r\n`,
+        + `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nOrigin: http://127.0.0.1:${port}\r\n`
+        + `${cookie === '' ? '' : `Cookie: ${cookie}\r\n`}\r\n`,
       )
     })
     socket.on('error', error => finish(error))

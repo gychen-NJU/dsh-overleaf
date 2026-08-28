@@ -110,7 +110,7 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, allowSelfInCsp, extractCspNonce, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, mergeProxyCookieHeaders, allowSelfInCsp, extractCspNonce, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
 
   // 0. Cookie authority regression (the v0.1.5 login-page bug): a browser-side
   // anonymous/stale twin of the session cookie must NEVER override the stored
@@ -122,13 +122,21 @@ async function main() {
     }
     const target = new URL('https://www.overleaf.com/project')
     const out = buildUpstreamHeaders(fakeReq, target, 'overleaf_session2=stored-credential')
-    assert.equal(out.cookie, 'overleaf_session2=stored-credential',
-      `stored credential must be sent verbatim, got: ${String(out.cookie)}`)
+    assert.equal(out.cookie, 'gclb=affinity; overleaf_session2=stored-credential',
+      `stored session must win while live routing cookies survive, got: ${String(out.cookie)}`)
     const outNoStored = buildUpstreamHeaders(fakeReq, target, undefined)
     assert.equal(outNoStored.cookie, 'overleaf_session2=stale-browser-value; gclb=affinity',
       'without a stored credential the browser cookies pass through')
     // mergeCookieHeaders keeps documented helper semantics: extra (stored) wins.
     assert.equal(mergeCookieHeaders('overleaf_session2=stale', 'overleaf_session2=stored'), 'overleaf_session2=stored')
+    assert.equal(
+      mergeProxyCookieHeaders(
+        'overleaf_session2=anonymous; GCLB=fresh-worker; csrf=fresh-browser',
+        'overleaf_session2=stored; GCLB=stale-worker',
+      ),
+      'GCLB=fresh-worker; csrf=fresh-browser; overleaf_session2=stored',
+      'stored auth must win, but the handshake affinity cookie must remain fresh',
+    )
   }
 
   // 0b. CSP adjustment regression (the v0.1.7 editor blank-page bug): the
@@ -231,6 +239,12 @@ async function main() {
     assert.ok(bridge.includes('class PatchedEventSource extends OriginalEventSource'),
       'EventSource wrapper uses class extends')
     assert.ok(!bridge.includes('OriginalEventSource.call('), 'no .call() on the DOM constructor')
+    // Replacing WebSocket without its static OPEN/CLOSED constants leaves the
+    // Overleaf connection manager in a permanent "cannot reconnect" state.
+    assert.ok(bridge.includes('Object.setPrototypeOf(PatchedWebSocket, OriginalWebSocket)'),
+      'WebSocket wrapper inherits native static constants')
+    assert.ok(bridge.includes('PatchedWebSocket.prototype = OriginalWebSocket.prototype'),
+      'WebSocket wrapper preserves instanceof behavior')
   }
 
   // 1. Mount against a fake context and confirm every route family lands.

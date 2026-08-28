@@ -284,6 +284,53 @@ export function mergeCookieHeaders(base: string | undefined, extra: string | und
   return entries.length > 0 ? entries.join('; ') : undefined
 }
 
+/**
+ * Cookies whose value is deliberately rotated by an edge/load-balancer layer.
+ *
+ * A saved login header is the authority for application session cookies (this
+ * prevents an anonymous browser-side `overleaf_session2` from replacing the
+ * authenticated value).  Edge-affinity cookies are different: the response to
+ * the Socket.IO handshake can rotate them immediately, and the subsequent
+ * WebSocket upgrade must echo that latest browser value or it can reach a
+ * different backend where the freshly issued socket id does not exist.
+ */
+function isRuntimeRoutingCookie(name: string): boolean {
+  return /^(?:gclb|awsalb(?:cors|app-\d+)?|route|serverid|bigipserver.*|__cf_bm|cf_clearance|ak_bmsc|bm_sv|acw_tc|cdn_sec_tc)$/i.test(name)
+    || /^(?:incap_ses_|visid_incap_)/i.test(name)
+}
+
+/**
+ * Merge the browser's live cookie jar with the stored login credential.
+ * Stored values win for normal/session cookies; a live browser value wins for
+ * known routing cookies so an HTTP handshake and its WebSocket upgrade stay on
+ * the same upstream worker.
+ */
+export function mergeProxyCookieHeaders(
+  browserCookie: string | undefined,
+  storedCookie: string | undefined,
+): string | undefined {
+  if (storedCookie === undefined || storedCookie.trim() === '') return browserCookie
+  if (browserCookie === undefined || browserCookie.trim() === '') return storedCookie
+
+  const liveRoutingNames = new Set<string>()
+  for (const pair of browserCookie.split(';')) {
+    const item = pair.trim()
+    const equals = item.indexOf('=')
+    if (equals <= 0) continue
+    const name = item.slice(0, equals).trim()
+    if (isRuntimeRoutingCookie(name)) liveRoutingNames.add(name.toLowerCase())
+  }
+
+  const storedWithoutStaleRouting = storedCookie.split(';').map(item => item.trim()).filter(item => {
+    const equals = item.indexOf('=')
+    if (equals <= 0) return false
+    const name = item.slice(0, equals).trim()
+    return !(isRuntimeRoutingCookie(name) && liveRoutingNames.has(name.toLowerCase()))
+  }).join('; ')
+
+  return mergeCookieHeaders(browserCookie, storedWithoutStaleRouting)
+}
+
 /** Compute the upstream sub-path (with query) for one matched request URL. */
 export function subPathOf(rawUrl: string | undefined, prefix: string): string {
   const raw = rawUrl ?? '/'
@@ -313,15 +360,14 @@ export function buildUpstreamHeaders(
   headers['host'] = target.host
   // Identity encoding keeps textual bodies rewritable end to end.
   headers['accept-encoding'] = 'identity'
-  // The stored credential is authoritative: when present it is sent VERBATIM
-  // and never mixed with the browser's own jar. A stale or anonymous twin of
-  // the session cookie in the browser jar (upstream Set-Cookie passthrough
-  // creates one on every anonymous visit) must never override the login.
-  if (extraCookie !== undefined && extraCookie !== '') {
-    headers['cookie'] = extraCookie
-  } else if (typeof req.headers.cookie === 'string' && req.headers.cookie !== '') {
-    headers['cookie'] = req.headers.cookie
-  }
+  // Keep saved application-session values authoritative while retaining live
+  // routing cookies (notably GCLB) issued by an immediately preceding request.
+  // Socket.IO binds its handshake id to one backend; dropping the rotated
+  // affinity value makes the WebSocket upgrade hit another backend and return
+  // 502, leaving the editor on Loading forever.
+  const browserCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined
+  const mergedCookie = mergeProxyCookieHeaders(browserCookie, extraCookie)
+  if (mergedCookie !== undefined && mergedCookie !== '') headers['cookie'] = mergedCookie
   return headers
 }
 
@@ -627,13 +673,10 @@ function writeUpgradeRequest(
     }
   }
   if (typeof req.headers.origin === 'string') lines.push(`Origin: ${target.origin}`)
-  // Same authoritative-credential rule as the plain HTTP path (see
-  // buildUpstreamHeaders): the stored cookie rides verbatim, never mixed.
-  if (extraCookie !== undefined && extraCookie !== '') {
-    lines.push(`Cookie: ${extraCookie}`)
-  } else if (typeof req.headers.cookie === 'string' && req.headers.cookie !== '') {
-    lines.push(`Cookie: ${req.headers.cookie}`)
-  }
+  // Same session-authority/routing-freshness rule as the HTTP handshake.
+  const browserCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined
+  const mergedCookie = mergeProxyCookieHeaders(browserCookie, extraCookie)
+  if (mergedCookie !== undefined && mergedCookie !== '') lines.push(`Cookie: ${mergedCookie}`)
   lines.push('', '')
   upstreamSocket.write(lines.join('\r\n'))
   if (head.length > 0) upstreamSocket.write(head)
