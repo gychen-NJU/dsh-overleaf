@@ -98,9 +98,13 @@ async function main() {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({
         status: 'success',
+        // The user-content host split: output files live on the second origin
+        // at the /zone/c path - the locked main origin 404s on those paths.
+        pdfDownloadDomain: `http://127.0.0.1:${upstreamPort}/zone/c`,
+        outputUrlPrefix: '/zone/c',
         outputFiles: [{
           path: 'output.pdf',
-          url: '/project/demo/build/build-123/output/output.pdf',
+          url: '/project/demo/user/u1/build/build-123/output/output.pdf',
           type: 'pdf',
           build: 'build-123',
         }],
@@ -109,13 +113,17 @@ async function main() {
       }))
       return
     }
-    if (req.url?.startsWith('/project/demo/build/build-123/output/output.pdf')) {
+    if (req.url?.startsWith('/project/demo/user/u1/build/build-123/output/output.pdf')
+      || req.url?.startsWith('/zone/c/project/demo/user/u1/build/build-123/output/output.pdf')) {
+      const zoneRequest = (req.url?.startsWith('/zone/c/') ?? false)
+      const cookieOk = zoneRequest && String(req.headers.cookie ?? '').includes('overleaf_session2=stored-token')
       if (req.headers.range === 'bytes=0-7') {
         res.writeHead(206, {
           'content-type': 'application/pdf',
           'accept-ranges': 'bytes',
           'content-range': `bytes 0-7/${fixturePdf.length}`,
           'content-length': '8',
+          ...(zoneRequest ? { 'x-zone-cookie': cookieOk ? 'ok' : 'missing' } : {}),
         })
         res.end(fixturePdf.subarray(0, 8))
       } else {
@@ -133,7 +141,7 @@ async function main() {
       'x-frame-options': 'DENY',
       'set-cookie': ['overleaf_session2=tok456; Domain=.upstream.test; Path=/; HttpOnly; Secure'],
     })
-    res.end(`<html><head><script>window.siteUrl = "http://127.0.0.1:${upstreamPort}"</script><script src="/js/app.js"></script></head><body>hi<!-- cookies: ${String(req.headers.cookie ?? '')} --></body></html>`)
+    res.end(`<html><head><meta name="ol-compilesUserContentDomain" content="http://127.0.0.1:${upstreamPort}"><script>window.siteUrl = "http://127.0.0.1:${upstreamPort}"</script><script src="/js/app.js"></script></head><body>hi<!-- cookies: ${String(req.headers.cookie ?? '')} --></body></html>`)
   })
   upstream.on('upgrade', (req, socket) => {
     upgradesSeen += 1
@@ -254,6 +262,32 @@ async function main() {
   assert.equal(pdfRes.headers.get('content-range'), `bytes 0-7/${fixturePdf.length}`)
   assert.equal(pdfRes.headers.get('content-length'), '8')
   assert.deepStrictEqual(Buffer.from(await pdfRes.arrayBuffer()), fixturePdf.subarray(0, 8))
+
+  // 4b. User-content host split (the compile/PDF field bug): the compile JSON
+  // + shell meta announce a second origin (pdfDownloadDomain/outputUrlPrefix),
+  // the bridge re-roots absolute URLs on it under the proxy, and the proxy
+  // must forward /zone/c/... paths to that origin - the locked main origin
+  // 404s on them. The stored credential must ride along.
+  const zonePdfRes = await fetch(`${base}/overleaf-proxy/zone/c/project/demo/user/u1/build/build-123/output/output.pdf?compileGroup=group-fixture`, {
+    headers: { range: 'bytes=0-7' },
+  })
+  assert.equal(zonePdfRes.status, 206, `zone PDF status ${zonePdfRes.status}`)
+  assert.equal(zonePdfRes.headers.get('content-type'), 'application/pdf')
+  assert.equal(zonePdfRes.headers.get('content-range'), `bytes 0-7/${fixturePdf.length}`)
+  assert.equal(zonePdfRes.headers.get('x-zone-cookie'), 'ok',
+    'content-origin requests keep the stored credential (zone handler saw the session cookie)')
+  assert.deepStrictEqual(Buffer.from(await zonePdfRes.arrayBuffer()), fixturePdf.subarray(0, 8))
+
+  // 4c. Zone-path routing must never grab normal application paths: the
+  // project page and the compile POST still hit the locked main origin.
+  const compileRouteViaMain = await fetch(`${base}/overleaf-proxy/project/demo/compile?x=1`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  })
+  assert.equal(compileRouteViaMain.status, 200, `main-origin compile route ${compileRouteViaMain.status}`)
+  const compileAgain = await compileRouteViaMain.json()
+  assert.equal(compileAgain.status, 'success')
 
   // 5. Status route through the REAL server.
   const statusRes = await fetch(`${base}/overleaf/workbench/status`, { method: 'POST' })

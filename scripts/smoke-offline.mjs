@@ -264,6 +264,40 @@ async function main() {
       'dynamic iframe/link/resource attributes share runtime URL routing')
   }
 
+  // 0e. User-content origin hints (the compile/PDF host split). Output files
+  // live on a second host (compiles.overleafusercontent.com/zone/c); the
+  // proxy must learn that origin from the shell meta tag and from project
+  // JSON (pdfDownloadDomain + outputUrlPrefix / downloadURL) so zone paths
+  // can be forwarded there instead of the locked main origin.
+  {
+    const { extractContentDomainFromHtml, extractContentHintsFromJson } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+    assert.equal(
+      extractContentDomainFromHtml('<html><head><meta name="ol-compilesUserContentDomain" content="https://compiles.overleafusercontent.com"></head></html>'),
+      'https://compiles.overleafusercontent.com',
+      'content domain extracted from the shell meta tag',
+    )
+    assert.equal(
+      extractContentDomainFromHtml('<html><head><meta content="https://compiles.overleafusercontent.com" name="ol-compilesUserContentDomain"></head></html>'),
+      'https://compiles.overleafusercontent.com',
+      'meta attribute order agnostic',
+    )
+    assert.equal(extractContentDomainFromHtml('<html><head></head></html>'), undefined, 'no meta -> no hint')
+    const jsonHints = extractContentHintsFromJson(JSON.stringify({
+      status: 'success',
+      pdfDownloadDomain: 'https://compiles.overleafusercontent.com/zone/c',
+      outputUrlPrefix: '/zone/c',
+      outputFiles: [
+        { path: 'output.pdf', url: '/project/demo/build/b1/output/output.pdf', downloadURL: 'https://compiles.overleafusercontent.com/zone/c/project/demo/build/b1/output/output.pdf' },
+      ],
+    }))
+    assert.ok(jsonHints.includes('https://compiles.overleafusercontent.com/zone/c'),
+      `pdfDownloadDomain + outputUrlPrefix hint: ${jsonHints.join(' | ')}`)
+    assert.ok(jsonHints.includes('https://compiles.overleafusercontent.com'),
+      `bare origin hint from downloadURL: ${jsonHints.join(' | ')}`)
+    assert.ok(!jsonHints.some(hint => /output\.pdf/.test(hint)),
+      'file URLs must never become zone-prefix hints')
+  }
+
   // 1. Mount against a fake context and confirm every route family lands.
   const { ctx, routes, upgrades, credentialsStore } = fakeCtx()
   // Attach a stub settings service so the namespace-registration branch runs:

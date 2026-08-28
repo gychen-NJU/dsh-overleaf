@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "dsh.overleaf",
   "name": "dsh-overleaf",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "facets": {
     "host": {
       "entry": "lib/index.js",
@@ -29,8 +29,8 @@
   "permissions": [
     {
       "name": "dsh.overleaf.network-proxy",
-      "scope": "outbound https to config.baseUrl origin only",
-      "reason": "The workbench forwards browser traffic to the configured self-hosted or public Overleaf instance."
+      "scope": "outbound https to config.baseUrl origin + the user-content output origin the site itself announces (meta ol-compilesUserContentDomain / compile pdfDownloadDomain)",
+      "reason": "The workbench forwards browser traffic to the configured self-hosted or public Overleaf instance and fetches compiled output files (PDF/logs) from the origin that instance designates."
     },
     {
       "name": "dsh.overleaf.credential-store",

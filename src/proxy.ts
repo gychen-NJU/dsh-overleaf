@@ -349,6 +349,90 @@ export function requestTimeoutFor(target: URL): number {
     : REQUEST_TIMEOUT_MS
 }
 
+/**
+ * A second upstream origin discovered from the site's own content-domain hints
+ * (HTML meta `ol-compilesUserContentDomain` / compile JSON `pdfDownloadDomain`
+ * + `outputUrlPrefix`). Overleaf serves compiled output files (PDFs, logs)
+ * from a separate user-content host; the bridge re-roots absolute URLs on that
+ * host back under the proxy, which then MUST forward them to that host (the
+ * locked main origin 404s on those paths).
+ */
+interface ContentOriginRule {
+  origin: URL
+  /** Path prefix the content origin owns ('' = whole host, guard required). */
+  prefix: string
+}
+
+/** Does the request path belong to a learned user-content origin? A rule with
+ *  a disclosed prefix is exact; the bare-host fallback only accepts paths
+ *  shaped like per-user build outputs (zone-scoped or `user/<uid>`), never an
+ *  application page. */
+function contentPathMatches(subPath: string, rule: ContentOriginRule): boolean {
+  if (rule.prefix !== '') {
+    return subPath === rule.prefix || subPath.startsWith(`${rule.prefix}/`)
+  }
+  return /^\/(?:zone\/[^/]+\/|project\/[0-9a-fA-F]{24}\/user\/)/.test(subPath)
+}
+
+/**
+ * Extract the user-content origin hint from one proxied HTML body (the meta
+ * tag shape used by Overleaf shells; attribute order is not guaranteed).
+ */
+export function extractContentDomainFromHtml(html: string): string | undefined {
+  const names = ['ol-compilesUserContentDomain', 'ol-userContentDomain']
+  for (const name of names) {
+    const forward = new RegExp(`<meta\\s+[^>]*name=["']${name}["'][^>]*content=["']([^"']+)["']`, 'i').exec(html)
+    if (forward?.[1] !== undefined && forward[1] !== '') return forward[1]
+    const reverse = new RegExp(`<meta\\s+[^>]*content=["']([^"']+)["'][^>]*name=["']${name}["']`, 'i').exec(html)
+    if (reverse?.[1] !== undefined && reverse[1] !== '') return reverse[1]
+  }
+  return undefined
+}
+
+/**
+ * Extract user-content origin hints from proxied JSON bodies (compile result
+ * `pdfDownloadDomain`/`outputUrlPrefix`, cached-output `downloadURL`). Each
+ * returned value is a full base URL the frontend prepends to output-file
+ * paths, e.g. `https://compiles.overleafusercontent.com/zone/c`.
+ */
+export function extractContentHintsFromJson(jsonText: string): string[] {
+  const hints: string[] = []
+  const add = (value: string | undefined): void => {
+    if (value === undefined || value === '') return
+    try {
+      const parsed = new URL(value)
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') hints.push(value)
+    } catch {
+      /* malformed - ignore */
+    }
+  }
+  add(/"pdfDownloadDomain"\s*:\s*"([^"]+)"/.exec(jsonText)?.[1])
+  const prefix = /"outputUrlPrefix"\s*:\s*"([^"]+)"/.exec(jsonText)?.[1]
+  if (prefix !== undefined && prefix.trim() !== '') {
+    const download = /"downloadURL"\s*:\s*"((?:https?:\/\/)[^"]+)"/.exec(jsonText)?.[1]
+    if (download !== undefined) {
+      try {
+        const parsed = new URL(download)
+        add(`${parsed.origin}${prefix.startsWith('/') ? '' : '/'}${prefix.replace(/\/+$/, '')}`)
+      } catch {
+        /* malformed - ignore */
+      }
+    }
+  }
+  // Full downloadURL entries contribute their ORIGIN only - a file path
+  // (…/build/b1/output/output.pdf) must never become the zone prefix.
+  for (const match of jsonText.matchAll(/"downloadURL"\s*:\s*"((?:https?:\/\/)[^"]+)"/g)) {
+    const rawUrl = match[1]
+    if (rawUrl === undefined) continue
+    try {
+      add(new URL(rawUrl).origin)
+    } catch {
+      /* malformed - ignore */
+    }
+  }
+  return [...new Set(hints)]
+}
+
 /** Forward selection of inbound request headers toward one upstream request. */
 export function buildUpstreamHeaders(
   req: IncomingMessage,
@@ -450,6 +534,41 @@ export class ReverseProxy {
   /** Port of the companion WS tunnel server (0 until it starts listening). */
   public wsPort = 0
 
+  /** User-content output-file origin learned from the site's own hints. */
+  private contentRule: ContentOriginRule | undefined = undefined
+
+  /**
+   * Register a user-content origin hint (e.g. `https://compiles
+   * .overleafusercontent.com/zone/c`). The hint with the most specific path
+   * prefix learned so far wins, so the zone-precise compile JSON hint
+   * survives later origin-only meta tags.
+   */
+  learnContentHint(value: string): void {
+    try {
+      const parsed = new URL(value)
+      const prefix = parsed.pathname === '/' || parsed.pathname === ''
+        ? ''
+        : parsed.pathname.replace(/\/+$/, '')
+      if (this.contentRule === undefined || prefix.length > this.contentRule.prefix.length) {
+        this.contentRule = { origin: new URL(parsed.origin), prefix }
+      }
+    } catch {
+      /* malformed hint - ignore */
+    }
+  }
+
+  /**
+   * Upstream target for one matched sub-path: the locked main origin, or the
+   * learned user-content origin when the path belongs to its zone.
+   */
+  private targetFor(subPath: string): URL {
+    const rule = this.contentRule
+    if (rule !== undefined && contentPathMatches(subPath, rule)) {
+      return new URL(subPath, rule.origin)
+    }
+    return new URL(subPath, this.target)
+  }
+
   /** Whether the given raw request URL belongs to this proxy. */
   matches(rawUrl: string | undefined): boolean {
     if (rawUrl === undefined) return false
@@ -459,7 +578,7 @@ export class ReverseProxy {
   /** Handle one matched proxied HTTP request end-to-end. */
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const subPath = subPathOf(req.url, PROXY_PREFIX)
-    const target = new URL(subPath, this.target)
+    const target = this.targetFor(subPath)
     const upstreamHeaders = buildUpstreamHeaders(req, target, this.extraCookie)
     await new Promise<void>((resolveProxy) => {
       let settled = false
@@ -477,7 +596,8 @@ export class ReverseProxy {
           headers: upstreamHeaders,
           timeout: requestTimeoutFor(target),
         }, upstreamRes => {
-          void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, this.wsAllowOrigin, this.wsPort, settle)
+          void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, this.wsAllowOrigin, this.wsPort,
+            hint => { this.learnContentHint(hint) }, settle)
         })
       } catch (error) {
         respondBadGateway(res, error)
@@ -544,12 +664,18 @@ async function deliverResponse(
   injectScriptSrc: string | undefined,
   wsAllowOrigin: string | undefined,
   wsPort: number,
+  learnContent: (hint: string) => void,
   settle: () => void,
 ): Promise<void> {
   const contentTypeHeader = upstreamRes.headers['content-type']
   const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader.toLowerCase() : ''
   const isHtml = contentType.includes('text/html')
   const isCss = contentType.includes('text/css')
+  // Project-scoped JSON (compile result / cached output index) discloses the
+  // user-content origin; buffer bounded bodies to LEARN it while forwarding
+  // the payload verbatim.
+  const isProjectJson = contentType.includes('application/json')
+    && /^\/project\/[^/]+\//.test(target.pathname)
   const { headers, hadFrameCsp } = buildResponseHeaders(upstreamRes.headers, PROXY_PREFIX, target, wsAllowOrigin)
   if (hadFrameCsp && process.env.DSH_OVERLEAF_DEBUG === '1') {
     console.warn('[dsh-overleaf] stripped frame-ancestors CSP for', target.pathname)
@@ -596,10 +722,44 @@ async function deliverResponse(
     return
   }
 
-  if (!isHtml) {
+  if (!isHtml && !isProjectJson) {
     res.writeHead(upstreamRes.statusCode ?? 502, headers)
     upstreamRes.pipe(res)
     upstreamRes.on('close', settle)
+    return
+  }
+
+  if (isProjectJson) {
+    // Buffer bounded project JSON only to learn the content origin; the body
+    // bytes themselves are forwarded untouched (length stays valid).
+    const chunksJson: Buffer[] = []
+    let sizeJson = 0
+    let overflowJson = false
+    upstreamRes.on('data', (chunk: Buffer) => {
+      if (overflowJson) return
+      sizeJson += chunk.byteLength
+      if (sizeJson > MAX_REWRITE_BODY_BYTES) {
+        overflowJson = true
+        res.writeHead(upstreamRes.statusCode ?? 502, headers)
+        const remaining = upstreamRes.readableLength > 0 ? [upstreamRes.read()] : []
+        for (const buffered of [...chunksJson, ...remaining.filter(item => item !== null)]) res.write(buffered)
+        upstreamRes.pipe(res)
+        return
+      }
+      chunksJson.push(chunk)
+    })
+    upstreamRes.on('close', settle)
+    upstreamRes.on('end', () => {
+      if (overflowJson) {
+        settle()
+        return
+      }
+      const jsonText = Buffer.concat(chunksJson).toString('utf8')
+      for (const hint of extractContentHintsFromJson(jsonText)) learnContent(hint)
+      res.writeHead(upstreamRes.statusCode ?? 502, headers)
+      res.end(Buffer.concat(chunksJson))
+      settle()
+    })
     return
   }
 
@@ -630,6 +790,11 @@ async function deliverResponse(
     }
     try {
       const htmlString = Buffer.concat(chunks).toString('utf8')
+      // Learn the user-content origin from the shell's meta tag BEFORE the
+      // origin rebasing (the meta value belongs to the content host, not the
+      // locked target origin, so it survives rewriteHtml untouched).
+      const metaHint = extractContentDomainFromHtml(htmlString)
+      if (metaHint !== undefined) learnContent(metaHint)
       const cspHeader = upstreamRes.headers['content-security-policy']
       const cspJoined = Array.isArray(cspHeader) ? cspHeader.join('; ') : cspHeader
       const cspNonce = extractCspNonce(cspJoined, htmlString)

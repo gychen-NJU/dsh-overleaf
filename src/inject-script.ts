@@ -77,6 +77,44 @@ export function renderBridgeScript(): string {
   function isProxyUrl(value) {
     return typeof value === 'string' && (value.indexOf(PREFIX + '/') === 0)
   }
+
+  /* User-content output-file origin (Overleaf serves PDFs/logs from a second
+     host - compiles.overleafusercontent.com - announced in the shell meta tag
+     ol-compilesUserContentDomain). The compile-result URL builder prepends
+     that absolute host to output-file paths with window.origin semantics, so
+     fetches escape the embedded origin and are CORS-blocked. Re-rooting them
+     under the proxy lets the same-origin tunnel fetch the bytes (the locked
+     main origin 404s on those paths). The meta may not be parsed yet while
+     this script runs (it is injected right after <head>), so the lookup
+     retries until it lands. */
+  var contentOriginSeen = false
+  var contentOriginValue = ''
+  function readContentOrigin() {
+    try {
+      var metas = document.querySelectorAll('meta[name="ol-compilesUserContentDomain"], meta[name="ol-userContentDomain"]')
+      for (var i = 0; i < metas.length; i++) {
+        if (metas[i] && metas[i].content) return String(metas[i].content)
+      }
+    } catch (err) {}
+    return undefined
+  }
+  function contentOrigin() {
+    if (!contentOriginSeen) {
+      var raw = readContentOrigin()
+      if (raw !== undefined && raw !== '') {
+        try {
+          contentOriginValue = new URL(raw).origin
+          markDiagnostic('content-origin', contentOriginValue)
+        } catch (err) {
+          contentOriginValue = ''
+        }
+        contentOriginSeen = true
+      }
+      /* else: meta not parsed yet - retry on the next request */
+    }
+    return contentOriginValue
+  }
+
   function routeUrl(raw) {
     try {
       if (raw instanceof URL) raw = raw.toString()
@@ -99,6 +137,13 @@ export function renderBridgeScript(): string {
         var isAlreadyProxied = parsed.pathname === PREFIX || parsed.pathname.indexOf(PREFIX + '/') === 0
         if (parsed.origin === window.location.origin && !isWorkbenchRoute && !isAlreadyProxied) {
           return window.location.origin + PREFIX + parsed.pathname + parsed.search + parsed.hash
+        }
+        // Absolute URLs on the site's user-content output origin are re-rooted
+        // under the proxy (keeps the path - the host proxy forwards zone paths
+        // to that origin after learning it from the compile result).
+        var contentDom = contentOrigin()
+        if (contentDom !== '' && parsed.origin === contentDom && !isWorkbenchRoute && !isAlreadyProxied) {
+          return PREFIX + parsed.pathname + parsed.search + parsed.hash
         }
       }
       return raw
