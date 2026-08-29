@@ -34,17 +34,13 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 
 ![分屏视图：源码与 PDF 预览](docs/screenshots/02-split-view.png)
 
-**辅助面板——AI 写入与自动捕获插入**：用自然语言描述需求，DSH 智能体完成写作后，面板会**自动捕获智能体的产出并填入"自定义内容"框**——检查后一键插入编辑器光标处：
+**辅助面板——三大工具并排**：AI 写入与自动捕获插入、选区 AI（审阅后替换原选区）、编译修复（读取日志错误/警告并一键智能体修复）：
 
-![辅助面板：AI 写入与自动捕获插入](docs/screenshots/03-panel-ai-insert.png)
+![辅助面板标签：ai-insert / selection-ai / compile-fix](docs/screenshots/panel-tabs.png)
 
-**辅助面板——选区 AI**：在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区（带文件/选区漂移保护）：
-
-![辅助面板：选区 AI](docs/screenshots/04-panel-selection-ai.png)
-
-**辅助面板——编译修复**：Recompile 后读取编译日志中的错误与警告，让智能体针对当前打开的文档提出自动修复：
-
-![辅助面板：编译修复](docs/screenshots/05-panel-compile-fix.png)
+- **`[ ai-insert ]`**——用自然语言描述需求，DSH 智能体完成写作后，面板会**自动捕获智能体的产出并填入"自定义内容"框**——检查后一键插入编辑器光标处。
+- **`[ selection-ai ]`**——在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区（带文件/选区漂移保护）。
+- **`[ compile-fix ]`**——Recompile 后读取编译日志中的错误与警告，让智能体针对当前打开的文档提出自动修复。
 
 ## 为什么需要它
 

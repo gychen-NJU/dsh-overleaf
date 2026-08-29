@@ -34,17 +34,13 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 
 ![Split view: source and PDF preview](docs/screenshots/02-split-view.png)
 
-**Assist panel — AI write & auto-captured insert**: describe the change, the DSH agent writes it, and the panel **automatically captures the agent's output into the custom-content box** — review it, then insert at the editor caret:
+**Assist panel — three tools side by side**: AI write & auto-captured insert, selection AI with reviewed replace, and compile fix (log errors/warnings with one-click agent fixes):
 
-![Assist panel: AI write with auto-captured agent output](docs/screenshots/03-panel-ai-insert.png)
+![Assist panel tabs: ai-insert / selection-ai / compile-fix](docs/screenshots/panel-tabs.png)
 
-**Assist panel — selection AI**: select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection (guarded against file/selection drift):
-
-![Assist panel: selection AI](docs/screenshots/04-panel-selection-ai.png)
-
-**Assist panel — compile fix**: read the compile log's errors and warnings after a Recompile, then let the agent propose fixes for the currently open document:
-
-![Assist panel: compile fix](docs/screenshots/05-panel-compile-fix.png)
+- **`[ ai-insert ]`** — describe the change, the DSH agent writes it, and the panel **automatically captures the agent's output into the custom-content box** — review it, then insert at the editor caret.
+- **`[ selection-ai ]`** — select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection (guarded against file/selection drift).
+- **`[ compile-fix ]`** — read the compile log's errors and warnings after a Recompile, then let the agent propose fixes for the currently open document.
 
 ## Why it exists
 
