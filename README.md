@@ -60,14 +60,20 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 
 ## Installation
 
-The npm package name is occupied by another project, so this plugin distributes via GitHub or tarball only:
+The npm package name `dsh-overleaf` is occupied by another project, so this plugin is **not published to npm** — install it from GitHub instead. The repository commits the prebuilt `lib/` bundle, so git installs need **no build step and no `allowBuilds` authorization**:
 
 ```sh
-# From GitHub releases (recommended):
+# From GitHub, tracking the main branch (recommended for latest features):
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
-# From a release asset:
-dsh plugin --profile web add ./dsh-overleaf-0.1.2.tgz
+# Or pin an exact released version:
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.8
+```
+
+From a release tarball (download the `.tgz` attached to the [latest release](https://github.com/gychen-NJU/dsh-overleaf/releases)):
+
+```sh
+dsh plugin --profile web add ./dsh-overleaf-0.3.8.tgz
 ```
 
 Then restart the web service once (client bundles join the boot graph at startup):

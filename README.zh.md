@@ -60,14 +60,20 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 
 ## 安装
 
-npm 包名已被另一项目占用，因此仅通过 GitHub 或 tarball 分发：
+npm 包名 `dsh-overleaf` 已被另一项目占用，因此本插件**不发布 npm**——请直接从 GitHub 安装。仓库已提交预构建的 `lib/` 产物，git 安装**无需构建步骤、无需 allowBuilds 授权**：
 
 ```sh
-# 从 GitHub releases 安装（推荐）：
+# 从 GitHub 安装，跟踪 main 分支（推荐，跟随最新特性）：
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
-# 从 release 资产安装：
-dsh plugin --profile web add ./dsh-overleaf-0.1.2.tgz
+# 或锁定某个已发布的版本：
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.8
+```
+
+从 release 资产安装（在 [Releases](https://github.com/gychen-NJU/dsh-overleaf/releases) 下载 `.tgz`）：
+
+```sh
+dsh plugin --profile web add ./dsh-overleaf-0.3.8.tgz
 ```
 
 随后重启一次 web 服务（客户端 bundle 在启动期进入 boot 图谱）：
