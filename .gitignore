@@ -1,6 +1,13 @@
 node_modules/
-lib/
+# lib/ is intentionally COMMITTED: git installs pull source without running
+# build scripts, so the built artifacts (lib/index.js + lib/client.js) must
+# live in the repo for `dsh plugin add github:` to load the plugin with zero
+# build authorization. Keep them in sync with src/ on every release.
+lib/*.map
+lib/types/**/*.js
+lib/types/**/*.map
 .tmp/
+.dsh-meow/
 *.tgz
 *.tsbuildinfo
 .DS_Store
