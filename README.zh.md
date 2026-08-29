@@ -24,6 +24,28 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 - 目标运行时：DeepSeek Harness `0.1.1-rc.2` web profile（`http://127.0.0.1:3080`）
 - 协议：附带符合 [dsh-std](https://github.com/Yan-Zero/dsh-std) 互操作规范的静态 Community v0.15 `dsh-plugin.json` 清单；经典双半区 bundle 加载仍是主激活路径。
 
+## 界面预览
+
+**运行在 DSH 会话页中的 Overleaf 编辑器**——完整编辑器与项目文件树，下方保留 DSH 对话输入框：
+
+![运行在 DSH 会话页中的 Overleaf 编辑器](docs/screenshots/01-overview.png)
+
+**分屏视图：LaTeX 源码与 PDF 预览并排**，配合 Recompile——编译、预览、迭代都不离开对话页：
+
+![分屏视图：源码与 PDF 预览](docs/screenshots/02-split-view.png)
+
+**辅助面板——AI 写入与自动捕获插入**：用自然语言描述需求，DSH 智能体完成写作后，面板会**自动捕获智能体的产出并填入"自定义内容"框**——检查后一键插入编辑器光标处：
+
+![辅助面板：AI 写入与自动捕获插入](docs/screenshots/03-panel-ai-insert.png)
+
+**辅助面板——选区 AI**：在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区（带文件/选区漂移保护）：
+
+![辅助面板：选区 AI](docs/screenshots/04-panel-selection-ai.png)
+
+**辅助面板——编译修复**：Recompile 后读取编译日志中的错误与警告，让智能体针对当前打开的文档提出自动修复：
+
+![辅助面板：编译修复](docs/screenshots/05-panel-compile-fix.png)
+
 ## 为什么需要它
 
 Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直接 `<iframe src="https://tex.nju.edu.cn">` 会被浏览器拒绝。本插件在 DSH 宿主进程内实现了一个 HTTP/1.1 反向代理：浏览器所有请求走 `/overleaf-proxy/<原路径>` 再转发到你配置的上游站点——上游被锁定为唯一配置来源，没有开放 SSRF 面。iframe 与 GUI 同源之后，浏览器级桥接才成为可能：嵌入编辑器里的文本选区可以结构化地进入对话框，生成的内容也可以写回编辑器光标处。

@@ -24,6 +24,28 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 - Target runtime: DeepSeek Harness `0.1.1-rc.2`, web profile (`http://127.0.0.1:3080`)
 - Protocol: ships a static Community v0.15 `dsh-plugin.json` per the [dsh-std](https://github.com/Yan-Zero/dsh-std) interoperability spec; classic dual-face bundle loading remains the primary activation path.
 
+## Screenshots
+
+**The Overleaf editor running inside a DSH conversation tab** — full editor with project file tree, and the DSH composer stays below:
+
+![Overleaf editor embedded in a DSH conversation tab](docs/screenshots/01-overview.png)
+
+**Split view: LaTeX source and PDF preview side by side**, with Recompile — compile, preview, and iterate without leaving the conversation:
+
+![Split view: source and PDF preview](docs/screenshots/02-split-view.png)
+
+**Assist panel — AI write & auto-captured insert**: describe the change, the DSH agent writes it, and the panel **automatically captures the agent's output into the custom-content box** — review it, then insert at the editor caret:
+
+![Assist panel: AI write with auto-captured agent output](docs/screenshots/03-panel-ai-insert.png)
+
+**Assist panel — selection AI**: select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection (guarded against file/selection drift):
+
+![Assist panel: selection AI](docs/screenshots/04-panel-selection-ai.png)
+
+**Assist panel — compile fix**: read the compile log's errors and warnings after a Recompile, then let the agent propose fixes for the currently open document:
+
+![Assist panel: compile fix](docs/screenshots/05-panel-compile-fix.png)
+
 ## Why it exists
 
 Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a plain `<iframe src="https://tex.nju.edu.cn">` is refused by browsers. This plugin ships an HTTP/1.1 reverse proxy inside the DSH host process: all browser traffic goes to `/overleaf-proxy/<original-path>` which forwards to your configured upstream origin — one fixed origin, locked by configuration, no open SSRF surface. Because the iframe and the GUI then share one origin, browser-level bridges become possible: text selections flow out of the embedded editor into the composer as structured quotes, and generated content can be written back at the editor caret.
