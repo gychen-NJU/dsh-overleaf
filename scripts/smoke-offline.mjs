@@ -236,7 +236,22 @@ async function main() {
     // new Function compiles without executing: any SyntaxError throws here.
     new Function(bridge)
     assert.ok(bridge.includes("split('\\n')"), 'outline split keeps its newline escape')
-    assert.ok(bridge.includes('\\s*\\{([^}]*)\\}'), 'outline regex keeps \\s/\\{ escapes')
+    // Behavior-level outline regex check (v0.3.9 regression: the regex source
+    // must be /^\\(part|...)\*?\s*\{/ — a doubled \\ before '(', single before
+    // *?/s*/{ . A wrongly escaped version matched nothing and reported hits=0).
+    {
+      const m = /var pattern = (\/[^\n]*)/.exec(bridge)
+      assert.ok(m, 'outline regex literal present')
+      const re = new Function(`return ${m[1]}`)()
+      const BSL = '\\'
+      const sectionLine = `${BSL}section{Introduction}`
+      const starredLine = `${BSL}section*{Abstract}`
+      assert.ok(re.exec(sectionLine)?.[2] === 'Introduction',
+        `outline regex matches a plain section line: ${String(re)}`)
+      assert.ok(re.exec(starredLine)?.[2] === 'Abstract',
+        `outline regex matches a starred (unnumbered) section: ${String(re)}`)
+      assert.ok(!re.exec(`${BSL}begin{document}`), 'outline regex ignores non-section commands')
+    }
     assert.ok(bridge.includes('sendBeacon'), 'sendBeacon wrapper present')
     // EventSource is a DOM constructor: the wrapper MUST be a class subclass
     // (a .call()-based shim made every new EventSource(...) throw, breaking
@@ -281,8 +296,6 @@ async function main() {
       'fix application and recompile click report results to the shell')
     // Outline diagnostics: starred sections must be detected, and the bridge
     // reports engine/chars/hits so a mystery "no outline" can be pinned down.
-    assert.ok(bridge.includes("\\*?\\s*\\{([^}]*)\\}"),
-      'outline regex matches starred (unnumbered) sections too')
     assert.ok(bridge.includes("type: 'outline'") && bridge.includes('debug: debug'),
       'outline replies carry bridge diagnostics (engine/chars/hits)')
   }

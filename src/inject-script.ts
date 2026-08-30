@@ -987,7 +987,7 @@ export function renderBridgeScript(): string {
       var lines = String(docValue).split('\\n')
       var items = []
       /* Starred (unnumbered) sections are outline entries too. */
-      var pattern = /^(part|chapter|section|subsection|subsubsection)\\*?\\s*\\{([^}]*)\\}/
+      var pattern = /^\\\\(part|chapter|section|subsection|subsubsection)\\*?\\s*\\{([^}]*)}/
       for (var i = 0; i < lines.length; i++) {
         var match = pattern.exec(lines[i])
         if (!match) continue
