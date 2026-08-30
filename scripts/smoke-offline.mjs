@@ -279,6 +279,12 @@ async function main() {
       'validated old->new edit lists are applied with uniqueness checks')
     assert.ok(bridge.includes("type: 'fix-applied'") && bridge.includes("data.type === 'recompile-click'"),
       'fix application and recompile click report results to the shell')
+    // Outline diagnostics: starred sections must be detected, and the bridge
+    // reports engine/chars/hits so a mystery "no outline" can be pinned down.
+    assert.ok(bridge.includes("\\*?\\s*\\{([^}]*)\\}"),
+      'outline regex matches starred (unnumbered) sections too')
+    assert.ok(bridge.includes("type: 'outline'") && bridge.includes('debug: debug'),
+      'outline replies carry bridge diagnostics (engine/chars/hits)')
   }
 
   // 0e. User-content origin hints (the compile/PDF host split). Output files
@@ -464,6 +470,8 @@ async function main() {
     'compile fix submits a bounded prompt and applies only after review')
   assert.ok(viewSource.includes("type: 'compile-log-request'") && viewSource.includes("type: 'recompile-click'"),
     'compile tab re-reads logs and can recompile from the panel')
+  assert.ok(viewSource.includes('outline.noEditor') && viewSource.includes('outlineDebug'),
+    'outline tab distinguishes "no editor" from an empty document and shows bridge diagnostics')
   const registered = []
   const sandboxWindow = {
     __ModuleLoader__: {

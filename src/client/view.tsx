@@ -201,6 +201,8 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   } | undefined>(undefined)
   const [fixDraft, setFixDraft] = useState('')
   const [fixParsed, setFixParsed] = useState<FixEditParse | undefined>(undefined)
+  const [outlineError, setOutlineError] = useState<string | undefined>(undefined)
+  const [outlineDebug, setOutlineDebug] = useState<string | undefined>(undefined)
   const docRef = useRef<{ name: string; text: string } | undefined>(undefined)
   const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
   const [cookieValue, setCookieValue] = useState('')
@@ -337,9 +339,21 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         case 'capabilities':
           setEngine(data.type === undefined ? 'none' : ((data as unknown as { editor?: EditorEngine }).editor ?? 'none'))
           return
-        case 'outline':
-          setOutlineItems((data as unknown as { items?: OutlineItem[] }).items ?? [])
+        case 'outline': {
+          const payload = data as unknown as { items?: OutlineItem[]; error?: string; debug?: { engine?: string; chars?: number; hits?: number; url?: string } }
+          setOutlineItems(payload.items ?? [])
+          setOutlineError(payload.error ?? undefined)
+          const debug = payload.debug
+          if (debug !== undefined) {
+            const parts = [debug.engine !== undefined ? `engine=${debug.engine}` : null,
+              debug.chars !== undefined ? `chars=${debug.chars}` : null,
+              debug.hits !== undefined ? `hits=${debug.hits}` : null].filter(Boolean)
+            setOutlineDebug(parts.length > 0 ? parts.join(' · ') : undefined)
+          } else {
+            setOutlineDebug(undefined)
+          }
           return
+        }
         case 'insert-done': {
           const done = data as unknown as { ok?: boolean; error?: string }
           if (done.ok === true) setNote({ ok: true, text: 'OK' })
@@ -469,6 +483,8 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
 
   const requestOutline = useCallback((): void => {
     setOutlineItems(undefined)
+    setOutlineError(undefined)
+    setOutlineDebug(undefined)
     sendToFrame({ type: 'outline-request' })
   }, [sendToFrame])
 
@@ -1134,7 +1150,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                       {outlineItems === undefined
                         ? <div className="dso-muted">…</div>
                         : outlineItems.length === 0
-                          ? <div className="dso-muted">{tt('outline.empty')}</div>
+                          ? <div className="dso-muted">{outlineError === undefined ? tt('outline.empty') : tt('outline.noEditor')}</div>
                           : outlineItems.map((item, index) => (
                               <div
                                 key={`${index}-${item.line ?? 0}`}
@@ -1146,6 +1162,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                                 <small>{item.level}</small>
                               </div>
                           ))}
+                      {outlineDebug !== undefined && <div className="dso-muted">bridge: {outlineDebug}</div>}
                     </>
                   )}
                   {panelTab === 'status' && (

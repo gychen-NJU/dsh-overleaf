@@ -973,8 +973,12 @@ export function renderBridgeScript(): string {
   function sendOutline() {
     try {
       var docValue = readDocValue()
+      var cm5 = findCm5()
+      var cm6 = cm5 ? undefined : findCm6()
+      var engine = cm5 ? 'cm5' : (cm6 ? 'cm6' : 'none')
+      var debug = { engine: engine, url: location.href }
       if (docValue === undefined) {
-        sendToParent({ type: 'outline', items: [], error: 'no-editor' })
+        sendToParent({ type: 'outline', items: [], error: 'no-editor', debug: debug })
         return
       }
       /* NOTE: inside this TS template literal every backslash that must
@@ -982,7 +986,8 @@ export function renderBridgeScript(): string {
          \n here becomes a REAL newline in the served script and breaks it. */
       var lines = String(docValue).split('\\n')
       var items = []
-      var pattern = /^(part|chapter|section|subsection|subsubsection)\\s*\\{([^}]*)\\}/
+      /* Starred (unnumbered) sections are outline entries too. */
+      var pattern = /^(part|chapter|section|subsection|subsubsection)\\*?\\s*\\{([^}]*)\\}/
       for (var i = 0; i < lines.length; i++) {
         var match = pattern.exec(lines[i])
         if (!match) continue
@@ -994,7 +999,9 @@ export function renderBridgeScript(): string {
         })
         if (items.length >= 300) break
       }
-      sendToParent({ type: 'outline', items: items })
+      debug.chars = String(docValue).length
+      debug.hits = items.length
+      sendToParent({ type: 'outline', items: items, debug: debug })
     } catch (err) {
       sendToParent({ type: 'outline', items: [], error: err && err.message })
     }
