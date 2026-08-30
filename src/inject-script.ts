@@ -943,7 +943,7 @@ export function renderBridgeScript(): string {
       return
     }
     if (data.type === 'reveal') {
-      revealText(String(data.query || ''))
+      revealText(String(data.query || ''), Number.isFinite(Number(data.line)) ? Number(data.line) : undefined)
       return
     }
     if (data.type === 'outline-request') {
@@ -1068,25 +1068,62 @@ export function renderBridgeScript(): string {
   /* Reveal + flash (chip jump-back target)                           */
   /* ---------------------------------------------------------------- */
 
-  function revealText(query) {
+  function revealText(query, lineNumber) {
     try {
-      if (!query) return
-      var needle = query.replace(/^\\n+|\\n+$/g, '').slice(0, 200)
-      if (!needle) return
+      if (!query && lineNumber === undefined) return
+      var needle = query ? query.replace(/^\\n+|\\n+$/g, '').slice(0, 200) : ''
       var cm5 = findCm5()
       if (cm5) {
         var doc = String(cm5.getValue())
-        var index = doc.indexOf(needle)
+        var index = -1
+        if (lineNumber !== undefined && cm5.getLineHandle) {
+          var lineText = cm5.getLine(lineNumber)
+          /* Line numbers in the outline are 0-based; CM5 getLine expects the
+             same 0-based index, so the match must be exact. Double-check the
+             text still corresponds, then fall through to string search. */
+          if (lineText && needle.indexOf(lineText) !== -1) {
+            try { index = cm5.indexFromPos({ line: lineNumber, ch: 0 }) } catch (err) { index = -1 }
+          }
+        }
+        if (index < 0 && needle) index = doc.indexOf(needle)
         if (index >= 0) {
           var from = cm5.posFromIndex(index)
-          var to = cm5.posFromIndex(index + Math.min(needle.length, 400))
+          var to = cm5.posFromIndex(index + Math.max(1, Math.min(needle.length || lineText.length || 1, 400)))
           cm5.setSelection(from, to)
           cm5.scrollIntoView({ from: from, to: to }, 160)
           cm5.focus()
           return
         }
       }
+      /* CM6: the editor text lives in a virtualized CodeMirror document, so
+         the raw line is not reachable through a DOM text-node walker. Locate
+         it in state.doc (by line number first, then string), move the cursor
+         there, then scroll the scroller. */
+      var cm6 = findCm6()
+      if (cm6) {
+        var doc6 = cm6.state.doc.toString()
+        var index6 = -1
+        if (lineNumber !== undefined && cm6.state.doc && typeof cm6.state.doc.line === 'function') {
+          try {
+            var line6 = cm6.state.doc.line(lineNumber)
+            if (line6 && line6.from !== undefined) index6 = line6.from
+          } catch (err) { index6 = -1 }
+        }
+        if (index6 < 0 && needle) index6 = doc6.indexOf(needle)
+        if (index6 >= 0) {
+          var len = Math.max(1, Math.min(needle.length || 1, 400))
+          cm6.dispatch({ selection: { anchor: index6, head: index6 + len } })
+          cm6.focus()
+          var scroller = cm6.dom && cm6.dom.closest ? cm6.dom.closest('.cm-scroller') : null
+          var anchor = scroller || (cm6.dom || null)
+          if (anchor && typeof anchor.scrollIntoView === 'function') {
+            anchor.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          }
+          return
+        }
+      }
       /* DOM-wide soft match otherwise */
+      if (!needle) return
       var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false)
       while (walker.nextNode()) {
         var node = walker.currentNode

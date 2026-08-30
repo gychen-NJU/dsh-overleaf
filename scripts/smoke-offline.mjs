@@ -298,6 +298,14 @@ async function main() {
     // reports engine/chars/hits so a mystery "no outline" can be pinned down.
     assert.ok(bridge.includes("type: 'outline'") && bridge.includes('debug: debug'),
       'outline replies carry bridge diagnostics (engine/chars/hits)')
+    // Outline jump: clicking a row must reveal the section. CM5 uses
+    // setSelection/scrollIntoView; CM6 dispatches a cursor move (the raw line
+    // is virtualized and unreachable via a DOM text-node walker).
+    assert.ok(bridge.includes("data.type === 'reveal'") && bridge.includes('revealText('),
+      'outline rows request a reveal through the bridge')
+    assert.ok(bridge.includes('cm6.state.doc.line'), 'CM6 reveal locates the section by line number')
+    assert.ok(bridge.includes('cm6.dispatch({ selection:'), 'CM6 reveal dispatches the cursor move')
+    assert.ok(bridge.includes(".cm-scroller"), 'CM6 reveal scrolls the editor scroller')
   }
 
   // 0e. User-content origin hints (the compile/PDF host split). Output files

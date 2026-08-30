@@ -1156,7 +1156,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                                 key={`${index}-${item.line ?? 0}`}
                                 className="dso-outline-row"
                                 style={{ paddingLeft: outlineIndent(item.level) }}
-                                onClick={() => { if (item.text !== undefined) sendToFrame({ type: 'reveal', query: item.text }) }}
+                                onClick={() => { if (item.line !== undefined || item.text !== undefined) sendToFrame({ type: 'reveal', query: item.text, line: item.line }) }}
                               >
                                 <span>{item.title}</span>
                                 <small>{item.level}</small>
