@@ -159,6 +159,14 @@ Two paths, both feeding the same credential store:
 - **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds default + installed Chromium builds; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Sign in once and keep that window open; the plugin polls `Storage.getCookies`/`Network.getAllCookies` until (1) at least one non-preference cookie exists for the configured host, (2) a tab sits on the origin outside its login/SSO pages, and (3) the assembled header passes a tolerant server-side check. This works for standard Overleaf AND TeXPage-based deployments (such as `tex.nju.edu.cn`) whose session cookie names differ. Closing the login window early aborts capture immediately — paste the cookie instead. The login route returns immediately and the view polls progress, so the toolbar never wedges.
 - **Manual paste**: DevTools copy of the Cookie header line pasted through the toolbar dialog; validated with the same tolerant check (200, or a redirect away from login pages) before persisting.
 
+When logging into www.overleaf.com from a CN network, the proxied embedded page may be blocked by Google reCAPTCHA (see the CAPTCHA notes below), so pasting a copied cookie is the recommended path:
+
+1. Press `F12` (or `Ctrl+Shift+J`) to open the Web DevTools console → the **Application** tab;
+2. In the **Cookie** panel find the `overleaf_session2` entry and copy the full value from its **Cookie Value** field;
+3. Assemble it as `overleaf_session2=<Cookie Value>` and paste it into the toolbar dialog.
+
+![Cookie login steps](docs/screenshots/06-cookie-login.png)
+
 ### CAPTCHA notes (www.overleaf.com from CN networks)
 
 Overleaf's login is protected by Google reCAPTCHA hosted on google.com/gstatic.com. Two consequences:

@@ -157,6 +157,14 @@ scripts/
 - **直连 CDP 抓取（推荐）**：插件用你选择的 Chromium 系浏览器（`auto` 自动发现默认浏览器与已装 Chromium；可指定渠道或路径）以独立配置目录（`~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`）加预留 loopback 调试端口启动。登录一次并保持窗口打开；插件轮询 `Storage.getCookies` / `Network.getAllCookies`，直到 (1) 配置主机名下出现至少一个非偏好类 Cookie，(2) 有页面停留在该站点且不在登录/SSO 页，(3) 组装出的 Cookie 头通过宽容的服务端校验。因此它同时兼容标准 Overleaf 与 TeXPage 系部署（如 `tex.nju.edu.cn`，其会话 Cookie 名完全不同）。提前关闭登录窗口会立即中止抓取——此时改用粘贴 Cookie。登录请求立即返回、视图轮询进度，工具栏不会卡死。
 - **手动粘贴**：DevTools 复制整行 Cookie 经工具栏对话框粘贴入库；保存前以 redirect-manual GET 校验 `<baseUrl>/project`。
 
+国内网络登录 www.overleaf.com 时，反向代理内嵌页面可能被 Google reCAPTCHA 阻塞（见下方 CAPTCHA 说明），此时推荐使用复制 Cookie 的方式登录：
+
+1. `F12`（或 `Ctrl+Shift+J`）打开 Web 工具控制台 → **Application（应用程序）** 页签；
+2. 在 **Cookie** 面板中找到 `overleaf_session2` 的值，从它的 **Cookie Value** 中复制完整值；
+3. 复制 Cookie Value，并补齐为 `overleaf_session2=<Cookie Value>` 的格式后粘贴入库。
+
+![复制 Cookie 登录步骤](docs/screenshots/06-cookie-login.png)
+
 ### CAPTCHA 说明（国内网络登录 www.overleaf.com）
 
 Overleaf 登录使用 Google reCAPTCHA（资源在 google.com / gstatic.com）。两个后果：
