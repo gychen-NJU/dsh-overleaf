@@ -39,8 +39,10 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 ![Assist panel tabs: ai-insert / selection-ai / compile-fix](docs/screenshots/panel-tabs.png)
 
 - **`[ ai-insert ]`** — describe the change, the DSH agent writes it, and the panel **automatically captures the agent's output into the custom-content box** — review it, then insert at the editor caret.
-- **`[ selection-ai ]`** — select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection (guarded against file/selection drift).
+- **`[ selection-ai ]`** — select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection. Source/selection drift checks are on by default and can be unchecked to force replacement at the saved anchor (file switches are still refused).
 - **`[ compile-fix ]`** — read the compile log's errors and warnings after a Recompile, then let the agent propose fixes for the currently open document.
+- **Local `.bib` sync** — both `ai-insert` and `selection-ai` offer “Update Overleaf .bib”: recursively auto-detect workspace bibliographies or accept an absolute/relative path inside the current DSH workspace, then update the same-named Overleaf document and wait for autosave confirmation.
+- **Bidirectional current `.tex` sync** — the assist panel's Status page defaults to saving the current Overleaf source into the workspace: it recursively detects local `.tex` files and creates a same-named root file when none exist. The reverse “Local → Overleaf” direction can use a selected local file or manually pasted complete LaTeX, but requires an explicit whole-document warning confirmation plus document-ID, revision, snapshot, write-verification, and save-event checks.
 
 ## Why it exists
 
@@ -56,7 +58,7 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 | R4 · native composer below | The view replaces only the message area; composer, workspace recording, deliverables untouched |
 | R5 · selection quoting | `selectionchange` in the iframe surfaces a floating quote button; clicking inserts a structured quote chip through the official reference pipeline (`inputTriggers.registerSource({name:'quote-ref'})` codec), falling back to plain-text block quotes when absent |
 | R6 · generate at caret | Template inserts and free-form/agent-generated LaTeX write to the live cursor through CodeMirror APIs (CM5 primary, CM6 probe, editable fallback); agent output is captured into a review box before insertion |
-| R7 · assist features | Assist panel: ask the agent about an editor selection or generate a reviewable, conflict-checked replacement; read the compile log and auto-fix errors/warnings via a reviewed agent edit list (applied only when every `old` matches uniquely); document outline with jump-to-line flashing; login/logout/cookie management; status reporting (`editorAssistEnabled` toggle = `assistPanelEnabled`) |
+| R7 · assist features | Assist panel: AI writing; selection questions and reviewed replacement (safe checks by default, explicit force mode available); safe local `.bib` synchronization; bidirectional current Overleaf/workspace `.tex` synchronization (Overleaf-to-local by default, explicit confirmation and revision checks for reverse whole-document replacement); reviewed compile-log fixes; document outline navigation; login/logout/cookie management; status reporting |
 
 ## Installation
 
@@ -67,13 +69,13 @@ The npm package name `dsh-overleaf` is occupied by another project, so this plug
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
 # Or pin an exact released version:
-dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.8
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.9
 ```
 
 From a release tarball (download the `.tgz` attached to the [latest release](https://github.com/gychen-NJU/dsh-overleaf/releases)):
 
 ```sh
-dsh plugin --profile web add ./dsh-overleaf-0.3.8.tgz
+dsh plugin --profile web add ./dsh-overleaf-0.3.9.tgz
 ```
 
 Then restart the web service once (client bundles join the boot graph at startup):
@@ -150,7 +152,7 @@ Request path summary:
 4. `text/html` bodies up to 4 MB are buffered once: root-relative `href/src/action/poster/data-src` and `srcset` references get the prefix, and `<base href="/overleaf-proxy/">` plus the bridge script are injected right after `<head>`. Larger HTML and every other content type stream untouched.
 5. WebSockets: the real webserver dispatches exact upgrade paths to a TCP/TLS tunnel that replays the handshake toward the upstream and splices both directions byte-for-byte.
 
-Inside the proxied document the bridge script installs defensive wrappers (`fetch`, `XMLHttpRequest.open`, `EventSource`, `WebSocket`) so late-created root-relative URLs also land under the prefix, reports CodeMirror-native selections with safe anchor tokens, watches compile responses to capture the build's output log for the auto-fix panel, exposes caret insertion/conflict-checked selection replacement/outline/reveal commands, and keeps a localStorage snapshot before each mutation for rollback.
+Inside the proxied document the bridge script installs defensive wrappers (`fetch`, `XMLHttpRequest.open`, `EventSource`, `WebSocket`) so late-created root-relative URLs also land under the prefix, reports CodeMirror-native selections with safe anchor tokens, watches fresh/cached compile responses and Overleaf's own output-log requests to capture `output.log`/`.blg` for the auto-fix panel, exposes caret insertion/selection replacement with default conflict checks and explicit force mode/outline/reveal commands, and keeps a localStorage snapshot before each mutation for rollback.
 
 ## Login
 

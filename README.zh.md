@@ -39,8 +39,10 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 ![辅助面板标签：ai-insert / selection-ai / compile-fix](docs/screenshots/panel-tabs.png)
 
 - **`[ ai-insert ]`**——用自然语言描述需求，DSH 智能体完成写作后，面板会**自动捕获智能体的产出并填入"自定义内容"框**——检查后一键插入编辑器光标处。
-- **`[ selection-ai ]`**——在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区（带文件/选区漂移保护）。
+- **`[ selection-ai ]`**——在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区；原文/选区漂移保护默认开启，也可取消勾选后按保存的原锚点位置强制替换（切换文件仍会拒绝）。
 - **`[ compile-fix ]`**——Recompile 后读取编译日志中的错误与警告，让智能体针对当前打开的文档提出自动修复。
+- **本地 `.bib` 同步**——`ai-insert` 与 `selection-ai` 面板都提供“更新 Overleaf .bib”：默认递归检测当前 DSH 工作区中的 `.bib`，也可填写工作区内的绝对/相对路径；点击后按同名文件更新 Overleaf，并等待自动保存确认。
+- **当前 `.tex` 双向同步**——辅助面板“状态”页默认把当前 Overleaf 源码同步到工作区：递归检测本地 `.tex`，没有候选时在工作区根目录新建同名文件；也可选择本地路径。切换为“本地 → Overleaf”后，可读取本地文件或使用手动粘贴的完整 LaTeX 内容，但必须先确认整篇覆盖警告，并通过文档 ID、内容版本、修改前快照和保存事件校验。
 
 ## 为什么需要它
 
@@ -56,7 +58,7 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 | R4 · 底部原生输入框 | 视图只替换消息区域；composer、工作区记录、交付物一概不动 |
 | R5 · 选区引用 | iframe 内 `selectionchange` 浮出引用按钮；点击经官方引用管线写入 chip（`inputTriggers.registerSource({name:'quote-ref'})` codec），管线缺失时退化为纯文本块引用 |
 | R6 · 光标处生成 | 模板插入（section/subsection/figure/table/equation/BibTeX）与自由粘贴通过 CodeMirror API 写入实时光标（CM5 主通道，CM6 探测，可编辑兜底）。自动写入模型回复列入后续计划；按任务书要求注明所属 lane |
-| R7 · 辅助功能 | 辅助面板：AI 写入；针对编辑器选区向智能体提问或生成可审阅的替换内容；读取编译日志并让智能体自动修复错误/警告（生成可审阅的编辑清单，每条 old 唯一匹配后才应用）；从编辑器缓冲抽取文档大纲并可跳转闪烁；登录/登出/Cookie 管理；状态上报（`assistPanelEnabled` 开关控制面板显隐） |
+| R7 · 辅助功能 | 辅助面板：AI 写入；针对编辑器选区向智能体提问或生成可审阅的替换内容（默认安全校验，可显式切换强制模式）；本地 `.bib` 安全同步到 Overleaf 同名文档；当前 Overleaf `.tex` 与工作区 `.tex` 双向同步（默认拉取到本地，反向整篇覆盖需显式确认和版本校验）；读取编译日志并让智能体自动修复错误/警告；文档大纲跳转；登录/登出/Cookie 管理；状态上报 |
 
 ## 安装
 
@@ -67,13 +69,13 @@ npm 包名 `dsh-overleaf` 已被另一项目占用，因此本插件**不发布 
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
 # 或锁定某个已发布的版本：
-dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.8
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.9
 ```
 
 从 release 资产安装（在 [Releases](https://github.com/gychen-NJU/dsh-overleaf/releases) 下载 `.tgz`）：
 
 ```sh
-dsh plugin --profile web add ./dsh-overleaf-0.3.8.tgz
+dsh plugin --profile web add ./dsh-overleaf-0.3.9.tgz
 ```
 
 随后重启一次 web 服务（客户端 bundle 在启动期进入 boot 图谱）：
@@ -148,7 +150,7 @@ scripts/
 4. 不超过 4MB 的 `text/html` 缓冲一次处理：根相对的 `href/src/action/poster/data-src` 与 `srcset` 加前缀，并在 `<head>` 后注入 `<base href="/overleaf-proxy/">` 与桥接脚本。超大 HTML 及其他类型一律原样流式。
 5. WebSocket：真实 webserver 把精确升级路径分派给 TCP/TLS 隧道——向上游重放握手字节再双向逐字节拼接。
 
-在被代理文档内，桥接脚本安装防御性包装（`fetch`、`XMLHttpRequest.open`、`EventSource`、`WebSocket`），让运行期新建的根相对 URL 也落回前缀；通过 CodeMirror API 上报选区及安全锚点；监测编译响应并抓取本次构建的 output.log 供自动修复面板使用；暴露光标写入、带冲突检测的选区替换、大纲和跳转命令；并在每次变更前保存 localStorage 快照供回滚。
+在被代理文档内，桥接脚本安装防御性包装（`fetch`、`XMLHttpRequest.open`、`EventSource`、`WebSocket`），让运行期新建的根相对 URL 也落回前缀；通过 CodeMirror API 上报选区及安全锚点；监测新编译/缓存响应，并复用 Overleaf 原生日志请求抓取本次构建的 `output.log`/`.blg` 供自动修复面板使用；暴露光标写入、默认带冲突检测且可显式强制的选区替换、大纲和跳转命令；并在每次变更前保存 localStorage 快照供回滚。
 
 ## 登录
 
