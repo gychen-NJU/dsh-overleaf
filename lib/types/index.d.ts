@@ -5,8 +5,8 @@
  */
 export { Config, OverleafWorkbenchService, name, inject, discoverWorkspaceBibFiles, discoverWorkspaceTexFiles, projectsFromDashboardHtml, readLocalBibFile, readLocalTexFile, writeLocalTexFile, } from './service.ts';
 export { default } from './service.ts';
-export type { WorkbenchConfig, ResolvedConfig, LoginProfileMode, OverleafBrowserChannel } from './config.ts';
-export { normalizeOrigin, resolveConfig } from './config.ts';
+export type { WorkbenchConfig, ResolvedConfig, LoginProfileMode, OverleafBrowserChannel, VolatileRef } from './config.ts';
+export { isVolatileRef, normalizeOrigin, readField, resolveConfig } from './config.ts';
 export { OVERLEAF_WORKBENCH_COOKIE } from './credentials.ts';
 export { PROXY_PREFIX, ReverseProxy, allowSelfInCsp, buildUpstreamHeaders, extractContentDomainFromHtml, extractContentHintsFromJson, extractCspNonce, mergeCookieHeaders, mergeProxyCookieHeaders, requestTimeoutFor, rewriteCss, rewriteHtml, relaxFrameCsp, scopeSetCookieToHost, subPathOf } from './proxy.ts';
 export { renderBridgeScript, BRIDGE_SCRIPT_NAME } from './inject-script.ts';
