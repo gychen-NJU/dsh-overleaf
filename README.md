@@ -42,6 +42,11 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 - **`[ selection-ai ]`** — select text in the editor, ask the agent to explain or rewrite it, review the replacement, then replace the original selection. Source/selection drift checks are on by default and can be unchecked to force replacement at the saved anchor (file switches are still refused).
 - **`[ compile-fix ]`** — read the compile log's errors and warnings after a Recompile, then let the agent propose fixes for the currently open document.
 - **Local `.bib` sync** — both `ai-insert` and `selection-ai` offer “Update Overleaf .bib”: recursively auto-detect workspace bibliographies or accept an absolute/relative path inside the current DSH workspace, then update the same-named Overleaf document and wait for autosave confirmation.
+
+  v0.3.20 supports both overleaf.com and tex.nju.edu.cn (TeXPage). Overleaf retains its document-ID and save-event lifecycle; TeXPage separately adapts its file tree, CM6 editor and server readback. Both require a unique same-named bibliography and preserve a pre-write snapshot. On TeXPage, enable the bottom status bar to verify the current file path and let pending edits save first. Restart DSH yourself and reload the embedded project after upgrading; no cookie clearing is needed. If a write is reported as unconfirmed, check the site's save state before repeating it.
+
+  v0.3.21 retries a transient TeXPage read once within its original deadline, never repeating the write. Errors identify the file-tree, baseline or save-verification phase plus an available HTTP status and safe error category. A read failure alone does not establish an expired login; permission, target and content-validation errors are not retried.
+  v0.3.22 adds bidirectional current-`.tex` synchronization for TeXPage. It binds the selected full tree path, footer path, loading state, unique CM6 editor, and the file tree API's `fileKey`; reverse sync confirms persistence through isolated server readback. overleaf.com retains its existing document-ID, revision, and `doc:saved` checks.
 - **Bidirectional current `.tex` sync** — the assist panel's Status page defaults to saving the current Overleaf source into the workspace: it recursively detects local `.tex` files and creates a same-named root file when none exist. The reverse “Local → Overleaf” direction can use a selected local file or manually pasted complete LaTeX, but requires an explicit whole-document warning confirmation plus document-ID, revision, snapshot, write-verification, and save-event checks.
 
 ## Why it exists
@@ -53,7 +58,7 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 | Requirement | Status |
 |---|---|
 | R1 · fourth session-page tab | `conversation.view` entry `id:"overleaf"`, `order:30`; visible whenever the tab bar shows (`tabs >= 2`) |
-| R2 · configurable site address | Settings page (`Settings > Plugins > Plugin configuration > dsh-overleaf`) edits `baseUrl`; saving hot-swaps the proxy target without a restart |
+| R2 · configurable site address | Settings page (DSH 0.1.7+: the "Overleaf workbench settings" page in the Settings sidebar, or sidebar → Plugins → Installed → dsh-overleaf; older lines: Settings > Plugins > Plugin configuration) edits `baseUrl`; saving hot-swaps the proxy target without a restart |
 | R3 · original site features usable | Streaming reverse proxy preserves paths and query strings; responses pass through minus framing headers; small HTML bodies get link/asset rebasing plus the bridge script |
 | R4 · native composer below | The view replaces only the message area; composer, workspace recording, deliverables untouched |
 | R5 · selection quoting | `selectionchange` in the iframe surfaces a floating quote button; clicking inserts a structured quote chip through the official reference pipeline (`inputTriggers.registerSource({name:'quote-ref'})` codec), falling back to plain-text block quotes when absent |
@@ -90,7 +95,7 @@ Verify composition survived:
 dsh --profile web --dump-config   # expect a "# == dsh-overleaf" block
 ```
 
-The default upstream is `https://www.overleaf.com`. To point the workbench at any other instance (self-hosted Overleaf, `tex.nju.edu.cn`, ...), open Settings > Plugins > Plugin configuration > dsh-overleaf, change `baseUrl`, and save — the proxy target hot-swaps without a restart.
+The default upstream is `https://www.overleaf.com`. To point the workbench at any other instance (self-hosted Overleaf, `tex.nju.edu.cn`, ...), open the "Overleaf workbench settings" page in the Settings sidebar (DSH 0.1.7+; also reachable via sidebar → Plugins → Installed → dsh-overleaf; older lines: Settings > Plugins > Plugin configuration > dsh-overleaf), change `baseUrl`, and save — the proxy target hot-swaps without a restart.
 
 Uninstall cleanly at any time:
 
@@ -158,8 +163,16 @@ Inside the proxied document the bridge script installs defensive wrappers (`fetc
 
 Two paths, both feeding the same credential store:
 
-- **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds default + installed Chromium builds; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Sign in once and keep that window open; the plugin polls `Storage.getCookies`/`Network.getAllCookies` until (1) at least one non-preference cookie exists for the configured host, (2) a tab sits on the origin outside its login/SSO pages, and (3) the assembled header passes a tolerant server-side check. This works for standard Overleaf AND TeXPage-based deployments (such as `tex.nju.edu.cn`) whose session cookie names differ. Closing the login window early aborts capture immediately — paste the cookie instead. The login route returns immediately and the view polls progress, so the toolbar never wedges.
-- **Manual paste**: DevTools copy of the Cookie header line pasted through the toolbar dialog; validated with the same tolerant check (200, or a redirect away from login pages) before persisting.
+- **Direct-CDP capture (recommended)**: the plugin launches your chosen Chromium-family browser (`auto` finds installed browsers; explicit channel/path available) with a reserved loopback debug port and its own profile under `~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`. Keep the window open until capture completes. Cookies must match the configured host, and the observed landing page must return 200 without a login form while anonymous access to that same URL is denied or requires login. Session names such as `SESSIONID` and `overleaf_session2` are supported. Closing the window early aborts capture; the view polls progress asynchronously.
+- **Manual paste**: copy the full Cookie request header from DevTools > Network for the current site into the toolbar dialog. The same protected-page check runs before saving. It starts at `/project` and falls back to the site root if that route is missing; 404 alone never proves authentication.
+
+Both the embedded page and the open-window button enter through the site root, allowing upstream redirects to choose the dashboard (for example, `/console` on the TeXPage deployment at `tex.nju.edu.cn`). Verified login and upstream changes return the frame to that root; same-site DSH tab switches preserve the open project. Different session cookie names can coexist under the shared local proxy origin without necessarily conflicting.
+
+Since v0.3.17, a narrowly scoped, credential-free proxy adjusts the fixed router basename in TeXPage's public `console.<hash>.js` bundle. Protocol-relative API URLs that omit the loopback port are also routed correctly. The console and project listing have been browser-verified; this is not a claim of full compatibility with every TeXPage editing/compilation interface. Restart the DSH backend and refresh the page after upgrading.
+
+Since v0.3.18, TeXPage's separately announced same-site Socket.IO host is tunneled through loopback using the original upstream HTTPS/WSS protocol, page Origin and site session. Only the exact `socket.<site hostname>` authority and explicit Socket.IO/heartbeat paths are accepted; arbitrary destinations are rejected. Project source loading has been browser-verified, separately from compilation or editing writes.
+
+v0.3.19 adds an isolated same-origin route for signed TeXPage compile PDFs and their sibling `output.log`/`output.blg` files on the announced `latex-file.texpageusercontent.com` host. It preserves signature queries and PDF Range/206/416 semantics, streams bytes without text rewriting, and never forwards site cookies, Authorization or Referer to the file host. Logs are served as plain text; other hosts and output paths are not opened up. Restart DSH and refresh the embedded page to load both the new proxy and bridge; do not clear login cookies or disable browser security.
 
 When logging into www.overleaf.com from a CN network, the proxied embedded page may be blocked by Google reCAPTCHA (see the CAPTCHA notes below), so pasting a copied cookie is the recommended path:
 
@@ -174,7 +187,7 @@ When logging into www.overleaf.com from a CN network, the proxied embedded page 
 Overleaf's login is protected by Google reCAPTCHA hosted on google.com/gstatic.com. Two consequences:
 
 - **The embedded page can never complete a login** — reCAPTCHA site keys are domain-locked to www.overleaf.com, so the widget fails on the loopback proxy origin. When the embedded page shows a login form the view displays a hint steering you to the popup/cookie flow. Always sign in through the CDP popup window or paste a cookie.
-- **The CDP popup needs direct access to Google**. From CN networks set `loginProxyServer` (Settings > Plugins > dsh-overleaf, or the composed row) to your proxy client's HTTP endpoint — `http://127.0.0.1:7890` for a typical Clash setup, a bare port works too — and the login browser is launched with `--proxy-server`. Leave it empty to use the system default. Without reachability you will see "captcha not available".
+- **The CDP popup needs direct access to Google**. From CN networks set `loginProxyServer` on the "Overleaf workbench settings" page (Settings sidebar, DSH 0.1.7+; or the composed row) to your proxy client's HTTP endpoint — `http://127.0.0.1:7890` for a typical Clash setup, a bare port works too — and the login browser is launched with `--proxy-server`. Leave it empty to use the system default. Without reachability you will see "captcha not available".
 
 No cookie value ever passes through plugin config, route payloads (beyond your paste), logs, or client storage.
 

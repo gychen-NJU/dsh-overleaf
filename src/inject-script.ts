@@ -19,6 +19,9 @@
  * Raw browser-side script. Kept as one double-quoted-free normal TS string;
  * build copies it verbatim into the bundle.
  */
+import { renderTexpageBibAdapter } from './texpage-bib.ts'
+import { renderTexpageTexAdapter } from './texpage-tex.ts'
+
 export const BRIDGE_SCRIPT_NAME = 'bridge.js'
 
 export function renderBridgeScript(): string {
@@ -120,7 +123,8 @@ export function renderBridgeScript(): string {
       if (raw instanceof URL) raw = raw.toString()
       if (typeof raw !== 'string') return raw
       // Root-relative upstream URLs are re-rooted under the proxy.
-      if (raw.charAt(0) === '/') {
+      if (raw.charAt(0) === '/' && raw.indexOf('//') !== 0) {
+        if (raw === PREFIX || raw.indexOf('/overleaf/workbench/') === 0) return raw
         if (!isProxyUrl(raw)) return PREFIX + raw
         return raw
       }
@@ -132,10 +136,37 @@ export function renderBridgeScript(): string {
       // their root semantics; external/CDN/blob/data origins remain untouched.
       var isAbsolute = raw.indexOf('//') === 0 || /^[a-z][a-z0-9+.-]*:/i.test(raw)
       if (isAbsolute) {
-        var parsed = new URL(raw.indexOf('//') === 0 ? location.protocol + raw : raw)
+        var upstreamOrigin = typeof window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__ === 'string'
+          ? window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__ : ''
+        var upstreamProtocol = upstreamOrigin ? new URL(upstreamOrigin).protocol : location.protocol
+        var protocolRelative = raw.indexOf('//') === 0
+        var parsed = new URL(protocolRelative ? upstreamProtocol + raw : raw)
+        // blob: URLs report their creator's origin, but are not HTTP resources.
+        // PDF viewers/workers must keep those object URLs intact.
+        if (!/^https?:$/.test(parsed.protocol)) return raw
+        // TeXPage builds API bases with location.hostname (no loopback port).
+        // Only that protocol-relative, implicit-port form aliases this proxy;
+        // explicit other ports/hosts remain external.
+        var implicitCurrentHost = protocolRelative && parsed.hostname === window.location.hostname && parsed.port === ''
+        // TeXPage returns signed PDF URLs over Socket.IO, not Overleaf compile
+        // JSON/meta tags. Send only the announced fixed host's PDF/log outputs
+        // through its isolated credential-free handler; preserve signed query.
+        var announcedOutput = window.__DSH_OVERLEAF_TEXPAGE_OUTPUT_ORIGIN__
+        if (announcedOutput === 'https://latex-file.texpageusercontent.com'
+          && parsed.origin === announcedOutput && parsed.username === '' && parsed.password === ''
+          && /^\\/CompileResult\\/[a-zA-Z0-9_-]+\\/[a-zA-Z0-9_-]+\\/[a-zA-Z0-9_-]+\\/output\\.(?:pdf|log|blg)$/.test(parsed.pathname)) {
+          markDiagnostic(/\\.pdf$/.test(parsed.pathname) ? 'pdf-route' : 'log-route', 'texpage-same-origin')
+          return window.location.origin + PREFIX + '/__dsh_texpage_output__' + parsed.pathname + parsed.search
+        }
+        var announcedSocket = window.__DSH_OVERLEAF_SOCKET_ORIGIN__
+        if (typeof announcedSocket === 'string' && /^https?:$/.test(parsed.protocol) && parsed.host === new URL(announcedSocket).host
+          && /^\\/(?:socket\\.io\\/?|heartbeat)$/.test(parsed.pathname)) {
+          return window.location.origin + PREFIX + '/__dsh_socket__' + parsed.pathname + parsed.search + parsed.hash
+        }
         var isWorkbenchRoute = parsed.pathname.indexOf('/overleaf/workbench/') === 0
         var isAlreadyProxied = parsed.pathname === PREFIX || parsed.pathname.indexOf(PREFIX + '/') === 0
-        if (parsed.origin === window.location.origin && !isWorkbenchRoute && !isAlreadyProxied) {
+        if ((parsed.origin === window.location.origin || parsed.origin === upstreamOrigin || implicitCurrentHost)
+          && !isWorkbenchRoute && !isAlreadyProxied) {
           return window.location.origin + PREFIX + parsed.pathname + parsed.search + parsed.hash
         }
         // Absolute URLs on the site's user-content output origin are re-rooted
@@ -145,6 +176,7 @@ export function renderBridgeScript(): string {
         if (contentDom !== '' && parsed.origin === contentDom && !isWorkbenchRoute && !isAlreadyProxied) {
           return PREFIX + parsed.pathname + parsed.search + parsed.hash
         }
+        if (protocolRelative) return parsed.toString()
       }
       return raw
     } catch (err) {
@@ -165,7 +197,8 @@ export function renderBridgeScript(): string {
   /* ---------------------------------------------------------------- */
   var lastCompileStatus = undefined
   var lastCompileLogs = undefined
-  var logFetchInFlight = false
+  var compileGeneration = 0
+  var logFetchInFlight = Object.create(null)
 
   function pathnameOf(rawUrl) {
     try {
@@ -181,11 +214,29 @@ export function renderBridgeScript(): string {
   }
 
   function isCompilePost(rawUrl) {
-    return /^\\/project\\/[^/]+\\/compile\\/?$/.test(pathnameOf(rawUrl))
+    var pathName = pathnameOf(rawUrl)
+    if (pathName.indexOf(PREFIX + '/') === 0) pathName = pathName.slice(PREFIX.length)
+    return /^\\/project\\/[^/]+\\/compile\\/?$/.test(pathName)
+  }
+
+  function isCachedCompileResponse(rawUrl) {
+    var pathName = pathnameOf(rawUrl)
+    if (pathName.indexOf(PREFIX + '/') === 0) pathName = pathName.slice(PREFIX.length)
+    return /^\\/project\\/[^/]+\\/output\\/cached\\/output\\.overleaf\\.json$/.test(pathName)
   }
 
   function isOutputPdf(rawUrl) {
     return /\\/output\\/output\\.pdf(?:[?#]|$)/.test(pathnameOf(rawUrl))
+  }
+
+  function isCompileLog(rawUrl) {
+    return /\\/output\\/[^/]+\\.(?:log|blg)$/i.test(pathnameOf(rawUrl))
+  }
+
+  function compileLogPath(rawUrl) {
+    var pathName = pathnameOf(rawUrl)
+    var name = pathName.slice(pathName.lastIndexOf('/') + 1)
+    return name || 'output.log'
   }
 
   function truncateText(text, max) {
@@ -197,7 +248,8 @@ export function renderBridgeScript(): string {
     try {
       var controller = typeof AbortController === 'function' ? new AbortController() : undefined
       if (controller) setTimeout(function () { try { controller.abort() } catch (err) {} }, 30000)
-      return window.fetch(url, {
+      var fetchImpl = originalFetch || window.fetch
+      return fetchImpl.call(window, routeUrl(url), {
         cache: 'no-store',
         signal: controller ? controller.signal : undefined,
       })
@@ -214,54 +266,119 @@ export function renderBridgeScript(): string {
     })
   }
 
-  function fetchAndPublishLog(fullUrl, pathName) {
-    if (logFetchInFlight) return
-    logFetchInFlight = true
+  function beginCompileGeneration(status) {
+    compileGeneration += 1
+    lastCompileStatus = status || 'compiling'
+    lastCompileLogs = []
+    publishCompileLog()
+    return compileGeneration
+  }
+
+  function storeCompileLog(captured, generation) {
+    if (generation !== compileGeneration) return
+    var previous = lastCompileLogs || []
+    var rest = previous.filter(function (item) { return item && item.path !== captured.path })
+    lastCompileLogs = rest.concat([captured])
+    markDiagnostic('compile-log', captured.path + (captured.error ? ':' + captured.error : ':' + captured.text.length))
+    publishCompileLog()
+  }
+
+  function fetchAndPublishLog(fullUrl, pathName, generation) {
+    var requestGeneration = typeof generation === 'number' ? generation : compileGeneration
+    var flightKey = String(requestGeneration) + '|' + String(fullUrl)
+    if (logFetchInFlight[flightKey]) return
+    logFetchInFlight[flightKey] = true
     fetchWithTimeout(fullUrl)
       .then(function (response) {
         if (!response.ok) return { path: pathName, text: '', error: 'HTTP ' + response.status }
         return response.text().then(function (text) {
-          return { path: pathName, text: truncateText(text, 262144) }
+          return { path: pathName, text: truncateText(text, 1048576) }
         })
       })
       .then(function (captured) {
-        var previous = lastCompileLogs || []
-        var rest = previous.filter(function (item) { return item && item.path !== pathName })
-        lastCompileLogs = rest.concat([captured])
-        publishCompileLog()
+        storeCompileLog(captured, requestGeneration)
       })
       .catch(function (err) {
+        storeCompileLog({
+          path: pathName,
+          text: '',
+          error: err && err.message ? String(err.message) : String(err),
+        }, requestGeneration)
         if (DEBUG) log('compile log fetch failed', err)
       })
-      .finally(function () { logFetchInFlight = false })
+      .finally(function () { delete logFetchInFlight[flightKey] })
+  }
+
+  /* Overleaf itself reads output.log to build its native error panel. Capture
+     that successful response too: it is the most reliable source because it
+     already contains the exact build URL and authorization query selected by
+     the current frontend. */
+  function captureObservedLogResponse(response, rawUrl, generation) {
+    var pathName = compileLogPath(rawUrl)
+    try {
+      if (!response || !response.ok) {
+        storeCompileLog({ path: pathName, text: '', error: 'HTTP ' + (response ? response.status : 0) }, generation)
+        return
+      }
+      response.clone().text()
+        .then(function (text) {
+          storeCompileLog({ path: pathName, text: truncateText(text, 1048576) }, generation)
+        })
+        .catch(function (err) {
+          storeCompileLog({ path: pathName, text: '', error: String(err) }, generation)
+        })
+    } catch (err) {
+      storeCompileLog({ path: pathName, text: '', error: String(err) }, generation)
+    }
   }
 
   /* Observed on a compile POST response: read outputFiles, fetch every
      .log/.blg through the proxy with the same compileGroup/clsiServerId
      query the frontend uses. */
-  function captureCompileResponse(json) {
+  function captureCompileResponse(json, requestedGeneration) {
     try {
       if (!json || !json.outputFiles || !Array.isArray(json.outputFiles)) return
+      var generation = typeof requestedGeneration === 'number'
+        ? requestedGeneration
+        : beginCompileGeneration(typeof json.status === 'string' ? json.status : 'unknown')
+      if (generation !== compileGeneration) return
       if (typeof json.status === 'string') lastCompileStatus = json.status
+      publishCompileLog()
       var pdfDomain = typeof json.pdfDownloadDomain === 'string' ? json.pdfDownloadDomain : ''
       var params = new URLSearchParams()
       if (json.compileGroup) params.set('compileGroup', String(json.compileGroup))
       if (json.clsiServerId) params.set('clsiserverid', String(json.clsiServerId))
+      for (var p = 0; p < json.outputFiles.length; p++) {
+        var pdfEntry = json.outputFiles[p]
+        if (pdfEntry && pdfEntry.path === 'output.pdf' && pdfEntry.editorId) {
+          params.set('editorId', String(pdfEntry.editorId))
+          break
+        }
+      }
       params.set('enable_pdf_caching', 'true')
-      var query = params.toString()
       var found = []
       for (var i = 0; i < json.outputFiles.length; i++) {
         var entry = json.outputFiles[i]
         var filePath = entry && typeof entry.path === 'string' ? entry.path : ''
         var relUrl = entry && typeof entry.url === 'string' ? entry.url : ''
         if (!/\\.(?:log|blg)$/i.test(filePath) || relUrl === '' || found.length >= 4) continue
-        var target = pdfDomain !== '' && relUrl.charAt(0) === '/'
+        /* Match Overleaf's own URL builder: only entries explicitly marked as
+           build artifacts use pdfDownloadDomain. output.log normally stays on
+           window.origin and therefore must travel through /overleaf-proxy. */
+        var target = entry && entry.build && pdfDomain !== '' && relUrl.charAt(0) === '/'
           ? pdfDomain + relUrl
           : relUrl
-        found.push({ path: filePath, url: target + (query !== '' ? '?' + query : '') })
+        var absoluteTarget = target.indexOf('//') === 0
+          ? location.protocol + target
+          : (/^[a-z][a-z0-9+.-]*:/i.test(target) ? target : location.origin + (target.charAt(0) === '/' ? target : '/' + target))
+        var parsedTarget = new URL(absoluteTarget)
+        params.forEach(function (value, key) {
+          if (!parsedTarget.searchParams.has(key)) parsedTarget.searchParams.set(key, value)
+        })
+        found.push({ path: filePath, url: routeUrl(parsedTarget.toString()) })
       }
       for (var j = 0; j < found.length; j++) {
-        fetchAndPublishLog(found[j].url, found[j].path)
+        fetchAndPublishLog(found[j].url, found[j].path, generation)
       }
     } catch (err) {
       if (DEBUG) log('compile capture failed', err)
@@ -277,15 +394,39 @@ export function renderBridgeScript(): string {
         : (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl) ? rawUrl : location.origin + rawUrl)
       var parsed = new URL(absolute)
       if (!/\\.pdf$/i.test(parsed.pathname)) return
+      /* /download/project/.../output.pdf is a download controller, not the
+         output-file path. Replacing its extension produces a guaranteed 404. */
+      if (/\\/download\\/project\\//.test(parsed.pathname)) return
       parsed.pathname = parsed.pathname.replace(/\\.pdf$/i, '.log')
-      fetchAndPublishLog(parsed.toString(), 'output.log')
+      fetchAndPublishLog(parsed.toString(), 'output.log', compileGeneration)
     } catch (err) {
       if (DEBUG) log('pdf log fallback failed', err)
     }
   }
 
+  function currentFileTreeDocument() {
+    try {
+      var root = document.querySelector('[data-testid="file-tree-list-root"]')
+      if (!root) return undefined
+      var selected = root.querySelectorAll('[role="treeitem"][aria-selected="true"][aria-label]')
+      var found = []
+      for (var i = 0; i < selected.length; i++) {
+        var entity = selected[i].querySelector('.entity[data-file-id][data-file-type="doc"]')
+        if (!entity) continue
+        var name = String(selected[i].getAttribute('aria-label') || '').replace(/[\u200e\u200f]/g, '').trim()
+        if (name === '') continue
+        found.push({ item: selected[i], entity: entity, id: String(entity.getAttribute('data-file-id') || ''), name: name })
+      }
+      return found.length === 1 ? found[0] : undefined
+    } catch (err) {
+      return undefined
+    }
+  }
+
   function currentDocName() {
     try {
+      var selected = currentFileTreeDocument()
+      if (selected) return selected.name
       var candidates = document.querySelectorAll('.document-title, [class*="document-title"], [class*="doc-title"], [class*="file-tree"] [class*="name"]')
       for (var i = 0; i < candidates.length; i++) {
         if (candidates[i] && candidates[i].textContent) {
@@ -377,12 +518,30 @@ export function renderBridgeScript(): string {
     }
   }
 
+  // Additive adapter: TeXPage uses a different file tree and CRDT lifecycle.
+  // The legacy Overleaf bibliography code below remains the default.
+  var texpageBib = ${renderTexpageBibAdapter()}({
+    fetch: function () { return originalFetch.apply(window, arguments) },
+    editor: function () { return currentEditableBibEditor() },
+    report: sendToParent,
+  })
+  var texpageTex = ${renderTexpageTexAdapter()}({
+    fetch: function () { return originalFetch.apply(window, arguments) },
+    editor: function () { return currentEditableBibEditor() },
+    report: sendToParent,
+  })
+
   /* fetch wrapper */
   var originalFetch = null
   if (typeof window.fetch === 'function') {
     originalFetch = window.fetch
     window.fetch = safe(function (input, init) {
-      var rawUrl = typeof input === 'string' ? input : (typeof Request === 'function' && input instanceof Request ? input.url : '')
+      var rawUrl = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : (typeof Request === 'function' && input instanceof Request ? input.url : ''))
+      var fetchMethod = String((init && init.method) || (typeof Request === 'function' && input instanceof Request ? input.method : 'GET')).toUpperCase()
+      var requestGeneration = compileGeneration
+      if (rawUrl !== '' && isCompilePost(rawUrl) && fetchMethod === 'POST') {
+        requestGeneration = beginCompileGeneration('compiling')
+      }
       if (typeof input === 'string' || input instanceof URL) {
         arguments[0] = routeUrl(input)
       } else if (typeof Request === 'function' && input instanceof Request) {
@@ -397,16 +556,26 @@ export function renderBridgeScript(): string {
         }
       }
       var routedResult = originalFetch.apply(window, arguments)
+      if (rawUrl !== '' && pathnameOf(rawUrl).indexOf('/api/project/fileTree') !== -1) {
+        routedResult.then(function (response) {
+          if (!response.ok) return
+          response.clone().json().then(function (json) {
+            texpageBib.observe(routeUrl(rawUrl), json)
+            texpageTex.observe(routeUrl(rawUrl), json)
+          }).catch(function () {})
+        }).catch(function () {})
+      }
       // Compile-fix source: compile POST responses reveal output.log/.blg URLs;
       // an output.pdf load reveals the build path as a fallback.
-      if (rawUrl !== '' && isCompilePost(rawUrl)) {
-        var fetchMethod = String((init && init.method) || (typeof Request === 'function' && input instanceof Request ? input.method : 'GET')).toUpperCase()
-        if (fetchMethod === 'POST') {
+      if (rawUrl !== '' && (isCompilePost(rawUrl) || isCachedCompileResponse(rawUrl))) {
+        if ((isCompilePost(rawUrl) && fetchMethod === 'POST') || (isCachedCompileResponse(rawUrl) && fetchMethod === 'GET')) {
           routedResult
             .then(function (response) {
               try {
                 response.clone().json()
-                  .then(function (json) { captureCompileResponse(json) })
+                  .then(function (json) {
+                    captureCompileResponse(json, isCompilePost(rawUrl) ? requestGeneration : undefined)
+                  })
                   .catch(function () {})
               } catch (err) {
                 if (DEBUG) log('compile clone failed', err)
@@ -414,6 +583,12 @@ export function renderBridgeScript(): string {
             })
             .catch(function () {})
         }
+      } else if (rawUrl !== '' && isCompileLog(rawUrl)) {
+        routedResult
+          .then(function (response) { captureObservedLogResponse(response, rawUrl, requestGeneration) })
+          .catch(function (err) {
+            storeCompileLog({ path: compileLogPath(rawUrl), text: '', error: String(err) }, requestGeneration)
+          })
       } else if (rawUrl !== '' && isOutputPdf(rawUrl)) {
         setTimeout(function () { captureLogFromOutputPdf(rawUrl) }, 0)
       }
@@ -428,8 +603,18 @@ export function renderBridgeScript(): string {
       var originalOpen = proto.open
       proto.open = safe(function (method, url) {
         var rawUrl = typeof url === 'string' ? url : ''
+        var xhrGeneration = compileGeneration
+        if (rawUrl !== '' && isCompilePost(rawUrl) && String(method || 'GET').toUpperCase() === 'POST') {
+          xhrGeneration = beginCompileGeneration('compiling')
+        }
         if (typeof url === 'string') {
           arguments[1] = routeUrl(url)
+        }
+        if (typeof arguments[1] === 'string' && arguments[1].indexOf(PREFIX + '/__dsh_texpage_output__/') !== -1) {
+          // Safe diagnostic only: never expose signed URLs, query values or
+          // document bytes in the DOM/console.
+          var outputStatusKey = /\\.pdf(?:[?#]|$)/.test(arguments[1]) ? 'pdf-status' : 'log-status'
+          this.addEventListener('loadend', function () { markDiagnostic(outputStatusKey, this.status) })
         }
         // XHR backup for the compile-log source (some deployments/issues use
         // XHR for the compile POST - the fetch wrapper alone would miss them).
@@ -439,9 +624,20 @@ export function renderBridgeScript(): string {
             xhr.addEventListener('readystatechange', function () {
               if (xhr.readyState !== 4) return
               try {
-                if (isCompilePost(rawUrl) && xhr.status === 200 && typeof xhr.responseText === 'string' && xhr.responseText !== '') {
+                if (xhr.status === 200 && pathnameOf(rawUrl).indexOf('/api/project/fileTree') !== -1) {
+                  var treeJson = JSON.parse(xhr.responseText)
+                  texpageBib.observe(routeUrl(rawUrl), treeJson)
+                  texpageTex.observe(routeUrl(rawUrl), treeJson)
+                }
+                if ((isCompilePost(rawUrl) || isCachedCompileResponse(rawUrl)) && xhr.status === 200 && typeof xhr.responseText === 'string' && xhr.responseText !== '') {
                   var parsedPayload = JSON.parse(xhr.responseText)
-                  if (parsedPayload) captureCompileResponse(parsedPayload)
+                  if (parsedPayload) captureCompileResponse(parsedPayload, isCompilePost(rawUrl) ? xhrGeneration : undefined)
+                } else if (isCompileLog(rawUrl)) {
+                  if (xhr.status >= 200 && xhr.status < 300 && typeof xhr.responseText === 'string') {
+                    storeCompileLog({ path: compileLogPath(rawUrl), text: truncateText(xhr.responseText, 1048576) }, xhrGeneration)
+                  } else {
+                    storeCompileLog({ path: compileLogPath(rawUrl), text: '', error: 'HTTP ' + xhr.status }, xhrGeneration)
+                  }
                 } else if (isOutputPdf(rawUrl)) {
                   captureLogFromOutputPdf(rawUrl)
                 }
@@ -489,6 +685,27 @@ export function renderBridgeScript(): string {
      on its own loopback port (injected as __DSH_OVERLEAF_WS_PORT__). When
      that port is known, same-origin WebSocket targets are redirected there;
      the tunnel forwards the request verbatim to the upstream origin. */
+  function routeSocketUrl(raw) {
+    if (typeof raw !== 'string' && !(raw instanceof URL)) return raw
+    var parsed = new URL(String(raw), window.location.href)
+    if (!/^(?:https?|wss?):$/.test(parsed.protocol) || parsed.username || parsed.password) return raw
+    var path = parsed.pathname
+    var socketOrigin = window.__DSH_OVERLEAF_SOCKET_ORIGIN__
+    var upstreamOrigin = window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__
+    var socketHost = typeof socketOrigin === 'string' ? new URL(socketOrigin).host : ''
+    var upstreamHost = typeof upstreamOrigin === 'string' ? new URL(upstreamOrigin).host : ''
+    if (socketHost !== '' && parsed.host === socketHost) {
+      if (!/^\\/socket\\.io\\/?$/.test(path)) return raw
+      path = '/__dsh_socket__' + path
+    } else if (parsed.host !== window.location.host && parsed.host !== upstreamHost) {
+      return raw
+    }
+    var port = parseInt(window.__DSH_OVERLEAF_WS_PORT__, 10) || 0
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    if (port > 0) return protocol + '//127.0.0.1:' + port + path + parsed.search
+    if (path.indexOf(PREFIX + '/') !== 0) path = PREFIX + path
+    return protocol + '//' + window.location.host + path + parsed.search
+  }
   try {
     var OriginalWebSocket = window.WebSocket
     if (typeof OriginalWebSocket === 'function') {
@@ -496,24 +713,7 @@ export function renderBridgeScript(): string {
       markDiagnostic('ws-port', WS_PORT)
       function PatchedWebSocket(url, protocols) {
         try {
-          if (typeof url === 'string' && url.indexOf('//') === 0) {
-            url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + url
-          }
-          if (typeof url === 'string' && url.charAt(0) === '/') {
-            if (WS_PORT > 0) {
-              url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '127.0.0.1:' + WS_PORT + url
-            } else {
-              url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + window.location.host + PREFIX + url
-            }
-          } else if (typeof url === 'string' && url.indexOf(window.location.host) !== -1 && !isProxyUrl(url)) {
-            if (WS_PORT > 0) {
-              var parts = url.split(window.location.host)
-              url = parts[0] + '127.0.0.1:' + WS_PORT + parts.slice(1).join(window.location.host)
-            } else {
-              url = url.replace(location.protocol + '//' + window.location.host,
-                location.protocol + '//' + window.location.host + PREFIX)
-            }
-          }
+          url = routeSocketUrl(url)
         } catch (err) {
           if (DEBUG) log('ws url fix failed', err)
         }
@@ -525,11 +725,24 @@ export function renderBridgeScript(): string {
           markDiagnostic('ws-target', 'invalid-url')
         }
         markDiagnostic('ws-state', 'connecting')
+        markDiagnostic('socketio-state', 'connecting')
+        var messageCount = 0
+        markDiagnostic('ws-messages', 0)
         var socket = new OriginalWebSocket(url, protocols)
         socket.addEventListener('open', function () { markDiagnostic('ws-state', 'open') })
+        socket.addEventListener('message', function (event) {
+          messageCount += 1
+          markDiagnostic('ws-messages', messageCount)
+          // Report protocol milestones, never payloads, session IDs or tokens.
+          if (typeof event.data === 'string') {
+            if (event.data.indexOf('40') === 0) markDiagnostic('socketio-state', 'connected')
+            else if (event.data.indexOf('44') === 0) markDiagnostic('socketio-state', 'connect-error')
+          }
+        })
         socket.addEventListener('error', function () { markDiagnostic('ws-state', 'error') })
         socket.addEventListener('close', function (event) {
           markDiagnostic('ws-state', 'closed:' + String(event && event.code || 0))
+          markDiagnostic('socketio-state', 'closed')
         })
         return socket
       }
@@ -670,6 +883,8 @@ export function renderBridgeScript(): string {
   }
 
   var savedSelection = undefined
+  var savedSelectionTargets = Object.create(null)
+  var savedSelectionOrder = []
   var selectionSequence = 0
 
   /* Capture editor-native offsets, not just DOM selection text. The stable
@@ -714,6 +929,12 @@ export function renderBridgeScript(): string {
       before: doc.slice(Math.max(0, from - 48), from),
       after: doc.slice(to, Math.min(doc.length, to + 48)),
     }
+    savedSelectionTargets[savedSelection.id] = savedSelection
+    savedSelectionOrder.push(savedSelection.id)
+    while (savedSelectionOrder.length > 12) {
+      var expiredId = savedSelectionOrder.shift()
+      if (!savedSelection || expiredId !== savedSelection.id) delete savedSelectionTargets[expiredId]
+    }
     return savedSelection
   }
 
@@ -735,38 +956,521 @@ export function renderBridgeScript(): string {
     }
   }
 
-  function replaceSavedEditorSelection(id, replacement) {
-    if (!savedSelection || savedSelection.id !== id) {
+  function replaceSavedEditorSelection(id, replacement, force) {
+    var target = savedSelectionTargets[id]
+    if (!target) {
       sendToParent({ type: 'selection-replace-done', ok: false, error: 'selection-expired' })
       return
     }
-    var target = savedSelection
     try {
+      if (!force && (!savedSelection || savedSelection.id !== id)) throw new Error('selection-stale')
       if (target.engine === 'cm5') {
         var cm5 = target.editor
         var doc5 = cm5 && String(cm5.getValue())
-        if (!cm5 || !selectionEditorIsAttached(target) || !replacementTargetStillMatches(target, doc5)) throw new Error('selection-stale')
+        if (!cm5 || !selectionEditorIsAttached(target)) throw new Error('selection-stale')
+        if (!force && !replacementTargetStillMatches(target, doc5)) throw new Error('selection-stale')
+        var from5 = Math.min(Math.max(0, target.from), doc5.length)
+        var to5 = Math.min(Math.max(from5, target.to), doc5.length)
         rememberSnapshot(doc5)
-        cm5.replaceRange(replacement, cm5.posFromIndex(target.from), cm5.posFromIndex(target.to))
-        cm5.setCursor(cm5.posFromIndex(target.from + replacement.length))
+        cm5.replaceRange(replacement, cm5.posFromIndex(from5), cm5.posFromIndex(to5))
+        cm5.setCursor(cm5.posFromIndex(from5 + replacement.length))
         cm5.focus()
       } else if (target.engine === 'cm6') {
         var cm6 = target.editor
         var doc6 = cm6 && cm6.state.doc.toString()
-        if (!cm6 || !selectionEditorIsAttached(target) || !replacementTargetStillMatches(target, doc6)) throw new Error('selection-stale')
+        if (!cm6 || !selectionEditorIsAttached(target)) throw new Error('selection-stale')
+        if (!force && !replacementTargetStillMatches(target, doc6)) throw new Error('selection-stale')
+        var from6 = Math.min(Math.max(0, target.from), doc6.length)
+        var to6 = Math.min(Math.max(from6, target.to), doc6.length)
         rememberSnapshot(doc6)
         cm6.dispatch({
-          changes: { from: target.from, to: target.to, insert: replacement },
-          selection: { anchor: target.from + replacement.length },
+          changes: { from: from6, to: to6, insert: replacement },
+          selection: { anchor: from6 + replacement.length },
         })
         cm6.focus()
       } else {
         throw new Error('selection-engine-unavailable')
       }
-      savedSelection = undefined
-      sendToParent({ type: 'selection-replace-done', ok: true, engine: target.engine })
+      delete savedSelectionTargets[id]
+      if (savedSelection && savedSelection.id === id) savedSelection = undefined
+      sendToParent({ type: 'selection-replace-done', ok: true, engine: target.engine, forced: force === true })
     } catch (err) {
       sendToParent({ type: 'selection-replace-done', ok: false, error: err && err.message })
+    }
+  }
+
+  /* Replace a project bibliography from an explicitly selected local file.
+     The bridge resolves the Overleaf target by basename, opens it through the
+     real file tree, waits for the matching editor tab, and then performs one
+     whole-document CodeMirror transaction so Overleaf's normal collaboration
+     and autosave pipeline observes the change. */
+  function normalizeBibName(value) {
+    return String(value || '').replace(/[\u200e\u200f]/g, '').trim()
+  }
+
+  function bibFileTreeRoot() {
+    return document.querySelector('[data-testid="file-tree-list-root"]')
+  }
+
+  function prepareBibFileTree(done) {
+    try {
+      var fileTreeTab = document.getElementById('ide-rail-tabs-tab-file-tree')
+      if (fileTreeTab && fileTreeTab.getAttribute('aria-selected') !== 'true') fileTreeTab.click()
+    } catch (err) {}
+    setTimeout(function () { expandBibFolders(0, done) }, 80)
+  }
+
+  function expandBibFolders(round, done) {
+    var root = bibFileTreeRoot()
+    if (!root) {
+      if (round >= 20) { done(); return }
+      setTimeout(function () { expandBibFolders(round + 1, done) }, 100)
+      return
+    }
+    var collapsed = root.querySelectorAll('[role="treeitem"][aria-expanded="false"]')
+    var clicked = 0
+    for (var i = 0; i < collapsed.length; i++) {
+      var button = collapsed[i].querySelector('.file-tree-entity-button')
+      if (button) { button.click(); clicked += 1 }
+    }
+    if (clicked > 0 && round < 8) {
+      setTimeout(function () { expandBibFolders(round + 1, done) }, 100)
+      return
+    }
+    done()
+  }
+
+  function bibTreeCandidates() {
+    var root = bibFileTreeRoot()
+    if (!root) return []
+    var items = root.querySelectorAll('[role="treeitem"][aria-label]')
+    var found = []
+    for (var i = 0; i < items.length; i++) {
+      var name = normalizeBibName(items[i].getAttribute('aria-label'))
+      if (!/\\.bib$/i.test(name)) continue
+      var entity = items[i].querySelector('.entity[data-file-id][data-file-type="doc"]')
+      if (!entity) continue
+      found.push({ item: items[i], entity: entity, id: String(entity.getAttribute('data-file-id') || ''), name: name })
+    }
+    return found
+  }
+
+  function overleafOpenDocState(id) {
+    try {
+      var unstable = window.overleaf && window.overleaf.unstable
+      var store = unstable && unstable.store
+      if (!store || typeof store.get !== 'function') return 'unavailable'
+      return String(store.get('editor.open_doc_id') || '') === id ? 'match' : 'mismatch'
+    } catch (err) {
+      return 'unavailable'
+    }
+  }
+
+  function bibTreeTargetIsSelected(target) {
+    try { return target.item && target.item.getAttribute('aria-selected') === 'true' }
+    catch (err) { return false }
+  }
+
+  function cleanupBibOpenListener(target) {
+    if (target && typeof target.cleanupOpened === 'function') {
+      target.cleanupOpened()
+      target.cleanupOpened = undefined
+    }
+  }
+
+  function elementIsUsable(element) {
+    try {
+      if (!element || !document.documentElement.contains(element)) return false
+      var style = window.getComputedStyle ? window.getComputedStyle(element) : undefined
+      if (style && (style.display === 'none' || style.visibility === 'hidden')) return false
+      return !element.getClientRects || element.getClientRects().length > 0
+    } catch (err) {
+      return false
+    }
+  }
+
+  function editableCm5Candidates() {
+    var found = []
+    try {
+      var holders = document.querySelectorAll('.CodeMirror')
+      for (var i = 0; i < holders.length; i++) {
+        var cm = holders[i].CodeMirror
+        if (!cm || !elementIsUsable(holders[i])) continue
+        try { if (cm.getOption && cm.getOption('readOnly')) continue } catch (err) {}
+        if (found.indexOf(cm) < 0) found.push(cm)
+      }
+    } catch (err) {}
+    return found
+  }
+
+  function editableCm6Candidates() {
+    var found = []
+    try {
+      var storedView = undefined
+      try {
+        var unstable = window.overleaf && window.overleaf.unstable
+        var store = unstable && unstable.store
+        storedView = asEditorView(store && typeof store.get === 'function' ? store.get('editor.view') : undefined)
+      } catch (err) {}
+      var roots = document.querySelectorAll('.cm-editor')
+      for (var i = 0; i < roots.length; i++) {
+        var holder = roots[i]
+        var content = holder.querySelector('.cm-content[contenteditable="true"]')
+        if (!content || !elementIsUsable(holder) || !elementIsUsable(content)) continue
+        if (String(content.getAttribute('aria-label') || '').toLowerCase() === 'visual preview') continue
+        /* Current Overleaf/CodeMirror 6 stores a ContentView on the live
+           .cm-content node. Its root view points at the EditorView. Older
+           builds used .cm-editor/.cm-scroller expandos, so retain all paths. */
+        var storedDom = storedView && (storedView.dom || storedView.contentDOM)
+        var storedBelongsHere = storedDom && (storedDom === holder || holder.contains(storedDom) || storedDom === content)
+        if (storedBelongsHere) return [storedView]
+        var view = undefined
+        view = view || asEditorView(content.cmView)
+          || asEditorView(content.cmView && content.cmView.rootView)
+          || asEditorView(holder.cmView)
+          || asEditorView(holder.editor)
+          || asEditorView(holder.parentNode && holder.parentNode.__codemirrorView)
+        var inner = holder.querySelector('.cm-scroller')
+        if (!view && inner) view = asEditorView(inner.cmView)
+        /* Some optimized builds hide the expando on a descendant other than
+           the root content node. Limit the fallback scan to this visible,
+           editable editor so a Visual Preview can never win. */
+        if (!view) {
+          var nodes = holder.querySelectorAll('.cm-content, .cm-scroller')
+          for (var n = 0; n < nodes.length && !view; n++) {
+            var keys = Object.keys(nodes[n] || {})
+            for (var k = 0; k < keys.length; k++) {
+              var value = null
+              try { value = nodes[n][keys[k]] } catch (err) { continue }
+              view = asEditorView(value)
+              if (view) break
+              try { view = asEditorView(value && value.rootView) } catch (err2) {}
+              if (view) break
+            }
+          }
+        }
+        if (view && found.indexOf(view) < 0) found.push(view)
+      }
+    } catch (err) {}
+    return found
+  }
+
+  function currentEditableBibEditor() {
+    var cm5 = editableCm5Candidates()
+    var cm6 = editableCm6Candidates()
+    if (cm5.length + cm6.length !== 1) return { error: cm5.length + cm6.length === 0 ? 'bib-editor-unavailable' : 'bib-editor-ambiguous' }
+    return cm5.length === 1 ? { engine: 'cm5', editor: cm5[0] } : { engine: 'cm6', editor: cm6[0] }
+  }
+
+  function bibEventDocId(event) {
+    try {
+      var detail = event && event.detail
+      return String((detail && (detail.id || detail.docId || detail.doc_id)) || '')
+    } catch (err) {
+      return ''
+    }
+  }
+
+  function listenForBibEvent(type, docId, done) {
+    var finished = false
+    var handler = function (event) {
+      if (bibEventDocId(event) !== docId) return
+      cleanup()
+      done()
+    }
+    function cleanup() {
+      if (finished) return
+      finished = true
+      window.removeEventListener(type, handler)
+      document.removeEventListener(type, handler)
+    }
+    window.addEventListener(type, handler)
+    document.addEventListener(type, handler)
+    return cleanup
+  }
+
+  function rememberBibSnapshot(target, engine, docValue) {
+    try {
+      var projectMatch = /\\/project\\/([^/?#]+)/.exec(location.pathname)
+      var projectId = projectMatch ? projectMatch[1] : 'unknown-project'
+      var key = 'dsh-overleaf:bib-snapshot:' + projectId + ':' + target.id
+      var value = JSON.stringify({
+        time: Date.now(), projectId: projectId, docId: target.id,
+        path: target.name, engine: engine, doc: docValue,
+      })
+      window.localStorage.setItem(key, value)
+      if (window.localStorage.getItem(key) !== value) throw new Error('snapshot verification failed')
+      sendToParent({ type: 'snapshot-saved' })
+      return true
+    } catch (err) {
+      if (DEBUG) log('bibliography snapshot failed', err)
+      return false
+    }
+  }
+
+  function waitForBibSave(target, content, cleanupSaveListener, savedState, attempt) {
+    if (savedState.done) {
+      cleanupSaveListener()
+      sendToParent({ type: 'bib-sync-done', ok: true, target: target.name, chars: content.length })
+      return
+    }
+    if (attempt >= 120) {
+      cleanupSaveListener()
+      sendToParent({ type: 'bib-sync-done', ok: false, error: 'bib-save-timeout', target: target.name })
+      return
+    }
+    setTimeout(function () { waitForBibSave(target, content, cleanupSaveListener, savedState, attempt + 1) }, 100)
+  }
+
+  function applyBibToSelectedEditor(target, content) {
+    var cleanupSaveListener
+    try {
+      var openState = overleafOpenDocState(target.id)
+      var identityReady = openState === 'match'
+        || (openState === 'unavailable' && (target.opened || target.initiallySelected) && bibTreeTargetIsSelected(target))
+      if (!identityReady) {
+        if (Date.now() >= target.openDeadline) throw new Error('bib-editor-timeout')
+        setTimeout(function () { applyBibToSelectedEditor(target, content) }, 100)
+        return
+      }
+      cleanupBibOpenListener(target)
+      if (!target.editorDeadline) target.editorDeadline = Date.now() + 8000
+      var selected = currentEditableBibEditor()
+      if (selected.error) {
+        if (Date.now() >= target.editorDeadline) throw new Error(selected.error)
+        setTimeout(function () { applyBibToSelectedEditor(target, content) }, 100)
+        return
+      }
+      var savedState = { done: false }
+      cleanupSaveListener = listenForBibEvent('doc:saved', target.id, function () { savedState.done = true })
+      if (selected.engine === 'cm5') {
+        var cm5 = selected.editor
+        var old5 = String(cm5.getValue())
+        if (old5 === content) {
+          cleanupSaveListener()
+          sendToParent({ type: 'bib-sync-done', ok: true, target: target.name, chars: content.length, unchanged: true })
+          return
+        }
+        if (!rememberBibSnapshot(target, 'cm5', old5)) throw new Error('bib-snapshot-failed')
+        if (typeof cm5.operation === 'function') {
+          cm5.operation(function () { cm5.replaceRange(content, cm5.posFromIndex(0), cm5.posFromIndex(old5.length)) })
+        } else {
+          cm5.replaceRange(content, cm5.posFromIndex(0), cm5.posFromIndex(old5.length))
+        }
+        if (String(cm5.getValue()) !== content) throw new Error('bib-write-verification-failed')
+        cm5.setCursor(cm5.posFromIndex(content.length))
+        cm5.focus()
+        waitForBibSave(target, content, cleanupSaveListener, savedState, 0)
+        return
+      }
+      if (selected.engine === 'cm6') {
+        var cm6 = selected.editor
+        var old6 = cm6.state.doc.toString()
+        if (old6 === content) {
+          cleanupSaveListener()
+          sendToParent({ type: 'bib-sync-done', ok: true, target: target.name, chars: content.length, unchanged: true })
+          return
+        }
+        if (!rememberBibSnapshot(target, 'cm6', old6)) throw new Error('bib-snapshot-failed')
+        cm6.dispatch({
+          changes: { from: 0, to: old6.length, insert: content },
+          selection: { anchor: content.length },
+        })
+        if (cm6.state.doc.toString() !== content) throw new Error('bib-write-verification-failed')
+        cm6.focus()
+        waitForBibSave(target, content, cleanupSaveListener, savedState, 0)
+        return
+      }
+    } catch (err) {
+      cleanupBibOpenListener(target)
+      if (typeof cleanupSaveListener === 'function') cleanupSaveListener()
+      sendToParent({ type: 'bib-sync-done', ok: false, error: err && err.message ? err.message : String(err) })
+    }
+  }
+
+  function syncBibFile(fileName, content) {
+    if (typeof texpageBib !== 'undefined' && texpageBib.enabled()) {
+      texpageBib.sync(fileName, content)
+      return
+    }
+    var requested = normalizeBibName(fileName)
+    if (!/\\.bib$/i.test(requested)) {
+      sendToParent({ type: 'bib-sync-done', ok: false, error: 'bib-invalid-name' })
+      return
+    }
+    prepareBibFileTree(function () {
+      try {
+        var all = bibTreeCandidates()
+        var exact = all.filter(function (candidate) { return candidate.name === requested })
+        var insensitive = all.filter(function (candidate) { return candidate.name.toLowerCase() === requested.toLowerCase() })
+        var matches = exact.length > 0 ? exact : insensitive
+        var target = matches.length === 1 ? matches[0] : undefined
+        if (!target) {
+          var names = all.map(function (candidate) { return candidate.name }).join(', ')
+          var reason = matches.length > 1 ? 'bib-target-ambiguous' : 'bib-target-missing'
+          sendToParent({ type: 'bib-sync-done', ok: false, error: reason, available: names })
+          return
+        }
+        target.initiallySelected = bibTreeTargetIsSelected(target)
+        target.opened = false
+        target.openDeadline = Date.now() + 10000
+        target.editorDeadline = 0
+        target.cleanupOpened = listenForBibEvent('doc:after-opened', target.id, function () {
+          target.opened = true
+          cleanupBibOpenListener(target)
+        })
+        if (!target.initiallySelected) target.entity.click()
+        applyBibToSelectedEditor(target, String(content || ''))
+      } catch (err) {
+        cleanupBibOpenListener(typeof target === 'undefined' ? undefined : target)
+        sendToParent({ type: 'bib-sync-done', ok: false, error: err && err.message ? err.message : String(err) })
+      }
+    })
+  }
+
+  /* Bidirectional current .tex synchronization. Overleaf-to-local reads the
+     single visible source editor. Local-to-Overleaf is deliberately stricter:
+     it requires an explicit confirmation bit, a stable current document id,
+     a pre-change snapshot, write verification, and doc:saved confirmation. */
+  function utf8TextSize(value) {
+    try { return new TextEncoder().encode(String(value || '')).length }
+    catch (err) { return String(value || '').length }
+  }
+
+  function texRevision(value) {
+    var text = String(value || '')
+    var hash = 2166136261
+    for (var i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i)
+      hash = Math.imul(hash, 16777619)
+    }
+    return text.length + '-' + (hash >>> 0).toString(16)
+  }
+
+  function currentTexIdentity() {
+    var selected = currentFileTreeDocument()
+    if (!selected) throw new Error('tex-document-identity-unavailable')
+    var storeId = ''
+    try {
+      var unstable = window.overleaf && window.overleaf.unstable
+      var store = unstable && unstable.store
+      if (store && typeof store.get === 'function') storeId = String(store.get('editor.open_doc_id') || '')
+    } catch (err) {}
+    if (storeId !== '' && selected.id !== storeId) throw new Error('tex-document-identity-mismatch')
+    if (!/\.tex$/i.test(selected.name)) throw new Error('tex-current-document-not-tex')
+    if (selected.id === '') throw new Error('tex-document-id-unavailable')
+    return { id: selected.id, name: selected.name, selected: selected }
+  }
+
+  function currentTexEditorValue() {
+    var selected = currentEditableBibEditor()
+    if (selected.error) throw new Error(selected.error.replace(/^bib-/, 'tex-'))
+    if (selected.engine === 'cm5') return { engine: 'cm5', editor: selected.editor, text: String(selected.editor.getValue()) }
+    if (selected.engine === 'cm6') return { engine: 'cm6', editor: selected.editor, text: selected.editor.state.doc.toString() }
+    throw new Error('tex-editor-unavailable')
+  }
+
+  function emitCurrentTexDocument(requestId) {
+    if (typeof texpageTex !== 'undefined' && texpageTex.enabled()) {
+      texpageTex.emit(requestId)
+      return
+    }
+    try {
+      var identity = currentTexIdentity()
+      var current = currentTexEditorValue()
+      if (utf8TextSize(current.text) > 4 * 1024 * 1024) throw new Error('tex-document-too-large')
+      sendToParent({ type: 'tex-document', requestId: requestId, ok: true, id: identity.id, name: identity.name, text: current.text, revision: texRevision(current.text) })
+    } catch (err) {
+      sendToParent({ type: 'tex-document', requestId: requestId, ok: false, error: err && err.message ? err.message : String(err) })
+    }
+  }
+
+  function rememberTexSnapshot(identity, engine, docValue) {
+    try {
+      var projectMatch = /\\/project\\/([^/?#]+)/.exec(location.pathname)
+      var projectId = projectMatch ? projectMatch[1] : 'unknown-project'
+      var key = 'dsh-overleaf:tex-snapshot:' + projectId + ':' + identity.id
+      var value = JSON.stringify({
+        time: Date.now(), projectId: projectId, docId: identity.id,
+        path: identity.name, engine: engine, doc: docValue,
+      })
+      window.localStorage.setItem(key, value)
+      if (window.localStorage.getItem(key) !== value) throw new Error('snapshot verification failed')
+      sendToParent({ type: 'snapshot-saved' })
+      return true
+    } catch (err) {
+      if (DEBUG) log('tex snapshot failed', err)
+      return false
+    }
+  }
+
+  var texSyncBusyRequestId = ''
+
+  function waitForTexSave(identity, content, requestId, cleanupSaveListener, savedState, attempt) {
+    if (savedState.done) {
+      cleanupSaveListener()
+      texSyncBusyRequestId = ''
+      sendToParent({ type: 'tex-overleaf-sync-done', requestId: requestId, ok: true, target: identity.name, chars: content.length })
+      return
+    }
+    if (attempt >= 120) {
+      cleanupSaveListener()
+      texSyncBusyRequestId = ''
+      sendToParent({ type: 'tex-overleaf-sync-done', requestId: requestId, ok: false, error: 'tex-save-timeout', target: identity.name })
+      return
+    }
+    setTimeout(function () { waitForTexSave(identity, content, requestId, cleanupSaveListener, savedState, attempt + 1) }, 100)
+  }
+
+  function syncTexToOverleaf(content, confirmed, requestId, expectedDocId, expectedRevision) {
+    if (typeof texpageTex !== 'undefined' && texpageTex.enabled()) {
+      texpageTex.sync(content, confirmed, requestId, expectedDocId, expectedRevision)
+      return
+    }
+    var cleanupSaveListener
+    try {
+      if (texSyncBusyRequestId !== '') throw new Error('tex-sync-busy')
+      texSyncBusyRequestId = requestId || 'unknown-request'
+      if (confirmed !== true) throw new Error('tex-reverse-confirmation-required')
+      var text = String(content || '')
+      if (utf8TextSize(text) > 4 * 1024 * 1024) throw new Error('tex-document-too-large')
+      var identity = currentTexIdentity()
+      var current = currentTexEditorValue()
+      if (String(expectedDocId || '') !== identity.id || String(expectedRevision || '') !== texRevision(current.text)) {
+        throw new Error('tex-remote-changed')
+      }
+      if (current.text === text) {
+        texSyncBusyRequestId = ''
+        sendToParent({ type: 'tex-overleaf-sync-done', requestId: requestId, ok: true, target: identity.name, chars: text.length, unchanged: true })
+        return
+      }
+      if (!rememberTexSnapshot(identity, current.engine, current.text)) throw new Error('tex-snapshot-failed')
+      var savedState = { done: false }
+      cleanupSaveListener = listenForBibEvent('doc:saved', identity.id, function () { savedState.done = true })
+      if (current.engine === 'cm5') {
+        var cm5 = current.editor
+        if (typeof cm5.operation === 'function') {
+          cm5.operation(function () { cm5.replaceRange(text, cm5.posFromIndex(0), cm5.posFromIndex(current.text.length)) })
+        } else {
+          cm5.replaceRange(text, cm5.posFromIndex(0), cm5.posFromIndex(current.text.length))
+        }
+        if (String(cm5.getValue()) !== text) throw new Error('tex-write-verification-failed')
+        cm5.setCursor(cm5.posFromIndex(text.length))
+        cm5.focus()
+      } else if (current.engine === 'cm6') {
+        var cm6 = current.editor
+        cm6.dispatch({
+          changes: { from: 0, to: current.text.length, insert: text },
+          selection: { anchor: text.length },
+        })
+        if (cm6.state.doc.toString() !== text) throw new Error('tex-write-verification-failed')
+        cm6.focus()
+      }
+      waitForTexSave(identity, text, requestId, cleanupSaveListener, savedState, 0)
+    } catch (err) {
+      if (typeof cleanupSaveListener === 'function') cleanupSaveListener()
+      texSyncBusyRequestId = ''
+      sendToParent({ type: 'tex-overleaf-sync-done', requestId: requestId, ok: false, error: err && err.message ? err.message : String(err) })
     }
   }
 
@@ -907,7 +1611,19 @@ export function renderBridgeScript(): string {
       return
     }
     if (data.type === 'replace-selection') {
-      replaceSavedEditorSelection(String(data.selectionId || ''), String(data.text || ''))
+      replaceSavedEditorSelection(String(data.selectionId || ''), String(data.text || ''), data.force === true)
+      return
+    }
+    if (data.type === 'sync-bib') {
+      syncBibFile(String(data.fileName || ''), String(data.text || ''))
+      return
+    }
+    if (data.type === 'tex-document-request') {
+      emitCurrentTexDocument(String(data.requestId || ''))
+      return
+    }
+    if (data.type === 'sync-tex-to-overleaf') {
+      syncTexToOverleaf(String(data.text || ''), data.confirmed === true, String(data.requestId || ''), String(data.expectedDocId || ''), String(data.expectedRevision || ''))
       return
     }
     if (data.type === 'compile-log-request') {
@@ -1037,6 +1753,10 @@ export function renderBridgeScript(): string {
         })
         return
       }
+      /* The active editor selection was cleared or moved away. Keep its
+         bounded history entry for explicit force mode, but make safe mode
+         reject it as no longer current. */
+      savedSelection = undefined
       var sel = window.getSelection()
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
         sendToParent({ type: 'selection-cleared' })

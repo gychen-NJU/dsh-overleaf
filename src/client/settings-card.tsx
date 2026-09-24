@@ -5,19 +5,30 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
+import { WORKBENCH_SETTINGS_CHANGED } from './navigation.ts'
 
-/** Structural face we rely on from settingsScope.bind({namespace}). */
+/**
+ * Structural face we rely on for the settings binding. Two harness
+ * generations feed it:
+ *  - pre-0.1.7 `settingsScope.bind({ namespace })` scopes: snapshot + watch();
+ *  - 0.1.7+ `ctx.configForms.get(entryId)` ConfigForms: snapshot + subscribe().
+ * Both expose value/base/user/revision/writable and set/unset, so the card
+ * only has to bridge the notification method (watch vs subscribe).
+ */
 export interface ScopeFace {
   getSnapshot(): {
-    value?: Record<string, unknown>
-    base?: Record<string, unknown>
-    user?: Record<string, unknown>
-    revision?: number
-    writable?: boolean
+    status?: string | undefined
+    value?: Record<string, unknown> | undefined
+    base?: Record<string, unknown> | undefined
+    user?: Record<string, unknown> | undefined
+    revision?: number | undefined
+    writable?: boolean | undefined
     mode?: unknown
   }
   get?(field: string): unknown
   watch?(listener: () => void): () => void
+  /** ConfigForms (0.1.7+) notification method. */
+  subscribe?(listener: () => void): () => void
   set(field: string, value: unknown): Promise<unknown>
   unset?(field: string): Promise<unknown>
 }
@@ -86,8 +97,13 @@ export function OverleafSettingsCard(props: OverleafSettingsCardProps): ReactNod
   const [note, setNote] = useState<{ ok: boolean; text: string } | undefined>(undefined)
 
   useEffect(() => {
-    if (scope === undefined || typeof scope.watch !== 'function') return
-    return scope.watch(() => setSnapshotRev(rev => rev + 1)) as unknown as () => void
+    if (scope === undefined) return
+    // 0.1.7+ ConfigForms notify through subscribe(); the older settingsScope
+    // binding uses watch(). Either one re-renders the staged form.
+    const notify = scope.watch ?? scope.subscribe
+    if (typeof notify !== 'function') return
+    const off = notify.call(scope, () => setSnapshotRev(rev => rev + 1))
+    return typeof off === 'function' ? (off as () => void) : undefined
   }, [scope])
 
   useEffect(() => {
@@ -111,6 +127,7 @@ export function OverleafSettingsCard(props: OverleafSettingsCardProps): ReactNod
     if (scope?.unset === undefined) return
     try {
       await scope.unset(key)
+      window.dispatchEvent(new Event(WORKBENCH_SETTINGS_CHANGED))
       setSnapshotRev(rev => rev + 1)
       setNote({ ok: true, text: tt('set.saved') })
     } catch (error) {
@@ -133,6 +150,7 @@ export function OverleafSettingsCard(props: OverleafSettingsCardProps): ReactNod
         if (nextValue === '') continue
         await scope.set(field.key, nextValue)
       }
+      window.dispatchEvent(new Event(WORKBENCH_SETTINGS_CHANGED))
       setNote({ ok: true, text: tt('set.saved') })
     } catch (error) {
       setNote({ ok: false, text: String(error) })

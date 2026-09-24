@@ -68,8 +68,7 @@ export function parseCompileLog(text: string): { items: CompileLogItem[]; errors
   const items: CompileLogItem[] = []
   let pendingError: CompileLogItem | undefined
   const push = (item: CompileLogItem): void => {
-    const key = `${item.level}\u0000${item.message.toLowerCase()}`
-    if (!items.some(existing => `${existing.level}\u0000${existing.message.toLowerCase()}` === key)) items.push(item)
+    items.push(item)
   }
   for (const rawLine of lines) {
     const line = rawLine.trim()
@@ -78,6 +77,22 @@ export function parseCompileLog(text: string): { items: CompileLogItem[]; errors
     if (bang !== null) {
       pendingError = { level: 'error', message: (bang[1] ?? '').trim().slice(0, 300) }
       push(pendingError)
+      continue
+    }
+    const biber = /^(?:\[\d+\]\s+)?[^>]*>\s*(WARN|ERROR)\s+-\s+(.+)$/i.exec(line)
+    if (biber !== null) {
+      push({
+        level: /^error$/i.test(biber[1] ?? '') ? 'error' : 'warning',
+        message: (biber[2] ?? line).trim().slice(0, 300),
+      })
+      continue
+    }
+    if (/^Warning--/i.test(line)) {
+      push({ level: 'warning', message: line.slice(0, 300) })
+      continue
+    }
+    if (/^(?:Runaway argument\?|Emergency stop\.|Fatal error occurred|No pages of output\.)/i.test(line)) {
+      push({ level: 'error', message: line.slice(0, 300) })
       continue
     }
     const fileLine = /^(.*):(\d+):\s*(.+)$/.exec(line)
@@ -90,21 +105,38 @@ export function parseCompileLog(text: string): { items: CompileLogItem[]; errors
       })
       continue
     }
-    if (/^l\.\d+/.test(line)) {
+    const sourceLine = /^l\.(\d+)/.exec(line)
+    if (sourceLine !== null) {
       if (pendingError !== undefined) {
-        pendingError.line = line.replace(/^l\./, '')
+        pendingError.line = sourceLine[1]
         pendingError = undefined
       }
       continue
     }
-    if (/(?:^|\b)(?:LaTeX|Package|Class|Module)\s+Warning|Overfull|Underfull|Warning:\s/.test(line)
-      || /(?:Citation|Reference)\s+.*undefined/i.test(line)) {
+    if (/(?:^|\b)(?:LaTeX3?|LaTeX\s+Font|Package(?:\s+\S+)?|Class(?:\s+\S+)?|Module(?:\s+\S+)?)\s+Warning|Overfull|Underfull|(?:pdf|Lua|Xe)?TeX warning|Warning:\s/i.test(line)
+      || /(?:Citation|Reference)\s+.*undefined/i.test(line)
+      || /There were undefined references|Label\(s\) may have changed/i.test(line)) {
       push({ level: 'warning', message: line.slice(0, 300) })
     }
   }
-  const errors = items.filter(item => item.level === 'error').length
-  const warnings = items.filter(item => item.level === 'warning').length
-  return { items, errors, warnings }
+  /* Preserve identical diagnostics at different source lines while folding
+     duplicate renderings of the same location (for example !-form plus
+     file:line form). */
+  const unique: CompileLogItem[] = []
+  const byIdentity = new Map<string, CompileLogItem>()
+  for (const item of items) {
+    const key = `${item.level}\u0000${item.line ?? ''}\u0000${item.message.toLowerCase()}`
+    const existing = byIdentity.get(key)
+    if (existing === undefined) {
+      byIdentity.set(key, item)
+      unique.push(item)
+    } else if (existing.file === undefined && item.file !== undefined) {
+      existing.file = item.file
+    }
+  }
+  const errors = unique.filter(item => item.level === 'error').length
+  const warnings = unique.filter(item => item.level === 'warning').length
+  return { items: unique, errors, warnings }
 }
 
 /** Markers delimit one edit block inside dsh-overleaf-fix.md. */

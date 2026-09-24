@@ -106,6 +106,12 @@ export declare class ReverseProxy {
     wsPort: number;
     /** User-content output-file origin learned from the site's own hints. */
     private contentRule;
+    /** Only a validated same-site socket host announced by upstream HTML. */
+    private socketOrigin;
+    /** Fixed, credential-free PDF host announced by a validated TeXPage shell. */
+    private texpageOutputOrigin;
+    learnTexpageOutput(html: string): void;
+    learnTexpageSocket(html: string): void;
     /**
      * Register a user-content origin hint (e.g. `https://compiles
      * .overleafusercontent.com/zone/c`). The hint with the most specific path

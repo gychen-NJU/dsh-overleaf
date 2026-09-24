@@ -14,9 +14,5 @@
  *    rollback buffer.
  *  - Scroll to & flash a quoted range when the composer chip asks (R5).
  */
-/**
- * Raw browser-side script. Kept as one double-quoted-free normal TS string;
- * build copies it verbatim into the bundle.
- */
 export declare const BRIDGE_SCRIPT_NAME = "bridge.js";
 export declare function renderBridgeScript(): string;

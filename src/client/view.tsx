@@ -12,6 +12,7 @@ import {
   insertQuoteIntoComposer, sessionWorkspaceHint,
 } from './workbench.ts'
 import { postWorkbench } from './wire.ts'
+import { navigateToWorkbenchHome, updateFrameUpstream, workbenchEntry, WORKBENCH_HOME, WORKBENCH_SETTINGS_CHANGED } from './navigation.ts'
 import type { EmbedInfo, LoginStatusWire, WorkbenchStatusWire } from './wire.ts'
 import {
   buildFixCompilePrompt, buildSelectionAgentPrompt, cleanAgentInsertContent, insertFileSignature,
@@ -55,6 +56,35 @@ interface EditorSelectionTarget {
   text: string
   selectionId?: string | undefined
   engine: 'cm5' | 'cm6' | 'dom'
+}
+
+interface LocalBibFileWire {
+  path: string
+  name: string
+  content: string
+  mtimeMs: number
+  size: number
+}
+
+interface LocalTexFileWire extends LocalBibFileWire {}
+
+interface LocalTexWriteWire {
+  path: string
+  name: string
+  mtimeMs: number
+  size: number
+  created: boolean
+  unchanged: boolean
+}
+
+type TexSyncDirection = 'overleaf-to-local' | 'local-to-overleaf'
+
+interface TexSyncOperation {
+  requestId: string
+  sessionId: string
+  direction: TexSyncDirection
+  path: string
+  manualText: string
 }
 
 /** Editor engine reported by the bridge capabilities probe. */
@@ -118,6 +148,8 @@ function ensureStyles(): void {
 .dso-note-ok{color:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary))}
 .dso-note-bad{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-secondary))}
 .dso-textarea{width:100%;box-sizing:border-box;min-height:72px;resize:vertical;font-family:var(--ds-font-family-code,monospace);font-size:12px;padding:6px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dso-input{width:100%;box-sizing:border-box;font-family:var(--ds-font-family-code,monospace);font-size:11px;padding:5px 7px;border-radius:7px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dso-tool-section{display:flex;flex-direction:column;gap:6px;margin-top:4px;padding-top:8px;border-top:1px dashed var(--dsw-alias-border-l1)}
 .dso-outline-row{display:flex;align-items:center;gap:6px;justify-content:space-between;padding:2px 0;cursor:pointer}
 .dso-outline-row:hover{color:var(--dsw-alias-brand-primary)}
 .dso-log-list{display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;padding:4px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
@@ -157,7 +189,7 @@ function ensurePersistentFrame(): HTMLIFrameElement {
   frame.className = 'dso-frame'
   frame.title = 'Overleaf'
   frame.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen')
-  frame.src = '/overleaf-proxy/project'
+  frame.src = WORKBENCH_HOME
   // Attach DIRECTLY to body and keep it there forever. Moving an iframe in
   // the DOM reloads it, so after creation the node is never re-parented —
   // show/hide is done purely via inline styles. It starts hidden; the view
@@ -176,7 +208,7 @@ function hidePersistentFrame(): void {
 export function OverleafView(props: OverleafViewProps): ReactNode {
   ensureStyles()
   const { sessionId, t: tr, features, inputActions } = props
-  const tt = tr ?? (key => String(key))
+  const tt = useMemo<Translate>(() => tr ?? (key => String(key)), [tr])
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const [status, setStatus] = useState<WorkbenchStatusWire | undefined>(undefined)
   const [embedInfo, setEmbedInfo] = useState<EmbedInfo | undefined>(features)
@@ -190,6 +222,18 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [selectionPrompt, setSelectionPrompt] = useState('')
   const [selectionDraft, setSelectionDraft] = useState('')
   const [pendingReplacement, setPendingReplacement] = useState<EditorSelectionTarget | undefined>(undefined)
+  const [selectionSafetyEnabled, setSelectionSafetyEnabled] = useState(true)
+  const [bibPath, setBibPath] = useState('')
+  const [bibCandidates, setBibCandidates] = useState<string[]>([])
+  const [bibScanState, setBibScanState] = useState<'idle' | 'scanning' | 'done' | 'unavailable'>('idle')
+  const [bibBusy, setBibBusy] = useState(false)
+  const [texPath, setTexPath] = useState('')
+  const [texCandidates, setTexCandidates] = useState<string[]>([])
+  const [texScanState, setTexScanState] = useState<'idle' | 'scanning' | 'done' | 'unavailable'>('idle')
+  const [texDirection, setTexDirection] = useState<TexSyncDirection>('overleaf-to-local')
+  const [texManualContent, setTexManualContent] = useState('')
+  const [texReverseConfirmed, setTexReverseConfirmed] = useState(false)
+  const [texBusy, setTexBusy] = useState(false)
   const [outlineItems, setOutlineItems] = useState<OutlineItem[] | undefined>(undefined)
   const [compileInfo, setCompileInfo] = useState<{
     status: string
@@ -216,6 +260,9 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const [aiWaitSeconds, setAiWaitSeconds] = useState(0)
   const [aiBusy, setAiBusy] = useState(false)
   const cursorContextRef = useRef<{ before: string; after: string; cursor: number } | undefined>(undefined)
+  const bibSyncTimerRef = useRef<number | undefined>(undefined)
+  const texSyncTimerRef = useRef<number | undefined>(undefined)
+  const texSyncPendingRef = useRef<TexSyncOperation | undefined>(undefined)
   const stageRef = useRef<HTMLDivElement | null>(null)
 
   // Same-origin detection: if the iframe document navigated itself outside
@@ -292,17 +339,32 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
   const assistPanelEnabled = embedInfo?.assistPanelEnabled ?? true
 
   useEffect(() => {
-    if (embedInfo !== undefined) return
-    void postWorkbench<EmbedInfo>('/overleaf/workbench/embed-info')
-      .then(info => setEmbedInfo(info))
-      .catch(error => setNote({ ok: false, text: `${tt('error.generic')}: ${String(error)}` }))
-  }, [embedInfo, tt])
+    let disposed = false
+    const refresh = (): void => {
+      void postWorkbench<EmbedInfo>('/overleaf/workbench/embed-info')
+        .then(info => { if (!disposed) setEmbedInfo(info) })
+        .catch(error => { if (!disposed) setNote({ ok: false, text: `${tt('error.generic')}: ${String(error)}` }) })
+      void postWorkbench<WorkbenchStatusWire>('/overleaf/workbench/status')
+        .then(value => { if (!disposed) setStatus(value) })
+        .catch(() => undefined)
+    }
+    refresh()
+    window.addEventListener(WORKBENCH_SETTINGS_CHANGED, refresh)
+    return () => { disposed = true; window.removeEventListener(WORKBENCH_SETTINGS_CHANGED, refresh) }
+  }, [tt])
 
   useEffect(() => {
-    void postWorkbench<WorkbenchStatusWire>('/overleaf/workbench/status')
-      .then(value => setStatus(value))
-      .catch((error: unknown) => setNote({ ok: false, text: String(error) }))
-  }, [])
+    const frame = frameRef.current
+    if (frame === null || embedInfo === undefined) return
+    if (updateFrameUpstream(frame, embedInfo.baseUrl, embedInfo.embedUrl)) {
+      setEngine('none')
+      setSelectedText(undefined)
+      setSelectionTarget(undefined)
+      setPendingReplacement(undefined)
+      setCompileInfo(undefined)
+      docRef.current = undefined
+    }
+  }, [embedInfo])
 
   const sendToFrame = useCallback((message: Record<string, unknown>): void => {
     try {
@@ -361,13 +423,13 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           return
         }
         case 'selection-replace-done': {
-          const done = data as unknown as { ok?: boolean; error?: string }
+          const done = data as unknown as { ok?: boolean; error?: string; forced?: boolean }
           if (done.ok === true) {
             setSelectionDraft('')
             setPendingReplacement(undefined)
             setSelectionTarget(undefined)
             setSelectedText(undefined)
-            setNote({ ok: true, text: tt('selection.replaced') })
+            setNote({ ok: true, text: done.forced === true ? tt('selection.replacedForced') : tt('selection.replaced') })
           } else {
             setNote({
               ok: false,
@@ -435,6 +497,189 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           setNote({ ok: done.ok === true, text: done.ok === true ? tt('compile.recompileSent') : tt('compile.recompileFailed') })
           return
         }
+        case 'bib-sync-done': {
+          const done = data as unknown as { ok?: boolean; target?: string; chars?: number; unchanged?: boolean; error?: string; available?: string; written?: boolean; diagnostic?: { phase?: string; status?: number; code?: string; attempts?: number } }
+          if (bibSyncTimerRef.current !== undefined) {
+            window.clearTimeout(bibSyncTimerRef.current)
+            bibSyncTimerRef.current = undefined
+          }
+          setBibBusy(false)
+          if (done.ok === true) {
+            const key = done.unchanged === true ? 'bib.unchanged' : 'bib.updated'
+            setNote({
+              ok: true,
+              text: tt(key)
+                .replace('{name}', done.target ?? '.bib')
+                .replace('{chars}', String(done.chars ?? 0)),
+            })
+          } else {
+            const texpageReasons: Record<string, string> = {
+              'bib-texpage-context-unavailable': 'bib.errorContext',
+              'bib-remote-read-failed': 'bib.errorRemoteRead',
+              'bib-remote-changed': 'bib.errorRemoteChanged',
+              'bib-document-changed': 'bib.errorDocumentChanged',
+              'bib-sync-busy': 'bib.errorBusy',
+              'bib-file-too-large': 'bib.errorTooLarge',
+              'bib-write-verification-failed': 'bib.errorVerification',
+            }
+            const reasonKey = texpageReasons[done.error ?? ''] ?? (done.error === 'bib-editor-timeout'
+              ? 'bib.errorEditorTimeout'
+              : done.error === 'bib-editor-unavailable'
+                ? 'bib.errorEditorUnavailable'
+                : done.error === 'bib-editor-ambiguous'
+                  ? 'bib.errorEditorAmbiguous'
+                  : done.error === 'bib-save-timeout'
+                    ? 'bib.errorSaveTimeout'
+                    : done.error === 'bib-snapshot-failed'
+                      ? 'bib.errorSnapshot'
+                      : done.error === 'bib-target-missing'
+                        ? 'bib.errorTargetMissing'
+                        : done.error === 'bib-target-ambiguous'
+                          ? 'bib.errorTargetAmbiguous'
+                          : undefined)
+            const diagnostic = done.diagnostic
+            const diagnosticPhase = diagnostic?.phase === 'tree' ? 'bib.phaseTree'
+              : diagnostic?.phase === 'baseline' ? 'bib.phaseBaseline' : diagnostic?.phase === 'save' ? 'bib.phaseSave' : undefined
+            const diagnosticText = diagnosticPhase !== undefined ? [tt(diagnosticPhase),
+              diagnostic?.status !== undefined && Number.isInteger(diagnostic.status) && diagnostic.status >= 100 && diagnostic.status <= 599 ? `HTTP ${diagnostic.status}` : undefined,
+              typeof diagnostic?.code === 'string' && /^[a-z0-9-]{1,48}$/.test(diagnostic.code) ? diagnostic.code : undefined,
+              diagnostic?.attempts === 2 ? tt('bib.readRetried') : undefined].filter(Boolean).join(' / ') : undefined
+            const detail = [reasonKey !== undefined ? tt(reasonKey) : done.error ?? 'unknown', diagnosticText, done.available !== undefined && done.available !== ''
+              ? tt('bib.available').replace('{files}', done.available)
+              : undefined, done.written === true ? tt('bib.writeUnconfirmed') : undefined].filter(Boolean).join(' · ')
+            setNote({ ok: false, text: tt('bib.failed').replace('{detail}', detail) })
+          }
+          return
+        }
+        case 'tex-document': {
+          const doc = data as unknown as {
+            requestId?: string; ok?: boolean; id?: string; name?: string; text?: string; revision?: string; error?: string
+          }
+          const pending = texSyncPendingRef.current
+          if (pending === undefined || doc.requestId !== pending.requestId) return
+          if (texSyncTimerRef.current !== undefined) {
+            window.clearTimeout(texSyncTimerRef.current)
+            texSyncTimerRef.current = undefined
+          }
+          if (doc.ok !== true || typeof doc.id !== 'string' || typeof doc.name !== 'string'
+            || typeof doc.text !== 'string' || typeof doc.revision !== 'string') {
+            texSyncPendingRef.current = undefined
+            setTexBusy(false)
+            const detail = doc.error === 'tex-current-document-not-tex'
+              ? tt('tex.errorCurrentNotTex')
+              : doc.error === 'tex-document-identity-unavailable' || doc.error === 'tex-document-identity-mismatch'
+                ? tt('tex.errorIdentity')
+              : doc.error === 'tex-editor-unavailable' || doc.error === 'tex-editor-ambiguous'
+                ? tt('tex.errorEditorUnavailable')
+                : doc.error === 'tex-document-too-large'
+                  ? tt('tex.errorTooLarge')
+                  : doc.error ?? 'unknown'
+            setNote({ ok: false, text: tt('tex.failed').replace('{detail}', detail) })
+            return
+          }
+          if (pending.direction === 'overleaf-to-local') {
+            void postWorkbench<LocalTexWriteWire>('/overleaf/workbench/write-tex-file', {
+              sessionId: pending.sessionId,
+              path: pending.path,
+              fallbackName: doc.name,
+              content: doc.text,
+            }, 45_000)
+              .then(result => {
+                if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+                setTexPath(result.path)
+                const key = result.unchanged ? 'tex.localUnchanged' : result.created ? 'tex.localCreated' : 'tex.localUpdated'
+                setNote({
+                  ok: true,
+                  text: tt(key).replace('{path}', result.path).replace('{chars}', String(doc.text?.length ?? 0)),
+                })
+              })
+              .catch(error => {
+                if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+                setNote({ ok: false, text: tt('tex.failed').replace('{detail}', String(error)) })
+              })
+              .finally(() => {
+                if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+                texSyncPendingRef.current = undefined
+                setTexBusy(false)
+              })
+            return
+          }
+          const forwardToOverleaf = (content: string): void => {
+            if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+            sendToFrame({
+              type: 'sync-tex-to-overleaf', requestId: pending.requestId, text: content,
+              expectedDocId: doc.id, expectedRevision: doc.revision, confirmed: true,
+            })
+            texSyncTimerRef.current = window.setTimeout(() => {
+              if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+              texSyncTimerRef.current = undefined
+              texSyncPendingRef.current = undefined
+              setTexBusy(false)
+              setNote({ ok: false, text: tt('tex.failed').replace('{detail}', tt('tex.errorTimeout')) })
+            }, 45_000)
+          }
+          if (pending.manualText !== '') {
+            forwardToOverleaf(pending.manualText)
+          } else {
+            void postWorkbench<LocalTexFileWire>('/overleaf/workbench/read-tex-file', {
+              sessionId: pending.sessionId, path: pending.path, fallbackName: doc.name,
+            }, 30_000)
+              .then(file => {
+                if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+                setTexPath(file.path)
+                forwardToOverleaf(file.content)
+              })
+              .catch(error => {
+                if (texSyncPendingRef.current?.requestId !== pending.requestId) return
+                texSyncPendingRef.current = undefined
+                setTexBusy(false)
+                setNote({ ok: false, text: tt('tex.failed').replace('{detail}', String(error)) })
+              })
+          }
+          return
+        }
+        case 'tex-overleaf-sync-done': {
+          const done = data as unknown as { requestId?: string; ok?: boolean; target?: string; chars?: number; unchanged?: boolean; error?: string }
+          const pending = texSyncPendingRef.current
+          if (pending === undefined || done.requestId !== pending.requestId) return
+          if (texSyncTimerRef.current !== undefined) {
+            window.clearTimeout(texSyncTimerRef.current)
+            texSyncTimerRef.current = undefined
+          }
+          texSyncPendingRef.current = undefined
+          setTexBusy(false)
+          if (done.ok === true) {
+            setTexReverseConfirmed(false)
+            setTexManualContent('')
+            setNote({
+              ok: true,
+              text: tt(done.unchanged === true ? 'tex.overleafUnchanged' : 'tex.overleafUpdated')
+                .replace('{name}', done.target ?? '.tex').replace('{chars}', String(done.chars ?? 0)),
+            })
+          } else {
+            const detail = done.error === 'tex-remote-changed'
+              ? tt('tex.errorRemoteChanged')
+              : done.error === 'tex-sync-busy'
+                ? tt('tex.errorBusy')
+              : done.error === 'tex-save-timeout'
+                ? tt('tex.errorSaveTimeout')
+                : done.error === 'tex-snapshot-failed'
+                  ? tt('tex.errorSnapshot')
+                  : done.error === 'tex-current-document-not-tex'
+                    ? tt('tex.errorCurrentNotTex')
+                    : done.error === 'tex-document-identity-unavailable' || done.error === 'tex-document-identity-mismatch'
+                      ? tt('tex.errorIdentity')
+                    : done.error === 'tex-editor-unavailable' || done.error === 'tex-editor-ambiguous'
+                      ? tt('tex.errorEditorUnavailable')
+                      : done.error === 'tex-write-verification-failed'
+                        ? tt('tex.errorVerification')
+                      : done.error === 'tex-remote-read-failed'
+                        ? tt('tex.errorReadback')
+                      : done.error ?? 'unknown'
+            setNote({ ok: false, text: tt('tex.failed').replace('{detail}', detail) })
+          }
+          return
+        }
         case 'url-change': {
           const href = typeof (data as { href?: unknown }).href === 'string'
             ? (data as { href: string }).href
@@ -451,7 +696,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
-  }, [selectionQuoteEnabled, tt])
+  }, [selectionQuoteEnabled, sendToFrame, tt])
 
   const refreshStatus = useCallback((): void => {
     void postWorkbench<WorkbenchStatusWire>('/overleaf/workbench/status')
@@ -512,8 +757,9 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
           if (current.error !== undefined) {
             setNote({ ok: false, text: current.error })
           } else if (current.result !== undefined) {
+            if (current.result.kind === 'automatic') navigateToWorkbenchHome(frameRef.current)
             setNote(current.result.kind === 'automatic'
-              ? { ok: true, text: 'OK' }
+              ? { ok: true, text: tt('status.loginVerified') }
               : { ok: false, text: current.result.instructions ?? tt('status.loginPending') })
           }
           refreshStatus()
@@ -551,6 +797,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         setNote({ ok: true, text: 'cookie saved' })
         setCookieDialogOpen(false)
         setCookieValue('')
+        navigateToWorkbenchHome(frameRef.current)
         refreshStatus()
       })
       .catch(error => setNote({ ok: false, text: String(error) }))
@@ -567,6 +814,131 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     () => sessionId !== undefined ? sessionWorkspaceHint(sessionId) : undefined,
     [sessionId],
   )
+
+  // Auto-detect bibliography files whenever the active DSH session changes.
+  // The host resolves the workspace from trusted session metadata; editable
+  // paths are still constrained to that workspace.
+  useEffect(() => {
+    let disposed = false
+    setBibPath('')
+    setBibCandidates([])
+    if (sessionId === undefined) {
+      setBibScanState('unavailable')
+      return () => { disposed = true }
+    }
+    setBibScanState('scanning')
+    void postWorkbench<{ files: string[] }>('/overleaf/workbench/bib-files', { sessionId }, 20_000)
+      .then(result => {
+        if (disposed) return
+        const files = Array.isArray(result.files) ? result.files.filter(path => typeof path === 'string') : []
+        setBibCandidates(files)
+        setBibPath(files[0] ?? '')
+        setBibScanState('done')
+      })
+      .catch(() => {
+        if (disposed) return
+        setBibScanState('unavailable')
+      })
+    return () => { disposed = true }
+  }, [sessionId])
+
+  // Discover workspace LaTeX sources. Candidates remain suggestions: an
+  // empty path lets the host select only one same-named current document,
+  // preventing accidental cross-file synchronization.
+  useEffect(() => {
+    let disposed = false
+    setTexPath('')
+    setTexCandidates([])
+    setTexReverseConfirmed(false)
+    texSyncPendingRef.current = undefined
+    setTexBusy(false)
+    if (texSyncTimerRef.current !== undefined) window.clearTimeout(texSyncTimerRef.current)
+    texSyncTimerRef.current = undefined
+    if (sessionId === undefined) {
+      setTexScanState('unavailable')
+      return () => { disposed = true }
+    }
+    setTexScanState('scanning')
+    void postWorkbench<{ files: string[] }>('/overleaf/workbench/tex-files', { sessionId }, 20_000)
+      .then(result => {
+        if (disposed) return
+        const files = Array.isArray(result.files) ? result.files.filter(path => typeof path === 'string') : []
+        setTexCandidates(files)
+        setTexPath('')
+        setTexScanState('done')
+      })
+      .catch(() => {
+        if (disposed) return
+        setTexScanState('unavailable')
+      })
+    return () => { disposed = true }
+  }, [sessionId])
+
+  useEffect(() => () => {
+    if (bibSyncTimerRef.current !== undefined) window.clearTimeout(bibSyncTimerRef.current)
+    if (texSyncTimerRef.current !== undefined) window.clearTimeout(texSyncTimerRef.current)
+    texSyncPendingRef.current = undefined
+  }, [])
+
+  const syncLocalBib = useCallback((): void => {
+    const requestedPath = bibPath.trim()
+    if (requestedPath === '') {
+      setNote({ ok: false, text: tt('bib.pathRequired') })
+      return
+    }
+    if (sessionId === undefined) {
+      setNote({ ok: false, text: tt('bib.noWorkspace') })
+      return
+    }
+    if (bibBusy) return
+    setBibBusy(true)
+    void postWorkbench<LocalBibFileWire>('/overleaf/workbench/read-bib-file', {
+      path: requestedPath,
+      sessionId,
+    }, 20_000)
+      .then(file => {
+        setBibPath(file.path)
+        sendToFrame({ type: 'sync-bib', fileName: file.name, text: file.content })
+        bibSyncTimerRef.current = window.setTimeout(() => {
+          bibSyncTimerRef.current = undefined
+          setBibBusy(false)
+          setNote({ ok: false, text: tt('bib.failed').replace('{detail}', 'timeout') })
+        }, 90_000)
+      })
+      .catch(error => {
+        setBibBusy(false)
+        setNote({ ok: false, text: tt('bib.failed').replace('{detail}', String(error)) })
+      })
+  }, [bibBusy, bibPath, sendToFrame, sessionId, tt])
+
+  const startTexSync = useCallback((): void => {
+    if (sessionId === undefined || sessionId === '') {
+      setNote({ ok: false, text: tt('tex.noWorkspace') })
+      return
+    }
+    if (texBusy) return
+    if (texDirection === 'local-to-overleaf' && !texReverseConfirmed) {
+      setNote({ ok: false, text: tt('tex.confirmRequired') })
+      return
+    }
+    if (texDirection === 'local-to-overleaf' && texPath.trim() === '' && texManualContent === '') {
+      setNote({ ok: false, text: tt('tex.pathOrContentRequired') })
+      return
+    }
+    const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+    texSyncPendingRef.current = {
+      requestId, sessionId, direction: texDirection, path: texPath.trim(), manualText: texManualContent,
+    }
+    setTexBusy(true)
+    sendToFrame({ type: 'tex-document-request', requestId })
+    texSyncTimerRef.current = window.setTimeout(() => {
+      if (texSyncPendingRef.current?.requestId !== requestId) return
+      texSyncTimerRef.current = undefined
+      texSyncPendingRef.current = undefined
+      setTexBusy(false)
+      setNote({ ok: false, text: tt('tex.failed').replace('{detail}', tt('tex.errorTimeout')) })
+    }, 20_000)
+  }, [sendToFrame, sessionId, texBusy, texDirection, texManualContent, texPath, texReverseConfirmed, tt])
 
   // Poll the fixed workspace handoff file after submission. A changed
   // revision must remain identical across two polls before it is accepted, so
@@ -643,11 +1015,9 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     return () => window.clearInterval(interval)
   }, [aiOutputWatch])
 
-  // Entry point: land directly on the project dashboard instead of the site
-  // root, removing the root->dashboard redirect chain (and any ambiguity
-  // around cached/restored intermediate pages).
-  const embedBase = embedInfo?.embedUrl ?? '/overleaf-proxy/'
-  const embedEntry = `${embedBase}${embedBase.endsWith('/') ? '' : '/'}project`
+  // Overleaf uses /project, NJU TeXPage uses /console. The upstream root
+  // chooses the right authenticated dashboard; never append /project here.
+  const embedEntry = workbenchEntry(embedInfo?.embedUrl)
 
   const templates: Array<[string, string]> = [
     [tt('insert.section'), LATex_TEMPLATES.section],
@@ -796,8 +1166,13 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
       setNote({ ok: false, text: tt('selection.stale') })
       return
     }
-    sendToFrame({ type: 'replace-selection', selectionId: pendingReplacement.selectionId, text: selectionDraft })
-  }, [pendingReplacement, selectionDraft, sendToFrame, tt])
+    sendToFrame({
+      type: 'replace-selection',
+      selectionId: pendingReplacement.selectionId,
+      text: selectionDraft,
+      force: !selectionSafetyEnabled,
+    })
+  }, [pendingReplacement, selectionDraft, selectionSafetyEnabled, sendToFrame, tt])
 
   const openCompileTab = useCallback((): void => {
     setPanelTab('compile')
@@ -880,6 +1255,124 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     }
     sendToFrame({ type: 'apply-fix-edits', edits: parsed.edits.map(edit => ({ old: edit.old, new: edit.new })) })
   }, [fixDraft, sendToFrame, tt])
+
+  const renderBibUpdater = (listId: string): ReactNode => {
+    const detectionText = bibScanState === 'scanning'
+      ? tt('bib.scanning')
+      : bibCandidates.length > 0
+        ? tt('bib.detected').replace('{count}', String(bibCandidates.length))
+        : bibScanState === 'unavailable'
+          ? tt('bib.noWorkspace')
+          : tt('bib.notDetected')
+    return (
+      <div className="dso-tool-section">
+        <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('bib.title')}</div>
+        <input
+          className="dso-input"
+          type="text"
+          list={listId}
+          value={bibPath}
+          onChange={event => setBibPath(event.target.value)}
+          placeholder={tt('bib.pathPlaceholder')}
+          aria-label={tt('bib.pathLabel')}
+        />
+        <datalist id={listId}>
+          {bibCandidates.map(path => <option key={path} value={path} />)}
+        </datalist>
+        <div className="dso-muted">{detectionText}</div>
+        <button
+          className="dso-btn"
+          disabled={bibBusy || bibPath.trim() === '' || !cursorInsertEnabled || sessionId === undefined}
+          onClick={syncLocalBib}
+        >{bibBusy ? tt('bib.updating') : tt('bib.update')}</button>
+        <div className="dso-muted">{tt('bib.hint')}</div>
+      </div>
+    )
+  }
+
+  const renderTexSync = (): ReactNode => {
+    const detectionText = texScanState === 'scanning'
+      ? tt('tex.scanning')
+      : texCandidates.length > 0
+        ? tt('tex.detected').replace('{count}', String(texCandidates.length))
+        : texScanState === 'unavailable'
+          ? tt('tex.noWorkspace')
+          : tt('tex.notDetected')
+    const reverse = texDirection === 'local-to-overleaf'
+    return (
+      <div className="dso-tool-section">
+        <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('tex.title')}</div>
+        <div className="dso-muted">{tt('tex.description')}</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }} role="group" aria-label={tt('tex.direction')}>
+          <button
+            className="dso-btn"
+            data-active={!reverse ? '1' : undefined}
+            disabled={texBusy}
+            onClick={() => { setTexDirection('overleaf-to-local'); setTexReverseConfirmed(false) }}
+          >{tt('tex.directionPull')}</button>
+          <button
+            className="dso-btn"
+            data-active={reverse ? '1' : undefined}
+            disabled={texBusy}
+            onClick={() => { setTexDirection('local-to-overleaf'); setTexReverseConfirmed(false) }}
+          >{tt('tex.directionPush')}</button>
+        </div>
+        <label className="dso-muted" htmlFor="dso-tex-sync-path">{tt('tex.pathLabel')}</label>
+        <input
+          id="dso-tex-sync-path"
+          className="dso-input"
+          type="text"
+          list="dso-tex-sync-candidates"
+          value={texPath}
+          disabled={texBusy}
+          onChange={event => setTexPath(event.target.value)}
+          placeholder={tt('tex.pathPlaceholder')}
+        />
+        <datalist id="dso-tex-sync-candidates">
+          {texCandidates.map(path => <option key={path} value={path} />)}
+        </datalist>
+        <div className="dso-muted">{detectionText}</div>
+        {!reverse && texCandidates.length === 0 && texScanState === 'done' && (
+          <div className="dso-muted">{tt('tex.createHint')}</div>
+        )}
+        {reverse && (
+          <>
+            <div
+              className="dso-muted"
+              role="alert"
+              style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)', fontWeight: 600 }}
+            >{tt('tex.reverseWarning')}</div>
+            <label className="dso-muted" htmlFor="dso-tex-manual-content">{tt('tex.manualLabel')}</label>
+            <textarea
+              id="dso-tex-manual-content"
+              className="dso-textarea"
+              value={texManualContent}
+              disabled={texBusy}
+              onChange={event => setTexManualContent(event.target.value)}
+              placeholder={tt('tex.manualPlaceholder')}
+              style={{ minHeight: 110 }}
+            />
+            <div className="dso-muted">{tt('tex.manualHint')}</div>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 11 }}>
+              <input
+                type="checkbox"
+                checked={texReverseConfirmed}
+                disabled={texBusy}
+                onChange={event => setTexReverseConfirmed(event.target.checked)}
+              />
+              <span>{tt('tex.reverseConfirm')}</span>
+            </label>
+          </>
+        )}
+        <button
+          className={`dso-btn ${reverse ? 'dso-btn-primary' : ''}`}
+          disabled={texBusy || sessionId === undefined || (reverse && !texReverseConfirmed)}
+          onClick={startTexSync}
+        >{texBusy ? tt('tex.syncing') : reverse ? tt('tex.pushAction') : tt('tex.pullAction')}</button>
+        <div className="dso-muted">{reverse ? tt('tex.pushHint') : tt('tex.pullHint')}</div>
+      </div>
+    )
+  }
 
   return (
     <div className="dso-root">
@@ -992,6 +1485,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                       />
                       <button className="dso-btn dso-btn-primary" disabled={!cursorInsertEnabled} onClick={() => onInsert(insertDraft)}>{tt('insert.action')}</button>
                       {!cursorInsertEnabled && <div className="dso-muted">R6 insert is disabled in settings.</div>}
+                      {renderBibUpdater('dso-bib-path-insert')}
                     </>
                   )}
                   {panelTab === 'selection' && (
@@ -1052,12 +1546,26 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                         placeholder={tt('selection.resultPlaceholder')}
                         style={{ minHeight: 110 }}
                       />
+                      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 6, fontSize: 11 }}>
+                        <input
+                          type="checkbox"
+                          checked={selectionSafetyEnabled}
+                          onChange={event => setSelectionSafetyEnabled(event.target.checked)}
+                        />
+                        <span>{tt('selection.safetyToggle')}</span>
+                      </label>
                       <button
                         className="dso-btn dso-btn-primary"
                         disabled={!cursorInsertEnabled || pendingReplacement?.selectionId === undefined || selectionDraft.trim() === ''}
                         onClick={replaceSelectedText}
                       >{tt('selection.replace')}</button>
-                      <div className="dso-muted">{tt('selection.safety')}</div>
+                      <div
+                        className="dso-muted"
+                        style={!selectionSafetyEnabled ? { color: 'var(--dsw-alias-state-error-primary, #c0392b)' } : undefined}
+                      >
+                        {selectionSafetyEnabled ? tt('selection.safety') : tt('selection.forceWarning')}
+                      </div>
+                      {renderBibUpdater('dso-bib-path-selection')}
                     </>
                   )}
                   {panelTab === 'compile' && (
@@ -1078,9 +1586,22 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                               .replace('{errors}', String(compileInfo.errors))
                               .replace('{warnings}', String(compileInfo.warnings))}
                           </div>
+                          {compileInfo.files.some(file => file.error !== undefined) && (
+                            <div className="dso-muted" style={{ color: 'var(--dsw-alias-state-error-primary, #c0392b)' }}>
+                              {tt('compile.logReadFailed').replace('{detail}', compileInfo.files
+                                .filter(file => file.error !== undefined)
+                                .map(file => `${file.path}: ${file.error ?? ''}`)
+                                .join('; ')
+                                .slice(0, 240))}
+                            </div>
+                          )}
                           <div className="dso-muted" style={{ fontWeight: 600 }}>{tt('compile.listTitle')}</div>
                           {compileInfo.items.length === 0
-                            ? <div className="dso-muted">{tt('compile.noIssue')}</div>
+                            ? (compileInfo.files.length === 0
+                                ? <div className="dso-muted">{tt('compile.empty')}</div>
+                                : compileInfo.files.some(file => file.error !== undefined)
+                                  ? null
+                                  : <div className="dso-muted">{tt('compile.noIssue')}</div>)
                             : (
                                 <div className="dso-log-list">
                                   {compileInfo.items.slice(0, 40).map((item, index) => (
@@ -1173,6 +1694,7 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
                       </div>
                       <div>{status?.loggedIn === true ? tt('status.loggedIn') : tt('status.loggedOut')}</div>
                       <div className="dso-muted">{tt('status.composeNote')}</div>
+                      {renderTexSync()}
                     </>
                   )}
                 </div>

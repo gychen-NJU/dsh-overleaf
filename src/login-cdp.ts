@@ -60,6 +60,15 @@ interface CdpCookie {
   domain: string
 }
 
+/** Match the cookie's actual host scope, not arbitrary child hosts. */
+export function cookieDomainMatchesHost(domain: string, host: string): boolean {
+  const normalizedDomain = domain.toLowerCase()
+  const normalizedHost = host.toLowerCase()
+  const bareDomain = normalizedDomain.replace(/^\./, '')
+  return bareDomain !== '' && (normalizedHost === bareDomain
+    || (normalizedDomain.startsWith('.') && normalizedHost.endsWith(`.${bareDomain}`)))
+}
+
 /** Minimal promise-based CDP client over the Node global WebSocket. */
 class CdpClient {
   private nextId = 1
@@ -338,8 +347,8 @@ async function pageTargetUrls(port: number): Promise<string[]> {
  * requires ALL of:
  *  1. at least one non-preference cookie scoped to the target host,
  *  2. a browser tab sitting on the target origin OUTSIDE its login/SSO pages,
- *  3. server-side validation of the assembled header against /project
- *     (tolerant: 200, 3xx-away-from-login, or 404 all count as authenticated).
+ *  3. server-side validation of a protected landing page. A missing /project
+ *     route is not login proof; alternative dashboards are reached via /.
  */
 async function captureCookies(
   browserCdp: CdpClient,
@@ -347,8 +356,7 @@ async function captureCookies(
   options: Pick<LoginOptions, 'targetHost' | 'baseUrl'>,
   timeoutMs: number,
 ): Promise<string> {
-  const bareHost = options.targetHost.replace(/^www\./, '')
-  const origin = options.baseUrl.replace(/\/+$/, '')
+  const origin = new URL(options.baseUrl).origin
   const deadline = Date.now() + timeoutMs
   let cookieCdp = browserCdp
   let pageCdp: CdpClient | undefined
@@ -356,24 +364,24 @@ async function captureCookies(
     while (Date.now() < deadline) {
       try {
         const cookies = await readCookiesFrom(cookieCdp)
-        const siteCookies = cookies.filter(cookie =>
-          cookie.domain === bareHost || cookie.domain.endsWith(`.${bareHost}`))
+        const siteCookies = cookies.filter(cookie => cookieDomainMatchesHost(cookie.domain, options.targetHost))
         const sessionish = siteCookies.filter(cookie => isSessionishCookie(cookie.name, cookie.value))
         if (sessionish.length > 0) {
           const header = siteCookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
-          let onLoggedInPage = false
+          let landingUrls: string[] = []
           try {
-            onLoggedInPage = (await pageTargetUrls(cdpPort)).some(url => {
-              if (!url.startsWith(`${origin}/`)) return false
-              const path = url.slice(origin.length)
-              return !locationLooksLikeLogin(path)
+            landingUrls = (await pageTargetUrls(cdpPort)).filter(url => {
+              try {
+                const target = new URL(url)
+                return target.origin === origin && !locationLooksLikeLogin(target.pathname)
+              } catch { return false }
             })
           } catch {
-            onLoggedInPage = false
+            landingUrls = []
           }
-          if (onLoggedInPage) {
+          for (const landingUrl of [...new Set(landingUrls)].slice(0, 3)) {
             try {
-              await validateCookieHeader(header, options.baseUrl)
+              await validateCookieHeader(header, options.baseUrl, Math.min(8_000, Math.max(1, deadline - Date.now())), landingUrl)
               return header
             } catch {
               // Not authenticated yet (or the probe page bounced to /login):

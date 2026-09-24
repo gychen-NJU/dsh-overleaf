@@ -12,12 +12,16 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import http from 'node:http'
-import { readFile, stat } from 'node:fs/promises'
-import { isAbsolute, join as joinPath } from 'node:path'
+import { readFile, readdir, realpath, stat, unlink, writeFile } from 'node:fs/promises'
+import {
+  basename, dirname, extname, isAbsolute, join as joinPath, relative as relativePath,
+  resolve as resolvePath, sep as pathSeparator,
+} from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type {} from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { Config, resolveConfig } from './config.ts'
 import type { ResolvedConfig, WorkbenchConfig } from './config.ts'
 import { OVERLEAF_WORKBENCH_COOKIE } from './credentials.ts'
@@ -47,11 +51,24 @@ export const INSERT_FILE_NAME = 'dsh-overleaf-insert.md'
 export const FIX_FILE_NAME = 'dsh-overleaf-fix.md'
 
 /** Services required before the host plugin can mount. */
-export const inject = ['webServer', 'credentials']
+export const inject = ['webServer', 'credentials', 'sessions']
 
 export { Config }
 
+const MAX_TEX_FILE_BYTES = 4 * 1024 * 1024
 const MAX_REQUEST_BYTES = 64 * 1024
+// JSON can escape each source character into several bytes. Only the local
+// .tex write route receives this larger bound; ordinary control routes remain
+// capped at 64 KiB.
+const MAX_TEX_REQUEST_BYTES = MAX_TEX_FILE_BYTES * 6 + 64 * 1024
+const MAX_BIB_FILE_BYTES = 2 * 1024 * 1024
+const MAX_BIB_RESULTS = 50
+const MAX_BIB_SCAN_DEPTH = 8
+const MAX_TEX_RESULTS = 100
+const MAX_TEX_SCAN_DEPTH = 8
+const BIB_SCAN_IGNORED_DIRS = new Set([
+  '.git', '.hg', '.svn', '.dsh-meow', '.tmp', 'node_modules', 'dist', 'build', 'coverage', 'fixtures',
+])
 
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
@@ -59,13 +76,13 @@ function isLoopback(req: IncomingMessage): boolean {
   return req.socket.remoteAddress === undefined || LOOPBACK_ADDRESSES.has(req.socket.remoteAddress)
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+async function readJsonBody(req: IncomingMessage, maxBytes = MAX_REQUEST_BYTES): Promise<unknown> {
   const chunks: Buffer[] = []
   let bytes = 0
   for await (const chunk of req) {
     const buffer = chunk as Buffer
     bytes += buffer.byteLength
-    if (bytes > MAX_REQUEST_BYTES) throw new Error('dsh-overleaf: request body too large')
+    if (bytes > maxBytes) throw new Error('dsh-overleaf: request body too large')
     chunks.push(buffer)
   }
   if (chunks.length === 0) return {}
@@ -90,6 +107,228 @@ function sendError(res: ServerResponse, error: unknown): void {
   sendJson(res, 500, { ok: false, error: { code, message } })
 }
 
+function isWithinWorkspace(root: string, target: string): boolean {
+  const relative = relativePath(root, target)
+  return relative === ''
+    || (relative !== '..' && !relative.startsWith(`..${pathSeparator}`) && !isAbsolute(relative))
+}
+
+async function canonicalWorkspaceRoot(cwd: string): Promise<string> {
+  const rawRoot = cwd.trim()
+  if (rawRoot === '' || !isAbsolute(rawRoot)) {
+    throw new Error('dsh-overleaf: bibliography sync requires an absolute session workspace')
+  }
+  const root = await realpath(rawRoot).catch(() => undefined)
+  if (root === undefined) throw new Error('dsh-overleaf: session workspace does not exist')
+  const rootStats = await stat(root).catch(() => undefined)
+  if (rootStats === undefined || !rootStats.isDirectory()) {
+    throw new Error('dsh-overleaf: session workspace is not a directory')
+  }
+  return root
+}
+
+/** Discover UTF-8 BibTeX candidates inside one trusted DSH workspace. */
+export async function discoverWorkspaceBibFiles(cwd: string): Promise<string[]> {
+  const root = await canonicalWorkspaceRoot(cwd)
+  const found: string[] = []
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }]
+  while (queue.length > 0 && found.length < MAX_BIB_RESULTS) {
+    const current = queue.shift()
+    if (current === undefined) break
+    const entries = await readdir(current.dir, { withFileTypes: true }).catch(() => [])
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    for (const entry of entries) {
+      if (found.length >= MAX_BIB_RESULTS) break
+      const fullPath = joinPath(current.dir, entry.name)
+      if (entry.isFile() && extname(entry.name).toLowerCase() === '.bib') {
+        found.push(fullPath)
+      } else if (entry.isDirectory() && current.depth < MAX_BIB_SCAN_DEPTH
+        && !BIB_SCAN_IGNORED_DIRS.has(entry.name.toLowerCase())) {
+        queue.push({ dir: fullPath, depth: current.depth + 1 })
+      }
+    }
+  }
+  return found
+}
+
+/** Resolve and read one explicit .bib, refusing traversal and symlink escapes. */
+export async function readLocalBibFile(cwd: string, requestedPath: string): Promise<{
+  path: string
+  name: string
+  content: string
+  mtimeMs: number
+  size: number
+}> {
+  const rawPath = requestedPath.trim()
+  if (rawPath === '' || rawPath.includes('\u0000')) throw new Error('dsh-overleaf: a .bib path is required')
+  const root = await canonicalWorkspaceRoot(cwd)
+  const requestedTarget = resolvePath(isAbsolute(rawPath) ? rawPath : joinPath(root, rawPath))
+  if (!isWithinWorkspace(root, requestedTarget)) {
+    throw new Error('dsh-overleaf: the .bib file must be inside the current session workspace')
+  }
+  if (extname(requestedTarget).toLowerCase() !== '.bib') {
+    throw new Error('dsh-overleaf: only .bib files can be synchronized')
+  }
+  const target = await realpath(requestedTarget).catch(() => undefined)
+  if (target === undefined) throw new Error(`dsh-overleaf: .bib file not found: ${requestedTarget}`)
+  if (!isWithinWorkspace(root, target)) {
+    throw new Error('dsh-overleaf: the .bib file resolves outside the current session workspace')
+  }
+  if (extname(target).toLowerCase() !== '.bib') {
+    throw new Error('dsh-overleaf: only .bib files can be synchronized')
+  }
+  const stats = await stat(target).catch(() => undefined)
+  if (stats === undefined || !stats.isFile()) throw new Error(`dsh-overleaf: .bib file not found: ${target}`)
+  if (stats.size > MAX_BIB_FILE_BYTES) throw new Error('dsh-overleaf: .bib file exceeds the 2 MiB safety limit')
+  const content = await readFile(target, 'utf8')
+  return { path: target, name: basename(target), content, mtimeMs: stats.mtimeMs, size: stats.size }
+}
+
+/** Discover local LaTeX sources without following directory symlinks. */
+export async function discoverWorkspaceTexFiles(cwd: string): Promise<string[]> {
+  const root = await canonicalWorkspaceRoot(cwd)
+  const found: string[] = []
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }]
+  while (queue.length > 0 && found.length < MAX_TEX_RESULTS) {
+    const current = queue.shift()
+    if (current === undefined) break
+    const entries = await readdir(current.dir, { withFileTypes: true }).catch(() => [])
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    for (const entry of entries) {
+      if (found.length >= MAX_TEX_RESULTS) break
+      const fullPath = joinPath(current.dir, entry.name)
+      if (entry.isFile() && extname(entry.name).toLowerCase() === '.tex') {
+        found.push(fullPath)
+      } else if (entry.isDirectory() && current.depth < MAX_TEX_SCAN_DEPTH
+        && !BIB_SCAN_IGNORED_DIRS.has(entry.name.toLowerCase())) {
+        queue.push({ dir: fullPath, depth: current.depth + 1 })
+      }
+    }
+  }
+  return found
+}
+
+function safeTexFallbackName(value: string): string {
+  const name = basename(value.replace(/[\u200e\u200f]/g, '').trim())
+  if (name === '' || name === '.' || name === '..' || extname(name).toLowerCase() !== '.tex') {
+    throw new Error('dsh-overleaf: the current Overleaf document must have a valid .tex filename')
+  }
+  return name
+}
+
+/** Resolve one local .tex target; an empty path uses safe auto-selection. */
+async function resolveWorkspaceTexPath(cwd: string, requestedPath: string, fallbackName: string, createWhenMissing: boolean): Promise<{
+  root: string
+  target: string
+}> {
+  const root = await canonicalWorkspaceRoot(cwd)
+  const rawPath = requestedPath.trim()
+  let target: string
+  if (rawPath !== '') {
+    if (rawPath.includes('\u0000')) throw new Error('dsh-overleaf: invalid .tex path')
+    target = resolvePath(isAbsolute(rawPath) ? rawPath : joinPath(root, rawPath))
+  } else {
+    const safeName = safeTexFallbackName(fallbackName)
+    const candidates = await discoverWorkspaceTexFiles(root)
+    const exact = candidates.filter(path => basename(path) === safeName)
+    const insensitive = candidates.filter(path => basename(path).toLowerCase() === safeName.toLowerCase())
+    const matches = exact.length > 0 ? exact : insensitive
+    if (matches.length === 1) target = matches[0]!
+    else if (matches.length > 1) throw new Error('dsh-overleaf: multiple local .tex files have the same name; choose a path explicitly')
+    else if (candidates.length > 0) throw new Error('dsh-overleaf: no same-named local .tex file was found; choose a path explicitly')
+    else if (createWhenMissing) target = joinPath(root, safeName)
+    else throw new Error('dsh-overleaf: no local .tex file was detected; choose a path or provide manual content')
+  }
+  if (!isWithinWorkspace(root, target)) {
+    throw new Error('dsh-overleaf: the .tex file must be inside the current session workspace')
+  }
+  if (extname(target).toLowerCase() !== '.tex') {
+    throw new Error('dsh-overleaf: only .tex files can be synchronized')
+  }
+  return { root, target }
+}
+
+/** Read one workspace .tex for the explicitly confirmed reverse direction. */
+export async function readLocalTexFile(cwd: string, requestedPath: string, fallbackName = 'current.tex'): Promise<{
+  path: string
+  name: string
+  content: string
+  mtimeMs: number
+  size: number
+}> {
+  const resolved = await resolveWorkspaceTexPath(cwd, requestedPath, fallbackName, false)
+  const target = await realpath(resolved.target).catch(() => undefined)
+  if (target === undefined) throw new Error(`dsh-overleaf: .tex file not found: ${resolved.target}`)
+  if (!isWithinWorkspace(resolved.root, target)) {
+    throw new Error('dsh-overleaf: the .tex file resolves outside the current session workspace')
+  }
+  if (extname(target).toLowerCase() !== '.tex') {
+    throw new Error('dsh-overleaf: the .tex file resolves to a non-.tex target')
+  }
+  const stats = await stat(target).catch(() => undefined)
+  if (stats === undefined || !stats.isFile()) throw new Error(`dsh-overleaf: .tex file not found: ${target}`)
+  if (stats.size > MAX_TEX_FILE_BYTES) throw new Error('dsh-overleaf: .tex file exceeds the 4 MiB safety limit')
+  const content = await readFile(target, 'utf8')
+  return { path: target, name: basename(target), content, mtimeMs: stats.mtimeMs, size: stats.size }
+}
+
+/**
+ * Write an Overleaf source snapshot into the workspace and verify the exact
+ * UTF-8 content. On a failed write/readback, restore the previous file (or
+ * remove the newly-created partial file) before reporting failure.
+ */
+export async function writeLocalTexFile(cwd: string, requestedPath: string, fallbackName: string, content: string): Promise<{
+  path: string
+  name: string
+  mtimeMs: number
+  size: number
+  created: boolean
+  unchanged: boolean
+}> {
+  const contentBytes = Buffer.byteLength(content, 'utf8')
+  if (contentBytes > MAX_TEX_FILE_BYTES) throw new Error('dsh-overleaf: .tex content exceeds the 4 MiB safety limit')
+  const resolved = await resolveWorkspaceTexPath(cwd, requestedPath, fallbackName, true)
+  const existingReal = await realpath(resolved.target).catch(() => undefined)
+  if (existingReal !== undefined && !isWithinWorkspace(resolved.root, existingReal)) {
+    throw new Error('dsh-overleaf: the .tex file resolves outside the current session workspace')
+  }
+  const target = existingReal ?? resolved.target
+  if (extname(target).toLowerCase() !== '.tex') {
+    throw new Error('dsh-overleaf: the .tex file resolves to a non-.tex target')
+  }
+  const parent = await realpath(dirname(target)).catch(() => undefined)
+  if (parent === undefined || !isWithinWorkspace(resolved.root, parent)) {
+    throw new Error('dsh-overleaf: the .tex parent directory must already exist inside the workspace')
+  }
+  const previousStats = await stat(target).catch(() => undefined)
+  if (previousStats !== undefined && !previousStats.isFile()) {
+    throw new Error('dsh-overleaf: the selected .tex target is not a regular file')
+  }
+  if (previousStats !== undefined && previousStats.size > MAX_TEX_FILE_BYTES) {
+    throw new Error('dsh-overleaf: existing .tex file exceeds the 4 MiB safety limit')
+  }
+  const previous = previousStats === undefined ? undefined : await readFile(target, 'utf8')
+  if (previous === content) {
+    return {
+      path: target, name: basename(target), mtimeMs: previousStats!.mtimeMs,
+      size: previousStats!.size, created: false, unchanged: true,
+    }
+  }
+  try {
+    await writeFile(target, content, 'utf8')
+    if (await readFile(target, 'utf8') !== content) throw new Error('write verification failed')
+  } catch (error) {
+    if (previous !== undefined) await writeFile(target, previous, 'utf8').catch(() => undefined)
+    else await unlink(target).catch(() => undefined)
+    throw new Error(`dsh-overleaf: local .tex write failed and was rolled back: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const nextStats = await stat(target)
+  return {
+    path: target, name: basename(target), mtimeMs: nextStats.mtimeMs,
+    size: nextStats.size, created: previousStats === undefined, unchanged: false,
+  }
+}
+
 function stringField(payload: unknown, field: string): string | undefined {
   if (typeof payload !== 'object' || payload === null) return undefined
   const value = (payload as Record<string, unknown>)[field]
@@ -103,17 +342,9 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-/** Minimal structural face of the optional settings service we consume. */
-interface SettingsScopeFace {
-  /** Current resolved value for the namespace (no snapshot wrapper). */
-  get(): Record<string, unknown> | undefined
-  /** Observe changes; listeners receive `(next, prev)` resolved values. */
-  watch(listener: (next: unknown, prev: unknown) => void): () => void
-}
-
 /** The `ctx.overleafWorkbench` service. */
 export class OverleafWorkbenchService extends Service {
-  static inject = ['webServer', 'credentials', 'settings']
+  static inject = ['webServer', 'credentials', 'settings', 'sessions']
   static Config = Config
 
   /** Mutable because live settings updates swap it wholesale. */
@@ -129,16 +360,32 @@ export class OverleafWorkbenchService extends Service {
 
   constructor(ctx: Context, config: WorkbenchConfig) {
     super(ctx, 'overleaf-workbench')
+    // Keep the loader-resolved container: its `.volatile()` fields are live
+    // references the Loader mutates in place, so later samples read new values.
+    this.rawConfig = config
     this.config = resolveConfig(config)
-    this.mountBaseConfig = { ...config }
     this.proxy = new ReverseProxy(this.config.baseUrl)
     this.bridgeScript = renderBridgeScript()
     this.proxy.injectScriptSrc = this.config.injectScriptEnabled ? '/overleaf/workbench/bridge.js' : undefined
     void this.refreshCredential()
       .catch(error => ctx.logger?.warn?.(`dsh-overleaf: credential probe failed: ${error instanceof Error ? error.message : String(error)}`))
     this.registerRoutes()
-    this.registerSettingsNamespace()
+    this.registerSettingsIntegration()
     this.startWsTunnel()
+  }
+
+  /** Resolve the workspace from server-owned session metadata, never client input. */
+  private workspaceForPayload(payload: unknown): string {
+    const sessionId = stringField(payload, 'sessionId')
+    if (sessionId === undefined || sessionId.trim() === '') {
+      throw new Error('dsh-overleaf: workspace synchronization requires a sessionId')
+    }
+    const session = this.ctx.sessions.get(sessionId as SessionId)
+    const cwd = session?.header.cwd
+    if (cwd === undefined || cwd.trim() === '') {
+      throw new Error('dsh-overleaf: the active session has no workspace')
+    }
+    return cwd
   }
 
   /**
@@ -188,41 +435,68 @@ export class OverleafWorkbenchService extends Service {
     }
   }
 
-  /** Base layer handed to the settings service (the composed mount config). */
-  private readonly mountBaseConfig: WorkbenchConfig | undefined
+  /**
+   * The loader-resolved config container. Its `.volatile()` fields are live
+   * references (`{ get() }`) that the Loader mutates in place, so re-resolving
+   * this same object always yields the current values.
+   */
+  private readonly rawConfig: WorkbenchConfig
 
   /**
-   * Publish the `dsh-overleaf` settings namespace so the Plugins settings page
-   * can own baseUrl/feature toggles without hand-editing the profile row.
-   * Composed patch values become the namespace `base`; user edits layer above
-   * them. Live changes hot-swap the proxy target — no restart required. The
-   * whole feature degrades silently when the profile runs no settings service.
+   * DSH 0.1.7+ settings integration.
+   *
+   * The Loader projects a plugin's Config into the settings forms, but ONLY its
+   * `.volatile()` fields: `dsh-settings`' `volatileForm()` returns undefined for
+   * a schema without one, after which `describe()` omits the entry entirely and
+   * no client page or transport write can address it. With volatile fields
+   * present, a save commits those references in place and the Loader emits
+   * `loader/volatile-update` on this fiber instead of remounting the plugin —
+   * that event is the cue to re-resolve and hot-swap the proxy, so baseUrl and
+   * feature edits apply without a restart.
+   *
+   * `configure({ auto: false })` declares that this plugin ships its own page
+   * (the client half registers into the Plugins page's keyed seats), which
+   * suppresses any schema-generated page. Everything here degrades silently on
+   * harness generations without these services.
    */
-  private registerSettingsNamespace(): void {
-    const settings = (this.ctx as { settings?: { register(ns: string, schema: unknown, options?: { base?: WorkbenchConfig }): SettingsScopeFace } }).settings
-    if (settings?.register === undefined) return
-    try {
-      const scope = settings.register('dsh-overleaf', Config, {
-        base: this.mountBaseConfig ?? {},
-      })
-      this.ctx.effect(() => scope.watch((next) => {
-        try {
-          if (next !== undefined) {
-            this.applyRuntimeConfig(resolveConfig(next as WorkbenchConfig))
+  private registerSettingsIntegration(): void {
+    if (typeof this.ctx.inject === 'function') {
+      try {
+        this.ctx.inject(['settings'], (child: Context) => {
+          try {
+            const settings = (child as unknown as {
+              settings?: { configure?(presentation: { auto?: boolean }, owner?: unknown): () => void }
+            }).settings
+            if (settings?.configure === undefined) return
+            const configure = settings.configure.bind(settings)
+            child.effect(
+              () => configure({ auto: false }, this.ctx.fiber),
+              'dsh-overleaf: settings page policy',
+            )
+          } catch (error) {
+            console.warn('[dsh-overleaf] settings page policy skipped:', error instanceof Error ? error.message : error)
           }
-        } catch (error) {
-          console.warn('[dsh-overleaf] settings application failed:', error instanceof Error ? error.message : error)
-        }
-      }), 'dsh-overleaf: settings watcher')
-      // Seed from a possibly pre-existing user section (saved on an earlier
-      // run); without it the freshly mounted service would ignore prior edits.
-      const seeded = scope.get()
-      if (seeded !== undefined) {
-        this.applyRuntimeConfig(resolveConfig(seeded as WorkbenchConfig))
+        })
+      } catch (error) {
+        console.warn('[dsh-overleaf] settings service unavailable:', error instanceof Error ? error.message : error)
       }
+    }
+
+    // Live edits arrive as a fiber-scoped event once the references changed;
+    // re-resolving the container reads the committed values.
+    try {
+      const events = this.ctx as unknown as {
+        on?(name: string, listener: (...args: unknown[]) => void): unknown
+      }
+      events.on?.('loader/volatile-update', () => {
+        try {
+          this.applyRuntimeConfig(resolveConfig(this.rawConfig))
+        } catch (error) {
+          console.warn('[dsh-overleaf] live settings application failed:', error instanceof Error ? error.message : error)
+        }
+      })
     } catch (error) {
-      // A rejected registration must never fail the plugin mount.
-      console.warn('[dsh-overleaf] settings namespace skipped:', error instanceof Error ? error.message : error)
+      console.warn('[dsh-overleaf] volatile-update subscription skipped:', error instanceof Error ? error.message : error)
     }
   }
 
@@ -253,7 +527,7 @@ export class OverleafWorkbenchService extends Service {
   }
 
   /** Register one exact JSON route with the shared envelope contract. */
-  private route(path: string, run: (payload: Record<string, unknown>) => Promise<unknown>): void {
+  private route(path: string, run: (payload: Record<string, unknown>) => Promise<unknown>, maxRequestBytes = MAX_REQUEST_BYTES): void {
     this.ctx.effect(() => this.ctx.webServer.register({
       kind: 'exact',
       path,
@@ -266,7 +540,7 @@ export class OverleafWorkbenchService extends Service {
           return
         }
         try {
-          const payload = await readJsonBody(req)
+          const payload = await readJsonBody(req, maxRequestBytes)
           sendJson(res, 200, { ok: true, value: await run((payload ?? {}) as Record<string, unknown>) })
         } catch (error) {
           sendError(res, error)
@@ -332,6 +606,34 @@ export class OverleafWorkbenchService extends Service {
       cursorInsertEnabled: this.config.cursorInsertEnabled,
       assistPanelEnabled: this.config.assistPanelEnabled,
     }))
+    // Local bibliography sync. The workspace comes from server-owned session
+    // metadata; user paths may be relative or absolute but cannot escape it.
+    this.route('/overleaf/workbench/bib-files', async payload => {
+      return { files: await discoverWorkspaceBibFiles(this.workspaceForPayload(payload)) }
+    })
+    this.route('/overleaf/workbench/read-bib-file', async payload => {
+      const path = stringField(payload, 'path')
+      if (path === undefined) throw new Error('dsh-overleaf: read-bib-file requires a path')
+      return await readLocalBibFile(this.workspaceForPayload(payload), path)
+    })
+    // Bidirectional current-document .tex sync. Every path is resolved from
+    // trusted session metadata and remains confined to that workspace.
+    this.route('/overleaf/workbench/tex-files', async payload => {
+      return { files: await discoverWorkspaceTexFiles(this.workspaceForPayload(payload)) }
+    })
+    this.route('/overleaf/workbench/read-tex-file', async payload => {
+      const path = stringField(payload, 'path') ?? ''
+      const fallbackName = stringField(payload, 'fallbackName') ?? 'current.tex'
+      return await readLocalTexFile(this.workspaceForPayload(payload), path, fallbackName)
+    })
+    this.route('/overleaf/workbench/write-tex-file', async payload => {
+      const path = stringField(payload, 'path') ?? ''
+      const fallbackName = stringField(payload, 'fallbackName')
+      const content = stringField(payload, 'content')
+      if (fallbackName === undefined) throw new Error('dsh-overleaf: write-tex-file requires a fallbackName')
+      if (content === undefined) throw new Error('dsh-overleaf: write-tex-file requires text content')
+      return await writeLocalTexFile(this.workspaceForPayload(payload), path, fallbackName, content)
+    }, MAX_TEX_REQUEST_BYTES)
     // Agent-output handoff: the assistant is asked (in its prompt) to write
     // the final content into dsh-overleaf-insert.md inside the workspace; the
     // panel polls this route and fills its reviewable custom-content box with
@@ -396,7 +698,8 @@ export class OverleafWorkbenchService extends Service {
       },
     }), 'dsh-overleaf: reverse proxy')
 
-    for (const wsPath of ['/overleaf-proxy/socket.io/', '/overleaf-proxy/socket.io', '/socket.io/', '/socket.io']) {
+    for (const wsPath of ['/overleaf-proxy/socket.io/', '/overleaf-proxy/socket.io', '/socket.io/', '/socket.io',
+      '/overleaf-proxy/__dsh_socket__/socket.io/', '/overleaf-proxy/__dsh_socket__/socket.io']) {
       this.ctx.effect(() => this.ctx.webServer.registerUpgrade({
         path: wsPath,
         handler: (req: IncomingMessage, socket: Duplex, head: Buffer) => {

@@ -3,7 +3,7 @@
  * Service class the web composition mounts as the `overleaf-workbench` row.
  * @module dsh-overleaf
  */
-export { Config, OverleafWorkbenchService, name, inject, projectsFromDashboardHtml, } from './service.ts';
+export { Config, OverleafWorkbenchService, name, inject, discoverWorkspaceBibFiles, discoverWorkspaceTexFiles, projectsFromDashboardHtml, readLocalBibFile, readLocalTexFile, writeLocalTexFile, } from './service.ts';
 export { default } from './service.ts';
 export type { WorkbenchConfig, ResolvedConfig, LoginProfileMode, OverleafBrowserChannel } from './config.ts';
 export { normalizeOrigin, resolveConfig } from './config.ts';

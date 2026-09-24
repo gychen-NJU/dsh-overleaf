@@ -5,7 +5,8 @@
  */
 export {
   Config, OverleafWorkbenchService, name, inject,
-  projectsFromDashboardHtml,
+  discoverWorkspaceBibFiles, discoverWorkspaceTexFiles, projectsFromDashboardHtml,
+  readLocalBibFile, readLocalTexFile, writeLocalTexFile,
 } from './service.ts'
 export { default } from './service.ts'
 export type { WorkbenchConfig, ResolvedConfig, LoginProfileMode, OverleafBrowserChannel } from './config.ts'

@@ -1,7 +1,7 @@
 {
   "name": "dsh-overleaf",
-  "description": "Embedded Overleaf workbench tab for DeepSeek Harness Web: same-origin reverse proxy for self-hosted or public Overleaf (no X-Frame-Options limits), direct-CDP login with credential storage, selection quoting into the composer, agent-driven cursor insertion, and LaTeX workflow helpers",
-  "version": "0.3.10",
+  "description": "Embedded Overleaf workbench tab for DeepSeek Harness Web: same-origin reverse proxy, persistent login, AI-assisted editing, compilation diagnostics, and safe bidirectional workspace LaTeX synchronization",
+  "version": "0.3.23",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -53,17 +53,18 @@
   "scripts": {
     "build": "tsc -b && tsdown",
     "typecheck": "tsc -b --pretty false",
-    "test": "node scripts/smoke-offline.mjs && node scripts/smoke-live.mjs",
+    "test": "node scripts/smoke-navigation.mjs && node scripts/smoke-login.mjs && node scripts/smoke-texpage.mjs && node scripts/smoke-texpage-socket.mjs && node scripts/smoke-socket-routing.mjs && node scripts/smoke-texpage-output.mjs && node scripts/smoke-output-routing.mjs && node --test scripts/smoke-bib-compat.mjs scripts/smoke-texpage-bib.mjs scripts/smoke-texpage-bib-proxy.mjs scripts/smoke-texpage-tex-sync.mjs scripts/smoke-texpage-tex-proxy.mjs && node scripts/smoke-offline.mjs && node scripts/smoke-live.mjs",
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-client-runtime": ">=0.1.0-rc.5",
     "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.5",
     "@deepseek-ai/dsh-host-webserver": ">=0.1.0-rc.5",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.5",
     "react": "^18.2.0"
   },
   "devDependencies": {
@@ -71,7 +72,8 @@
     "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.5",
     "@deepseek-ai/dsh-credentials": "^0.1.0-rc.5",
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.5",
-    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.5",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.20.0",
     "@types/react": "~18.3.1",
     "@types/react-dom": "^18.3.5",

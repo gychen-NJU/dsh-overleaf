@@ -10,7 +10,7 @@
 import { createServer } from 'node:http'
 import assert from 'node:assert'
 import { pathToFileURL } from 'node:url'
-import { readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import vm from 'node:vm'
 import { Context } from '@deepseek-ai/cordis'
@@ -25,6 +25,7 @@ function fakeCtx() {
   const routes = []
   const upgrades = []
   const credentialsStore = new Map()
+  const sessionsStore = new Map()
   const credentials = {
     resolve: async ref => credentialsStore.has(String(ref)) ? { value: credentialsStore.get(String(ref)), source: 'test' } : undefined,
     describe: async ref => ({ configured: credentialsStore.has(String(ref)), writable: true }),
@@ -58,10 +59,13 @@ function fakeCtx() {
     tapIndex: () => () => {},
   })
   ctx.provide('credentials', credentials)
-  return { ctx, routes, upgrades, credentialsStore }
+  ctx.provide('sessions', { get: id => sessionsStore.get(String(id)) })
+  return { ctx, routes, upgrades, credentialsStore, sessionsStore }
 }
 
-function mockRequest({ method = 'GET', url = '/', headers = {} }) {
+function mockRequest({ method = 'GET', url = '/', headers = {}, body } = {}) {
+  const bodyBuffer = body === undefined ? undefined : Buffer.from(JSON.stringify(body))
+  let bodyRead = false
   const req = {
     method,
     url,
@@ -78,7 +82,13 @@ function mockRequest({ method = 'GET', url = '/', headers = {} }) {
     },
     on() {},
     [Symbol.asyncIterator]() {
-      return { next: async () => ({ done: true, value: undefined }) }
+      return {
+        next: async () => {
+          if (bodyBuffer === undefined || bodyRead) return { done: true, value: undefined }
+          bodyRead = true
+          return { done: false, value: bodyBuffer }
+        },
+      }
     },
   }
   return req
@@ -110,7 +120,69 @@ class MockResponse {
 }
 
 async function main() {
-  const { default: ServiceClass, buildUpstreamHeaders, mergeCookieHeaders, mergeProxyCookieHeaders, allowSelfInCsp, extractCspNonce, requestTimeoutFor, rewriteHtml } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+  const {
+    default: ServiceClass, allowSelfInCsp, buildUpstreamHeaders, discoverWorkspaceBibFiles,
+    discoverWorkspaceTexFiles, extractCspNonce, mergeCookieHeaders, mergeProxyCookieHeaders,
+    readLocalBibFile, readLocalTexFile, writeLocalTexFile,
+    requestTimeoutFor, rewriteHtml,
+  } = await import(pathToFileURL(join(root, 'lib', 'index.js')))
+
+  // Local bibliography reads are confined to the trusted session workspace.
+  {
+    const bibRoot = join(root, 'scripts', 'fixtures', 'bib-workspace')
+    const found = await discoverWorkspaceBibFiles(bibRoot)
+    assert.deepStrictEqual(found.map(path => path.slice(bibRoot.length + 1).replaceAll('\\', '/')), [
+      'references.bib', 'nested/extra.BIB',
+    ], 'workspace .bib discovery is deterministic and recursive')
+    const relative = await readLocalBibFile(bibRoot, 'references.bib')
+    assert.equal(relative.name, 'references.bib')
+    assert.ok(relative.content.includes('@article{workspace_reference'), 'relative .bib path is read')
+    const absolute = await readLocalBibFile(bibRoot, join(bibRoot, 'nested', 'extra.BIB'))
+    assert.equal(absolute.name, 'extra.BIB', 'absolute path inside the workspace is accepted')
+    await assert.rejects(
+      readLocalBibFile(bibRoot, join('..', 'bib-outside', 'outside.bib')),
+      /must be inside the current session workspace/,
+      'directory traversal outside the session workspace is rejected',
+    )
+    await assert.rejects(readLocalBibFile(bibRoot, 'not-bibliography.txt'), /only \.bib files/)
+    assert.deepStrictEqual(await discoverWorkspaceBibFiles(join(root, 'scripts')), [],
+      'automatic workspace discovery skips test fixture directories')
+  }
+
+  // LaTeX sync discovery/read/write remains inside the active workspace,
+  // supports deterministic recursion, creates a same-named root file when
+  // no candidate exists, and verifies rollback-safe whole-text writes.
+  {
+    const texRoot = join(root, 'scripts', 'fixtures', 'tex-workspace')
+    const found = await discoverWorkspaceTexFiles(texRoot)
+    assert.deepStrictEqual(found.map(path => path.slice(texRoot.length + 1).replaceAll('\\', '/')), [
+      'main.tex', 'chapters/methods.TEX',
+    ], 'workspace .tex discovery is deterministic, recursive, and case-insensitive')
+    const source = await readLocalTexFile(texRoot, 'main.tex')
+    assert.ok(source.content.includes('Workspace main fixture'), 'workspace .tex source is read completely')
+    await assert.rejects(readLocalTexFile(texRoot, '../bib-workspace/references.bib'), /inside the current session workspace|only \.tex/)
+
+    const tmpParent = join(root, '.tmp')
+    await mkdir(tmpParent, { recursive: true })
+    const emptyRoot = await mkdtemp(join(tmpParent, 'tex-sync-smoke-'))
+    try {
+      const created = await writeLocalTexFile(emptyRoot, '', 'paper.tex', '\\documentclass{article}\n')
+      assert.equal(created.created, true, 'empty workspace creates a same-named root .tex file')
+      assert.equal(created.name, 'paper.tex')
+      assert.equal((await readLocalTexFile(emptyRoot, 'paper.tex')).content, '\\documentclass{article}\n')
+      const unchanged = await writeLocalTexFile(emptyRoot, 'paper.tex', 'ignored.tex', '\\documentclass{article}\n')
+      assert.equal(unchanged.unchanged, true, 'identical local .tex content is not rewritten')
+      await assert.rejects(writeLocalTexFile(emptyRoot, '', 'different.tex', 'mismatch'), /no same-named local \.tex file/)
+      await assert.rejects(writeLocalTexFile(emptyRoot, '../escaped.tex', 'paper.tex', 'escape'), /inside the current session workspace/)
+      await mkdir(join(emptyRoot, 'nested'))
+      await writeFile(join(emptyRoot, 'nested', 'second.tex'), 'second', 'utf8')
+      await assert.rejects(writeLocalTexFile(emptyRoot, '', 'missing.tex', 'ambiguous'), /no same-named local \.tex file/)
+    } finally {
+      await rm(emptyRoot, { recursive: true, force: true })
+    }
+    assert.deepStrictEqual(await discoverWorkspaceTexFiles(join(root, 'scripts')), [],
+      'automatic workspace .tex discovery skips test fixture directories')
+  }
 
   assert.equal(requestTimeoutFor(new URL('https://example.test/project/demo/compile?auto_compile=true')), 600_000,
     'synchronous compile calls receive the extended timeout')
@@ -281,13 +353,63 @@ async function main() {
       'selected-text workflow captures native CM5/CM6 ranges')
     assert.ok(bridge.includes("data.type === 'replace-selection'") && bridge.includes("type: 'selection-replace-done'"),
       'bridge exposes delayed selected-range replacement with an explicit result')
+    assert.ok(bridge.includes("data.type === 'sync-bib'") && bridge.includes("type: 'bib-sync-done'"),
+      'bridge exposes explicit local bibliography synchronization results')
+    assert.ok(bridge.includes(".file-tree-entity-button") && bridge.includes("data-file-type=\"doc\""),
+      'bibliography sync expands real file-tree folders and accepts editable documents only')
+    assert.ok(!bridge.includes("matches.length === 0 && all.length === 1"),
+      'a mismatched local filename can never overwrite the sole Overleaf bibliography')
+    assert.ok(bridge.includes("doc:after-opened") && bridge.includes("doc:saved"),
+      'bibliography sync consumes exact document open and save lifecycle signals')
+    assert.ok(bridge.includes('asEditorView(content.cmView)') && bridge.includes('content.cmView && content.cmView.rootView'),
+      'bibliography sync resolves the current Overleaf CM6 .cm-content.cmView chain')
+    assert.ok(bridge.includes("store.get('editor.view')") && bridge.includes('storedBelongsHere'),
+      'bibliography sync shape-checks the shared editor view and binds it to the visible source editor')
+    assert.ok(bridge.includes("openState === 'match'") && bridge.includes("openState === 'unavailable'"),
+      'bibliography document identity prefers open_doc_id and uses exact event/tree evidence only when the store is absent')
+    assert.ok(!bridge.includes('selectedStable') && !bridge.includes('editorChanged'),
+      'elapsed time or an editor object change can never authorize a whole-document replacement')
+    assert.ok(!bridge.includes('selectedEditorTabHasId'),
+      'editor tabs are optional UI and cannot block bibliography document identity checks')
+    assert.ok(bridge.includes('openDeadline') && bridge.includes('editorDeadline'),
+      'document opening and editor mounting receive independent timeout budgets')
+    assert.ok(bridge.includes('bib-write-verification-failed') && bridge.includes('dsh-overleaf:bib-snapshot:'),
+      'bibliography replacement verifies its write and stores a document-scoped rollback snapshot')
+    assert.ok(bridge.includes("data.type === 'tex-document-request'") && bridge.includes("type: 'tex-document'"),
+      'bridge exposes a complete current .tex document snapshot protocol')
+    assert.ok(bridge.includes("data.type === 'sync-tex-to-overleaf'") && bridge.includes("type: 'tex-overleaf-sync-done'"),
+      'bridge exposes explicit local/manual content synchronization into the current .tex document')
+    assert.ok(bridge.includes('expectedRevision') && bridge.includes("throw new Error('tex-remote-changed')"),
+      'reverse .tex sync rejects a switched or concurrently edited Overleaf document')
+    assert.ok(bridge.includes('texSyncBusyRequestId') && bridge.includes('requestId: requestId'),
+      'reverse .tex sync is single-flight and every result is correlated to its request')
+    assert.ok(bridge.includes('dsh-overleaf:tex-snapshot:') && bridge.includes("listenForBibEvent('doc:saved', identity.id"),
+      'reverse .tex sync snapshots, verifies, and waits for exact save confirmation')
     assert.ok(bridge.includes('replacementTargetStillMatches') && bridge.includes('selectionEditorIsAttached'),
       'delayed replacement validates source text, context, and editor identity')
+    assert.ok(bridge.includes('!force && !replacementTargetStillMatches') && bridge.includes('data.force === true'),
+      'selection drift checks can be explicitly bypassed without bypassing editor attachment checks')
+    assert.ok(bridge.includes('savedSelectionTargets[id]') && bridge.includes('savedSelectionOrder.length > 12'),
+      'a bounded history retains the original anchor after the user selects different text')
+    assert.ok(bridge.includes('!force && (!savedSelection || savedSelection.id !== id)'),
+      'safe mode still rejects replacement after the active selection changes')
+    assert.ok(bridge.includes('bounded history entry for explicit force mode') && bridge.includes('savedSelection = undefined'),
+      'clearing the active editor selection invalidates safe mode without deleting the force anchor')
+    assert.ok(bridge.includes('forced: force === true') && bridge.includes('Math.min(Math.max(0, target.from), doc5.length)'),
+      'forced replacement is reported and clamps stale offsets to the current document')
     // Compile-fix source contract: the bridge watches compile POSTs and
     // output.pdf loads, fetches the build's output logs, and exposes the
     // document + validated replace commands to the shell.
     assert.ok(bridge.includes("type: 'compile-log'") && bridge.includes('captureCompileResponse'),
       'compile responses are watched for output.log/.blg capture')
+    assert.ok(bridge.includes('captureObservedLogResponse') && bridge.includes('isCachedCompileResponse'),
+      'native and cached output.log loads are captured, not only fresh compile POSTs')
+    assert.ok(bridge.includes('entry && entry.build && pdfDomain') && bridge.includes("params.set('editorId'"),
+      'log URL construction matches Overleaf build-domain and authorization rules')
+    assert.ok(bridge.includes('logFetchInFlight[flightKey]') && !bridge.includes('if (logFetchInFlight) return'),
+      'output.log and blg files are independently fetched instead of globally serialized')
+    assert.ok(bridge.includes("if (/\\/download\\/project\\//.test(parsed.pathname)) return"),
+      'PDF download-controller URLs are not mis-derived into nonexistent log URLs')
     assert.ok(bridge.includes("data.type === 'document-request'") && bridge.includes('readDocValue()'),
       'shell can request the current editor document')
     assert.ok(bridge.includes("data.type === 'apply-fix-edits'") && bridge.includes('buildFixSteps'),
@@ -343,41 +465,64 @@ async function main() {
   }
 
   // 1. Mount against a fake context and confirm every route family lands.
-  const { ctx, routes, upgrades, credentialsStore } = fakeCtx()
-  // Attach a stub settings service so the namespace-registration branch runs:
-  // its watcher must hot-swap the proxy target when the user doc changes.
-  let registeredNs
-  let registeredBase
-  let watcherFn
-  const mutableDoc = {}
-  ctx.settings = {
-    register: (ns, schema, options) => {
-      registeredNs = ns
-      registeredBase = options?.base ?? {}
-      return {
-        get: () => resolvedFromSchema(schema, mutableDoc),
-        watch(listener) {
-          watcherFn = () => listener(resolvedFromSchema(schema, mutableDoc), undefined)
-          return () => {}
-        },
-      }
+  const { ctx, routes, upgrades, credentialsStore, sessionsStore } = fakeCtx()
+  // DSH 0.1.7+ settings integration: the harness owns the form and the
+  // transport form, so the plugin only (a) declares its own page policy via
+  // settings.configure and (b) samples the live (volatile) config references
+  // after `loader/volatile-update`. baseUrl arrives as a live reference here,
+  // which exercises the hot-swap path asserted further down.
+  const liveDoc = { baseUrl: 'https://www.overleaf.com' }
+  let policyAuto
+  let policyOwner
+  const volatileListeners = []
+  ctx.provide('settings', {
+    configure: (presentation, owner) => {
+      policyAuto = presentation?.auto
+      policyOwner = owner
+      return () => {}
     },
+  })
+  const baseOn = ctx.on.bind(ctx)
+  ctx.on = (name, listener, ...rest) => {
+    if (name === 'loader/volatile-update') volatileListeners.push(listener)
+    return baseOn(name, listener, ...rest)
   }
-  function resolvedFromSchema(_schema, overlay) {
-    // Minimal resolution: the plugin re-applies schema defaults via
-    // resolveConfig, so a transparent pass-through of the user overlay is
-    // enough here.
-    return { ...overlay }
+  const liveConfig = {
+    baseUrl: { get: () => liveDoc.baseUrl },
+    browserChannel: 'auto',
+    selectionQuoteEnabled: true,
+    cursorInsertEnabled: true,
+    injectScriptEnabled: true,
+    assistPanelEnabled: true,
   }
-  const service = new ServiceClass(ctx, { baseUrl: '' }) // blank baseUrl exercises normalizeOrigin fallback? keep default branch
+  const service = new ServiceClass(ctx, liveConfig)
   const paths = routes.map(r => r.path)
   assert.ok(paths.includes('/overleaf-proxy'), 'proxy prefix route registered')
   assert.ok(paths.includes('/overleaf/workbench/status'), 'status route')
   assert.ok(paths.includes('/overleaf/workbench/login'), 'login route')
   assert.ok(paths.includes('/overleaf/workbench/cookie'), 'cookie route')
   assert.ok(paths.includes('/overleaf/workbench/projects'), 'projects route')
+  assert.ok(paths.includes('/overleaf/workbench/bib-files'), 'local bibliography discovery route')
+  assert.ok(paths.includes('/overleaf/workbench/read-bib-file'), 'bounded local bibliography read route')
+  assert.ok(paths.includes('/overleaf/workbench/tex-files'), 'local LaTeX discovery route')
+  assert.ok(paths.includes('/overleaf/workbench/read-tex-file'), 'bounded local LaTeX read route')
+  assert.ok(paths.includes('/overleaf/workbench/write-tex-file'), 'verified local LaTeX write route')
   assert.ok(paths.includes('/overleaf/workbench/bridge.js'), 'bridge asset route')
   assert.ok(upgrades.some(u => u.path === '/overleaf-proxy/socket.io/'), 'socket.io upgrade tunnel')
+
+  // Bibliography routes derive cwd from trusted server-side session metadata.
+  sessionsStore.set('fixture-session', {
+    header: { cwd: join(root, 'scripts', 'fixtures', 'bib-workspace') },
+  })
+  const bibListRoute = routes.find(r => r.path === '/overleaf/workbench/bib-files')
+  const bibListResponse = new MockResponse()
+  await bibListRoute.handler(mockRequest({ method: 'POST', body: {
+    sessionId: 'fixture-session', cwd: join(root, 'scripts', 'fixtures', 'bib-outside'),
+  } }), bibListResponse)
+  const bibListEnvelope = JSON.parse(bibListResponse.body.join(''))
+  assert.equal(bibListEnvelope.ok, true)
+  assert.ok(bibListEnvelope.value.files.every(path => path.includes(`${join('fixtures', 'bib-workspace')}`)),
+    'client-provided cwd is ignored in favor of the session workspace')
 
   // 2. Drive one JSON route end-to-end.
   const statusRoute = routes.find(r => r.path === '/overleaf/workbench/status')
@@ -435,16 +580,20 @@ async function main() {
   ).catch(() => {}) // empty body -> JSON.parse fails -> envelope error
   assert.equal(resBad.statusCode, 500)
 
-  // 5. Settings namespace registered + hot swap of the proxy target.
-  assert.equal(registeredNs, 'dsh-overleaf', 'settings namespace name')
-  assert.equal(typeof watcherFn, 'function', 'watcher attached')
-  mutableDoc.baseUrl = `http://127.0.0.1:${upstreamPort}`
-  watcherFn()
+  // 5. Settings integration (DSH 0.1.7+): the plugin declares its own page
+  //    policy — the harness skips an entry whose schema has no volatile field,
+  //    so the schema marks every field volatile — and applies live commits by
+  //    re-sampling the same config container when volatile-update fires.
+  assert.equal(policyAuto, false, 'plugin declares its own settings page (auto: false)')
+  assert.ok(policyOwner !== undefined, 'page policy is keyed to the plugin fiber')
+  assert.equal(volatileListeners.length > 0, true, 'volatile-update listener attached on mount')
+  liveDoc.baseUrl = `http://127.0.0.1:${upstreamPort}`
+  for (const listener of volatileListeners) listener([['baseUrl']])
   const statusRoute2 = routes.find(r => r.path === '/overleaf/workbench/status')
   const resHot = new MockResponse()
   await statusRoute2.handler(mockRequest({ method: 'POST' }), resHot)
   assert.equal(JSON.parse(resHot.body.join('')).value.baseUrl, `http://127.0.0.1:${upstreamPort}`,
-    'watch commit hot-swapped baseUrl without restart')
+    'volatile commit hot-swapped baseUrl without restart')
 
   // logout clears whatever was stored.
   await ctx.credentials.set('OVERLEAF_WORKBENCH_COOKIE', 'x=1')
@@ -485,6 +634,25 @@ async function main() {
     'assist panel exposes separate ask and modify actions for editor selections')
   assert.ok(viewSource.includes('setSelectionDraft(clean)') && viewSource.includes("type: 'replace-selection'"),
     'selection revision is reviewed before an explicit anchored replacement')
+  assert.ok(viewSource.includes('checked={selectionSafetyEnabled}') && viewSource.includes('force: !selectionSafetyEnabled'),
+    'selection panel keeps drift protection enabled by default and offers explicit force mode')
+  assert.ok(viewSource.includes("tt('selection.forceWarning')") && viewSource.includes("tt('selection.replacedForced')"),
+    'force mode carries a visible warning and distinct completion feedback')
+  assert.equal((viewSource.match(/renderBibUpdater\('dso-bib-path-/g) ?? []).length, 2,
+    'cursor-insert and selection-AI panels both render the bibliography updater')
+  assert.ok(viewSource.includes("'/overleaf/workbench/bib-files', { sessionId }")
+    && viewSource.includes("type: 'sync-bib'"),
+  'the client discovers through trusted session identity and sends the chosen content to the bridge')
+  assert.ok(viewSource.includes("panelTab === 'status'") && viewSource.includes('{renderTexSync()}'),
+    'the status panel renders the bidirectional current .tex synchronization controls')
+  assert.ok(viewSource.includes("useState<TexSyncDirection>('overleaf-to-local')")
+    && viewSource.includes("tt('tex.reverseWarning')") && viewSource.includes('checked={texReverseConfirmed}'),
+  'Overleaf-to-local is the default and reverse whole-document replacement has a visible confirmation gate')
+  assert.ok(viewSource.includes("type: 'tex-document-request'") && viewSource.includes("type: 'sync-tex-to-overleaf'"),
+    'the client uses correlated complete-document and reverse-sync bridge operations')
+  assert.ok(viewSource.includes("'/overleaf/workbench/tex-files'")
+    && viewSource.includes("'/overleaf/workbench/write-tex-file'"),
+  'the client discovers workspace .tex files and writes through the session-bound host route')
   assert.ok(viewSource.includes("panelTab === 'compile'") && viewSource.includes("panel.tabCompile"),
     'assist panel exposes the compile-fix tab')
   assert.ok(viewSource.includes('buildFixCompilePrompt') && viewSource.includes("sendToFrame({ type: 'apply-fix-edits'"),
@@ -581,6 +749,25 @@ async function main() {
       'error item carries the l.NN line number')
     assert.ok(parsedLog.items.some(item => item.level === 'error' && item.file === './main.tex' && item.line === '12'),
       'file:line: message shape parsed as an error')
+
+    const repeatedAndBibLog = [
+      '! Missing $ inserted.',
+      'l.111 some_text',
+      '! Missing $ inserted.',
+      'l.112 other_text',
+      'LaTeX3 Warning: A LaTeX3 warning.',
+      'Warning--I did not find a database entry for "missing"',
+      '[2] Utils.pm:399> WARN - Duplicate entry key: duplicate',
+      '[3] Utils.pm:399> ERROR - Cannot find refs.bib',
+      'Runaway argument?',
+    ].join('\n')
+    const repeatedParsed = exportsObject.parseCompileLog(repeatedAndBibLog)
+    assert.equal(repeatedParsed.items.filter(item => item.message === 'Missing $ inserted.').length, 2,
+      'identical errors at distinct source lines remain distinct')
+    assert.ok(repeatedParsed.items.some(item => item.line === '111') && repeatedParsed.items.some(item => item.line === '112'),
+      'l.N diagnostics retain pure numeric source lines')
+    assert.ok(repeatedParsed.warnings >= 3, `BibTeX/Biber/LaTeX3 warnings are parsed: ${repeatedParsed.warnings}`)
+    assert.ok(repeatedParsed.errors >= 4, `Biber and runaway errors are parsed: ${repeatedParsed.errors}`)
 
     const fixPayload = [
       exportsObject.FIX_EDIT_START,

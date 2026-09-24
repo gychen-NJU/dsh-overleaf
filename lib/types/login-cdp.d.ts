@@ -21,6 +21,8 @@ export interface LoginOptions {
     timeoutMs: number;
     profileMode?: LoginProfileMode | undefined;
 }
+/** Match the cookie's actual host scope, not arbitrary child hosts. */
+export declare function cookieDomainMatchesHost(domain: string, host: string): boolean;
 /**
  * Run the CDP login flow. Returns automatic when cookies were captured,
  * otherwise opens the default browser and returns manual-paste instructions.

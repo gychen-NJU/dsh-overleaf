@@ -42,6 +42,11 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 - **`[ selection-ai ]`**——在编辑器中选中文字，让智能体解释或改写，审阅替换内容后替换原选区；原文/选区漂移保护默认开启，也可取消勾选后按保存的原锚点位置强制替换（切换文件仍会拒绝）。
 - **`[ compile-fix ]`**——Recompile 后读取编译日志中的错误与警告，让智能体针对当前打开的文档提出自动修复。
 - **本地 `.bib` 同步**——`ai-insert` 与 `selection-ai` 面板都提供“更新 Overleaf .bib”：默认递归检测当前 DSH 工作区中的 `.bib`，也可填写工作区内的绝对/相对路径；点击后按同名文件更新 Overleaf，并等待自动保存确认。
+
+  v0.3.20 同时兼容 overleaf.com 和 tex.nju.edu.cn（TeXPage）。Overleaf 保留原有文档 ID / 保存事件校验；TeXPage 独立适配文件树、CM6 编辑器和服务器文件回读。两个站点都仅更新唯一同名 `.bib`，写前保留快照。TeXPage 请启用底部状态栏（用于核对当前文件路径），并等待其他修改保存完成。更新后自行重启 DSH、刷新内嵌项目；无需清理 Cookie。若提示“已写入但保存未确认”，先检查页面保存状态，不要立即重复覆盖。
+
+  v0.3.21 为 TeXPage 临时网络/服务端繁忙增加一次只读重试，共用原有超时上限，不会重复执行写入。失败提示显示文件树、写入前读取或写入后保存确认阶段，以及可用的 HTTP 状态/安全错误类别；不要仅凭“读取失败”判断登录失效。权限拒绝、错误文件路径及无效内容不重试。
+  v0.3.22 为 TeXPage 增加当前 `.tex` 双向同步适配：以文件树完整路径、底部当前文件路径、加载状态、唯一 CM6 编辑器和文件树 API 的 `fileKey` 共同确认身份。反向同步通过独立服务器回读确认保存；overleaf.com 仍使用原来的文档 ID、版本和 `doc:saved` 校验。
 - **当前 `.tex` 双向同步**——辅助面板“状态”页默认把当前 Overleaf 源码同步到工作区：递归检测本地 `.tex`，没有候选时在工作区根目录新建同名文件；也可选择本地路径。切换为“本地 → Overleaf”后，可读取本地文件或使用手动粘贴的完整 LaTeX 内容，但必须先确认整篇覆盖警告，并通过文档 ID、内容版本、修改前快照和保存事件校验。
 
 ## 为什么需要它
@@ -53,7 +58,7 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 | 需求 | 实现状态 |
 |---|---|
 | R1 · 会话页第 4 个选项 | `conversation.view` 条目 `id:"overleaf"`、`order:30`；官方 tab 条可见时即可见（tabs >= 2） |
-| R2 · 可配置地址 | 设置页（设置 > 插件 > 插件配置 > dsh-overleaf）修改 `baseUrl`；保存后热切换代理目标，无需重启 |
+| R2 · 可配置地址 | 设置页（DSH 0.1.7+：设置侧栏的「Overleaf 工作台设置」页，或侧边栏「插件」→ 已安装 → dsh-overleaf；旧版：设置 > 插件 > 插件配置）修改 `baseUrl`；保存后热切换代理目标，无需重启 |
 | R3 · 原站功能可用 | 流式反向代理保留路径与查询串；响应除取景限制头外透传；小幅 HTML 正文做链接/资源重定基并注入桥接脚本 |
 | R4 · 底部原生输入框 | 视图只替换消息区域；composer、工作区记录、交付物一概不动 |
 | R5 · 选区引用 | iframe 内 `selectionchange` 浮出引用按钮；点击经官方引用管线写入 chip（`inputTriggers.registerSource({name:'quote-ref'})` codec），管线缺失时退化为纯文本块引用 |
@@ -90,7 +95,7 @@ dsh --profile web web        # 用你平时的方式启动即可
 dsh --profile web --dump-config   # 应看到 "# == dsh-overleaf" 配置块
 ```
 
-默认上游为 `https://www.overleaf.com`。要接入其它实例（自托管 Overleaf、`tex.nju.edu.cn` 等），打开 设置 > 插件 > 插件配置 > dsh-overleaf，修改 `baseUrl` 并保存——代理目标即刻热切换，无需重启。
+默认上游为 `https://www.overleaf.com`。要接入其它实例（自托管 Overleaf、`tex.nju.edu.cn` 等），打开设置侧栏的「Overleaf 工作台设置」页（DSH 0.1.7+；也可从侧边栏「插件」→ 已安装 → dsh-overleaf 进入；旧版为 设置 > 插件 > 插件配置 > dsh-overleaf），修改 `baseUrl` 并保存——代理目标即刻热切换，无需重启。
 
 随时可以干净卸载：
 
@@ -156,8 +161,16 @@ scripts/
 
 两条路径共用同一凭据库：
 
-- **直连 CDP 抓取（推荐）**：插件用你选择的 Chromium 系浏览器（`auto` 自动发现默认浏览器与已装 Chromium；可指定渠道或路径）以独立配置目录（`~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`）加预留 loopback 调试端口启动。登录一次并保持窗口打开；插件轮询 `Storage.getCookies` / `Network.getAllCookies`，直到 (1) 配置主机名下出现至少一个非偏好类 Cookie，(2) 有页面停留在该站点且不在登录/SSO 页，(3) 组装出的 Cookie 头通过宽容的服务端校验。因此它同时兼容标准 Overleaf 与 TeXPage 系部署（如 `tex.nju.edu.cn`，其会话 Cookie 名完全不同）。提前关闭登录窗口会立即中止抓取——此时改用粘贴 Cookie。登录请求立即返回、视图轮询进度，工具栏不会卡死。
-- **手动粘贴**：DevTools 复制整行 Cookie 经工具栏对话框粘贴入库；保存前以 redirect-manual GET 校验 `<baseUrl>/project`。
+- **直连 CDP 抓取（推荐）**：插件用你选择的 Chromium 系浏览器（`auto` 自动发现默认浏览器与已装 Chromium；可指定渠道或路径）以独立配置目录（`~/.dsh/plugin-data/dsh-overleaf-workbench/browser-profile`）加预留 loopback 调试端口启动。登录一次并保持窗口打开；插件轮询站点作用域内的 Cookie 和登录落地页，只有落地页返回 200、非登录表单，且同一地址匿名访问被拒绝或要求登录时，才保存凭据。支持 `SESSIONID`、`overleaf_session2` 等会话名称。提前关闭窗口会中止抓取；登录请求立即返回，视图轮询进度。
+- **手动粘贴**：从 DevTools > Network > 当前站点请求 > Request Headers 复制完整 Cookie 行，经工具栏对话框粘贴；保存前执行同样的受保护页面校验。默认检查 `/project`，该路由不存在时改由站点首页跟随同源跳转；404 本身不算登录成功。
+
+内嵌页和“弹出窗口”均从站点首页进入，不再固定拼接 `/project`；例如 `tex.nju.edu.cn` 的 TeXPage 登录后首页会跳转 `/console`。登录成功后自动刷新内嵌页，修改 `base_url` 后返回当前站点首页，同一站点内切换 DSH 标签则保留打开的项目。共享本地代理地址下可能保留不同站点的 Cookie，两个会话 Cookie 名称同时出现不代表冲突。
+
+TeXPage 控制台还需要适配其固定的前端路由前缀：v0.3.17 起仅对指定公共 CDN 的 `console.<hash>.js` 做凭据隔离的代理和 basename 改写，并正确处理省略本地端口的协议相对 API 地址。已验证控制台和项目列表显示；这不等同于全面支持 TeXPage 的所有编辑器/编译接口。升级后需重启 DSH 后台并刷新页面。
+
+v0.3.18 增加 TeXPage 独立 Socket.IO 子域支持：从上游页面的 JSON 配置识别严格同站点的 `socket.<站点主机名>`，经本地通道使用上游 HTTPS/WSS 和页面 Origin 连接，携带该站点会话，不把它误发到网页主域或直接降级为公网 WS。只支持指定实时连接/心跳路径，未知域名和路径拒绝转发。已实际验证项目文件正文加载；编译和编辑写入仍需各自验收。
+
+v0.3.19 为 TeXPage 返回的签名编译 PDF 及其同目录 `output.log`/`output.blg` 增加隔离的同源下载通道：只允许页面配置声明的固定 `latex-file.texpageusercontent.com` 文件域及指定编译产物路径。完整保留签名查询参数和 Range/206/416 分段语义，流式传输 PDF，不做文本改写，日志仅作为纯文本返回；不会把站点 Cookie、Authorization 或 Referer 转发给文件域，也不开放任意外域。升级后请自行重启 DSH 并刷新内嵌页，以同时载入新代理和桥接；不需要清空登录 Cookie 或关闭浏览器安全限制。
 
 国内网络登录 www.overleaf.com 时，反向代理内嵌页面可能被 Google reCAPTCHA 阻塞（见下方 CAPTCHA 说明），此时推荐使用复制 Cookie 的方式登录：
 
@@ -172,7 +185,7 @@ scripts/
 Overleaf 登录使用 Google reCAPTCHA（资源在 google.com / gstatic.com）。两个后果：
 
 - **内嵌页面永远无法完成登录**——reCAPTCHA 站点密钥锁死 www.overleaf.com 域名，在回环代理源下必然失败。内嵌页出现登录表单时视图会给出提示，引导改用弹窗/粘贴 Cookie。
-- **CDP 弹窗需要能直连 Google**。国内网络请在 设置 > 插件 > 插件配置 > dsh-overleaf 里把 `loginProxyServer` 设为代理客户端 HTTP 端口（Clash 典型为 `http://127.0.0.1:7890`，纯端口号亦可），登录浏览器会以 `--proxy-server` 启动；留空则用系统默认。不可达时就会看到 "captcha not available"。
+- **CDP 弹窗需要能直连 Google**。国内网络请在「Overleaf 工作台设置」页（设置侧栏；DSH 0.1.7+）里把 `loginProxyServer` 设为代理客户端 HTTP 端口（Clash 典型为 `http://127.0.0.1:7890`，纯端口号亦可），登录浏览器会以 `--proxy-server` 启动；留空则用系统默认。不可达时就会看到 "captcha not available"。
 
 Cookie 值从不进入插件 config、路由返回值、日志或客户端存储。
 

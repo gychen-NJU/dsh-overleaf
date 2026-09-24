@@ -65,6 +65,22 @@ async function main() {
   let upgradesSeen = 0
   const fixturePdf = Buffer.from('%PDF-1.7\nfixture-pdf-body\n%%EOF')
   const upstream = http.createServer((req, res) => {
+    // TeXPage/NJU: /project is absent; the authenticated root chooses /console.
+    if (req.url === '/') {
+      res.writeHead(302, { location: '/console' })
+      res.end()
+      return
+    }
+    if (req.url === '/project') {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('Not Found')
+      return
+    }
+    if (req.url === '/console') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end('<html><head><title>TeXPage fixture</title></head><body>console</body></html>')
+      return
+    }
     if (req.url === '/big.bin') {
       res.writeHead(200, { 'content-type': 'application/octet-stream' })
       res.end(Buffer.from([0, 1, 2, 3, 250, 251]))
@@ -193,6 +209,14 @@ async function main() {
     }
   }
   new CredsStubService(ctxB)
+  const SessionsStubService = class extends Service {
+    static inject = []
+    constructor(innerCtx) {
+      super(innerCtx, 'sessions')
+    }
+    get() { return undefined }
+  }
+  new SessionsStubService(ctxB)
 
   // Discover and invoke the [Service.init] symbol exactly as the loader would.
   const proto = Object.getPrototypeOf(serverB)
@@ -217,6 +241,17 @@ async function main() {
 
   /* ---------------------- exercise everything ------------------------ */
 
+  const homeRes = await fetch(`${base}/overleaf-proxy/`, { redirect: 'manual' })
+  assert.equal(homeRes.status, 302)
+  assert.equal(homeRes.headers.get('location'), '/overleaf-proxy/console')
+  await homeRes.body?.cancel()
+  const dashboardRes = await fetch(`${base}${homeRes.headers.get('location')}`)
+  assert.equal(dashboardRes.status, 200)
+  assert.ok((await dashboardRes.text()).includes('TeXPage fixture'))
+  const absentProjectRes = await fetch(`${base}/overleaf-proxy/project`)
+  assert.equal(absentProjectRes.status, 404, 'proxy must not silently rewrite project APIs')
+  await absentProjectRes.body?.cancel()
+
   // 1+2. HTML rebase, bridge injection, XFO removal, cookie scoping.
   const htmlRes = await fetch(`${base}/overleaf-proxy/project/demo`, {
     headers: { cookie: 'overleaf_session2=conflicting-browser-value; gclb=affinity' },
@@ -233,7 +268,9 @@ async function main() {
   // 7. siteUrl rebasing: the app's own origin string must become the proxy
   // prefix so SPA-built links never escape to the real site.
   assert.ok(htmlBody.includes('window.siteUrl = "/overleaf-proxy"'), `siteUrl rebased:\n${htmlBody.slice(0, 400)}`)
-  assert.ok(!htmlBody.includes(`http://127.0.0.1:${upstreamPort}`), 'target origin string fully scrubbed from HTML')
+  const upstreamBootstrap = `window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__="http://127.0.0.1:${upstreamPort}";`
+  assert.ok(htmlBody.includes(upstreamBootstrap), 'bridge receives the real protocol/origin for protocol-relative APIs')
+  assert.ok(!htmlBody.replace(upstreamBootstrap, '').includes(`http://127.0.0.1:${upstreamPort}`), 'upstream references are rebased except the explicit bridge routing metadata')
   const cookieHeaders = htmlRes.headers.getSetCookie?.() ?? []
   assert.equal(cookieHeaders.length, 1, `set-cookie passthrough (${cookieHeaders.join(' | ')})`)
   assert.ok(!cookieHeaders[0].includes('Domain='), 'domain attr stripped')

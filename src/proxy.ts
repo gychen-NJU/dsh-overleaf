@@ -18,6 +18,11 @@ import net from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
+import { rewriteTexpageScriptTags, serveTexpageConsoleAsset, texpageAssetUrl } from './texpage-compat.ts'
+import { extractTexpageSocketOrigin, resolveTexpageSocketTarget, SOCKET_PROXY_PATH } from './texpage-socket.ts'
+import { extractTexpageOutputOrigin, resolveTexpageOutputTarget, serveTexpageOutput, OUTPUT_PROXY_PATH } from './texpage-output.ts'
+import { BIB_PROXY_PATH, resolveTexpageBibTarget, serveTexpageBib } from './texpage-bib-proxy.ts'
+import { TEX_PROXY_PATH, resolveTexpageTexTarget, serveTexpageTex } from './texpage-tex-proxy.ts'
 
 /** Prefix under which the upstream site is exposed (disjoint from other plugins). */
 export const PROXY_PREFIX = '/overleaf-proxy'
@@ -151,12 +156,18 @@ export function rewriteHtml(
   }
   if (injectScriptSrc !== undefined && !html.includes('dsh-overleaf-bridge')) {
     const nonceAttr = cspNonce !== undefined && cspNonce !== '' ? ` nonce="${cspNonce}"` : ''
+    const socketOrigin = targetOrigin !== undefined ? extractTexpageSocketOrigin(html, targetOrigin) : undefined
+    const outputOrigin = targetOrigin !== undefined ? extractTexpageOutputOrigin(html, targetOrigin) : undefined
     // Bootstrap FIRST: the WS tunnel port the bridge wrappers redirect
     // socket.io connections to (the webserver's upgrade registry is
     // exact-path only and cannot handle socket.io's dynamic paths).
-    const bootstrap = wsPort > 0
-      ? `<script${nonceAttr}>window.__DSH_OVERLEAF_WS_PORT__=${wsPort};</script>\n`
-      : ''
+    const bootstrapValues = [
+      ...(wsPort > 0 ? [`window.__DSH_OVERLEAF_WS_PORT__=${wsPort};`] : []),
+      ...(targetOrigin !== undefined ? [`window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__=${JSON.stringify(targetOrigin)};`] : []),
+      ...(socketOrigin !== undefined ? [`window.__DSH_OVERLEAF_SOCKET_ORIGIN__=${JSON.stringify(socketOrigin.origin)};`] : []),
+      ...(outputOrigin !== undefined ? [`window.__DSH_OVERLEAF_TEXPAGE_OUTPUT_ORIGIN__=${JSON.stringify(outputOrigin.origin)};`] : []),
+    ].join('')
+    const bootstrap = bootstrapValues !== '' ? `<script${nonceAttr}>${bootstrapValues}</script>\n` : ''
     const tag = `${bootstrap}<script src="${injectScriptSrc}"${nonceAttr} data-dsh-overleaf-bridge></script>`
     if (/<head[^>]*>/i.test(out)) {
       out = out.replace(/<head[^>]*>/i, match => `${match}\n${tag}\n`)
@@ -166,7 +177,7 @@ export function rewriteHtml(
       out = `${tag}\n${out}`
     }
   }
-  return out
+  return rewriteTexpageScriptTags(out, prefix)
 }
 
 /**
@@ -537,6 +548,22 @@ export class ReverseProxy {
   /** User-content output-file origin learned from the site's own hints. */
   private contentRule: ContentOriginRule | undefined = undefined
 
+  /** Only a validated same-site socket host announced by upstream HTML. */
+  private socketOrigin: URL | undefined = undefined
+
+  /** Fixed, credential-free PDF host announced by a validated TeXPage shell. */
+  private texpageOutputOrigin: URL | undefined = undefined
+
+  learnTexpageOutput(html: string): void {
+    const origin = extractTexpageOutputOrigin(html, this.target.origin)
+    if (origin !== undefined) this.texpageOutputOrigin = origin
+  }
+
+  learnTexpageSocket(html: string): void {
+    const origin = extractTexpageSocketOrigin(html, this.target.origin)
+    if (origin !== undefined) this.socketOrigin = origin
+  }
+
   /**
    * Register a user-content origin hint (e.g. `https://compiles
    * .overleafusercontent.com/zone/c`). The hint with the most specific path
@@ -561,12 +588,22 @@ export class ReverseProxy {
    * Upstream target for one matched sub-path: the locked main origin, or the
    * learned user-content origin when the path belongs to its zone.
    */
-  private targetFor(subPath: string): URL {
+  private targetFor(subPath: string, allowContent = true): URL {
+    // This marker must never fall through to the credential-bearing site or
+    // WebSocket tunnel. Its separate GET/HEAD handler owns all PDF traffic.
+    if (subPath.startsWith(OUTPUT_PROXY_PATH) || subPath.startsWith(BIB_PROXY_PATH) || subPath.startsWith(TEX_PROXY_PATH)) throw new Error('dsh-overleaf: content target requires isolated handler')
+    if (subPath.startsWith(SOCKET_PROXY_PATH)) {
+      const socketTarget = resolveTexpageSocketTarget(subPath, this.socketOrigin)
+      if (socketTarget === undefined) throw new Error('dsh-overleaf: unregistered or invalid socket target')
+      return socketTarget
+    }
     const rule = this.contentRule
-    if (rule !== undefined && contentPathMatches(subPath, rule)) {
+    if (allowContent && rule !== undefined && contentPathMatches(subPath, rule)) {
       return new URL(subPath, rule.origin)
     }
-    return new URL(subPath, this.target)
+    const target = new URL(subPath, this.target)
+    if (target.origin !== this.target.origin) throw new Error('dsh-overleaf: external proxy path refused')
+    return target
   }
 
   /** Whether the given raw request URL belongs to this proxy. */
@@ -578,8 +615,49 @@ export class ReverseProxy {
   /** Handle one matched proxied HTTP request end-to-end. */
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const subPath = subPathOf(req.url, PROXY_PREFIX)
-    const target = this.targetFor(subPath)
+    if (subPath.startsWith(TEX_PROXY_PATH)) {
+      const texTarget = resolveTexpageTexTarget(subPath, this.target, this.texpageOutputOrigin)
+      if (texTarget === undefined) {
+        res.writeHead(400, { 'content-type': 'text/plain', 'cache-control': 'no-store' })
+        res.end('dsh-overleaf: unregistered or invalid TeX target')
+        return
+      }
+      await serveTexpageTex(req, res, texTarget, buildUpstreamHeaders(req, texTarget.download, this.extraCookie))
+      return
+    }
+    if (subPath.startsWith(BIB_PROXY_PATH)) {
+      const bibTarget = resolveTexpageBibTarget(subPath, this.target, this.texpageOutputOrigin)
+      if (bibTarget === undefined) {
+        res.writeHead(400, { 'content-type': 'text/plain', 'cache-control': 'no-store' })
+        res.end('dsh-overleaf: unregistered or invalid bibliography target')
+        return
+      }
+      await serveTexpageBib(req, res, bibTarget, buildUpstreamHeaders(req, bibTarget.download, this.extraCookie))
+      return
+    }
+    if (subPath.startsWith(OUTPUT_PROXY_PATH)) {
+      const outputTarget = resolveTexpageOutputTarget(subPath, this.texpageOutputOrigin)
+      if (outputTarget === undefined) {
+        res.writeHead(400, { 'content-type': 'text/plain', 'cache-control': 'no-store' })
+        res.end('dsh-overleaf: unregistered or invalid PDF target')
+        return
+      }
+      await serveTexpageOutput(req, res, outputTarget)
+      return
+    }
+    const publicAsset = texpageAssetUrl(subPath)
+    if (publicAsset !== undefined) {
+      await serveTexpageConsoleAsset(req, res, publicAsset, PROXY_PREFIX)
+      return
+    }
+    let target: URL
+    try { target = this.targetFor(subPath) } catch {
+      res.writeHead(400, { 'content-type': 'text/plain' })
+      res.end('dsh-overleaf: invalid proxy target')
+      return
+    }
     const upstreamHeaders = buildUpstreamHeaders(req, target, this.extraCookie)
+    if (subPath.startsWith(SOCKET_PROXY_PATH)) upstreamHeaders['origin'] = this.target.origin
     await new Promise<void>((resolveProxy) => {
       let settled = false
       const settle = (): void => {
@@ -597,7 +675,13 @@ export class ReverseProxy {
           timeout: requestTimeoutFor(target),
         }, upstreamRes => {
           void deliverResponse(res, upstreamRes, target, this.injectScriptSrc, this.wsAllowOrigin, this.wsPort,
-            hint => { this.learnContentHint(hint) }, settle)
+            hint => { this.learnContentHint(hint) },
+            html => {
+              if (target.origin === this.target.origin) {
+                this.learnTexpageSocket(html)
+                this.learnTexpageOutput(html)
+              }
+            }, settle)
         })
       } catch (error) {
         respondBadGateway(res, error)
@@ -624,8 +708,11 @@ export class ReverseProxy {
    */
   tunnelUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     const subPath = subPathOf(req.url, PROXY_PREFIX)
-    const isTls = this.target.protocol === 'https:'
-    const port = Number(this.target.port) || (isTls ? 443 : 80)
+    let target: URL
+    try { target = this.targetFor(subPath, false) } catch { socket.destroy(); return }
+    if (subPath.startsWith(SOCKET_PROXY_PATH) && !/^\/socket\.io\/?$/.test(target.pathname)) { socket.destroy(); return }
+    const isTls = target.protocol === 'https:'
+    const port = Number(target.port) || (isTls ? 443 : 80)
 
     let upstreamSocket!: Duplex
     const destroyBoth = (): void => {
@@ -635,7 +722,9 @@ export class ReverseProxy {
 
     const connectCallback = (): void => {
       try {
-        writeUpgradeRequest(req, subPath, this.target, this.extraCookie, upstreamSocket, head)
+        // This is a connection-establishment timeout, not a heartbeat timeout.
+        ;(upstreamSocket as typeof upstreamSocket & { setTimeout(ms: number): unknown }).setTimeout(0)
+        writeUpgradeRequest(req, target.pathname + target.search, target, this.extraCookie, upstreamSocket, head, this.target.origin)
         spliceSockets(socket, upstreamSocket, destroyBoth)
       } catch {
         destroyBoth()
@@ -643,8 +732,8 @@ export class ReverseProxy {
     }
 
     upstreamSocket = isTls
-      ? tlsConnect({ host: this.target.hostname, port, servername: this.target.hostname }, connectCallback)
-      : net.connect({ host: this.target.hostname, port }, connectCallback)
+      ? tlsConnect({ host: target.hostname, port, servername: target.hostname }, connectCallback)
+      : net.connect({ host: target.hostname, port }, connectCallback)
 
     // Duplex typing does not expose socket timeout controls; both concrete
     // shapes here do.
@@ -665,6 +754,7 @@ async function deliverResponse(
   wsAllowOrigin: string | undefined,
   wsPort: number,
   learnContent: (hint: string) => void,
+  learnSocket: (html: string) => void,
   settle: () => void,
 ): Promise<void> {
   const contentTypeHeader = upstreamRes.headers['content-type']
@@ -790,6 +880,7 @@ async function deliverResponse(
     }
     try {
       const htmlString = Buffer.concat(chunks).toString('utf8')
+      learnSocket(htmlString)
       // Learn the user-content origin from the shell's meta tag BEFORE the
       // origin rebasing (the meta value belongs to the content host, not the
       // locked target origin, so it survives rewriteHtml untouched).
@@ -836,6 +927,7 @@ function writeUpgradeRequest(
   extraCookie: string | undefined,
   upstreamSocket: Duplex,
   head: Buffer,
+  pageOrigin: string,
 ): void {
   const lines: string[] = [`GET ${subPath} HTTP/1.1`, `Host: ${target.host}`]
   for (const [name, value] of Object.entries(req.headers)) {
@@ -849,7 +941,7 @@ function writeUpgradeRequest(
       if (item !== undefined && item !== '') lines.push(`${name}: ${item}`)
     }
   }
-  if (typeof req.headers.origin === 'string') lines.push(`Origin: ${target.origin}`)
+  if (typeof req.headers.origin === 'string') lines.push(`Origin: ${pageOrigin}`)
   // Same session-authority/routing-freshness rule as the HTTP handshake.
   const browserCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined
   const mergedCookie = mergeProxyCookieHeaders(browserCookie, extraCookie)

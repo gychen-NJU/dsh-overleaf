@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "dsh.overleaf",
   "name": "dsh-overleaf",
-  "version": "0.3.10",
+  "version": "0.3.23",
   "facets": {
     "host": {
       "entry": "lib/index.js",
@@ -23,19 +23,45 @@
         "kind": "Credentials",
         "optional": true,
         "fallback": "missing credentials service disables cookie storage; manual-cookie mode only"
+      },
+      {
+        "apiVersion": "cordis.svc/v1",
+        "kind": "SessionStore",
+        "optional": false,
+        "fallback": "dsh-session 0.1.x ctx.sessions (trusted active-session workspace metadata)"
       }
     ]
   },
   "permissions": [
     {
       "name": "dsh.overleaf.network-proxy",
-      "scope": "outbound https to config.baseUrl origin + the user-content output origin the site itself announces (meta ol-compilesUserContentDomain / compile pdfDownloadDomain)",
+      "scope": "outbound https to config.baseUrl origin + the user-content output origin the site itself announces (meta ol-compilesUserContentDomain / compile pdfDownloadDomain); credential-free GET of https://static.texpage.com/dist/console.<hash>.js; HTTP/WebSocket for /socket.io/ and HTTP /heartbeat on the upstream-announced exact socket.<configured hostname minus www> host, using the original page Origin and the configured site's session cookies; isolated credential-free GET/HEAD of announced latex-file.texpageusercontent.com compile PDF/log paths; bounded bibliography and TeX source readback via the configured site's authenticated /api/project/file followed by at most one credential-free GET to that fixed file host with exact owner/file/version identity",
       "reason": "The workbench forwards browser traffic to the configured self-hosted or public Overleaf instance and fetches compiled output files (PDF/logs) from the origin that instance designates."
     },
     {
       "name": "dsh.overleaf.credential-store",
       "scope": "credentialRef OVERLEAF_WORKBENCH_COOKIE",
       "reason": "Store the captured Overleaf session cookie so reboots do not require re-login."
+    },
+    {
+      "name": "dsh.overleaf.workspace-bibliography-read",
+      "scope": "regular .bib files contained by the active DSH session workspace; recursive discovery depth 8, at most 50 candidates, at most 2 MiB per selected file",
+      "reason": "Let the user explicitly synchronize a local workspace bibliography into the matching bibliography document in the embedded Overleaf project."
+    },
+    {
+      "name": "dsh.overleaf.workspace-tex-read",
+      "scope": "regular .tex files contained by the active DSH session workspace; recursive discovery depth 8, at most 100 candidates, at most 4 MiB per selected file",
+      "reason": "Let the user explicitly synchronize one local workspace LaTeX source into the currently open, identity-verified Overleaf .tex document."
+    },
+    {
+      "name": "dsh.overleaf.workspace-tex-write",
+      "scope": "create or replace one regular .tex file inside the active DSH session workspace after an explicit Overleaf-to-local sync action; no directory creation; 4 MiB limit; write rollback and readback verification",
+      "reason": "Let the user save the complete currently open Overleaf .tex source into a chosen local workspace file, or create a same-named file at the workspace root when no local .tex exists."
+    },
+    {
+      "name": "dsh.overleaf.current-tex-edit",
+      "scope": "the single currently open Overleaf .tex source document only, after an explicit reverse-direction confirmation; document-id/revision check, pre-change snapshot, readback verification, and save confirmation required",
+      "reason": "Support user-confirmed local-to-Overleaf whole-document synchronization without silently overwriting a switched or concurrently edited document."
     }
   ],
   "license": "MIT",
