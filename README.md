@@ -21,7 +21,8 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
 ```
 
 - License: MIT
-- Target runtime: DeepSeek Harness `0.1.1-rc.2`, web profile (`http://127.0.0.1:3080`)
+- Version: **1.0.0** — milestone release: adapted to DSH 0.1.7's plugin configuration contract (volatile hot-editable fields + Plugins page configuration seats) and consolidating the TeXPage (`tex.nju.edu.cn`) two-site support
+- Target runtime: DeepSeek Harness `0.1.7-rc.2`, web profile (`http://127.0.0.1:3080`); the peer ranges still accept host services from 0.1.0-rc.5 on, where the legacy settings entry is used
 - Protocol: ships a static Community v0.15 `dsh-plugin.json` per the [dsh-std](https://github.com/Yan-Zero/dsh-std) interoperability spec; classic dual-face bundle loading remains the primary activation path.
 
 ## Screenshots
@@ -49,6 +50,8 @@ An embedded **Overleaf workbench** plugin for DeepSeek Harness (DSH) Web. It add
   v0.3.22 adds bidirectional current-`.tex` synchronization for TeXPage. It binds the selected full tree path, footer path, loading state, unique CM6 editor, and the file tree API's `fileKey`; reverse sync confirms persistence through isolated server readback. overleaf.com retains its existing document-ID, revision, and `doc:saved` checks.
 - **Bidirectional current `.tex` sync** — the assist panel's Status page defaults to saving the current Overleaf source into the workspace: it recursively detects local `.tex` files and creates a same-named root file when none exist. The reverse “Local → Overleaf” direction can use a selected local file or manually pasted complete LaTeX, but requires an explicit whole-document warning confirmation plus document-ID, revision, snapshot, write-verification, and save-event checks.
 
+  **v1.0.0 (milestone)** adapts the plugin to DSH 0.1.7's configuration contract: every field is a volatile, hot-editable field, and settings now live under **Settings → "Overleaf workbench settings"** or **sidebar → Plugins → Installed → dsh-overleaf** (bundle page or row configuration). Saving applies the new proxy target and feature switches **immediately, without a restart**; older harness generations keep the legacy settings entry. The release also consolidates the TeXPage support delivered across v0.3.16–v0.3.22 (console and project loading, the Socket.IO tunnel, signed compile artifacts and logs, `.bib`/`.tex` bidirectional sync) into one maintainable milestone.
+
 ## Why it exists
 
 Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a plain `<iframe src="https://tex.nju.edu.cn">` is refused by browsers. This plugin ships an HTTP/1.1 reverse proxy inside the DSH host process: all browser traffic goes to `/overleaf-proxy/<original-path>` which forwards to your configured upstream origin — one fixed origin, locked by configuration, no open SSRF surface. Because the iframe and the GUI then share one origin, browser-level bridges become possible: text selections flow out of the embedded editor into the composer as structured quotes, and generated content can be written back at the editor caret.
@@ -74,13 +77,13 @@ The npm package name `dsh-overleaf` is occupied by another project, so this plug
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
 # Or pin an exact released version:
-dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.9
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v1.0.0
 ```
 
 From a release tarball (download the `.tgz` attached to the [latest release](https://github.com/gychen-NJU/dsh-overleaf/releases)):
 
 ```sh
-dsh plugin --profile web add ./dsh-overleaf-0.3.9.tgz
+dsh plugin --profile web add ./dsh-overleaf-1.0.0.tgz
 ```
 
 Then restart the web service once (client bundles join the boot graph at startup):
@@ -223,7 +226,7 @@ To try local changes in a real profile, pack and add the tarball, restart the we
 
 ## Compatibility notes
 
-- Verified against DSH `0.1.1-rc.2` web profile; peer ranges accept `>=0.1.0-rc.5` for host services and cordis `^4.0.1`.
+- Verified against DSH `0.1.7-rc.2` web profile (including 0.1.7's volatile settings forms, the Plugins page keyed configuration seats and the `loader/volatile-update` hot-apply contract); peer ranges accept `>=0.1.0-rc.5` for host services and cordis `^4.0.1`, and older harness generations use the legacy settings seat with `settingsScope` — the feature set is unchanged there.
 - Node `^22.19 || >=24`.
 - Works alongside `dsh-better-sidebar`/`dsh-better-overleaf`/`dsh-context`/`paperlab` et al.; see the coexistence table.
 - `dsh-plugin.json` follows dsh-std Community v0.15; hosts implementing `@dsh-std/adapter-dsh` discover the manifest statically, while ordinary profiles simply ignore it.

@@ -1,7 +1,7 @@
 {
   "name": "dsh-overleaf",
   "description": "Embedded Overleaf workbench tab for DeepSeek Harness Web: same-origin reverse proxy, persistent login, AI-assisted editing, compilation diagnostics, and safe bidirectional workspace LaTeX synchronization",
-  "version": "0.3.23",
+  "version": "1.0.0",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

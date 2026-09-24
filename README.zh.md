@@ -21,7 +21,8 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 ```
 
 - 许可证：MIT
-- 目标运行时：DeepSeek Harness `0.1.1-rc.2` web profile（`http://127.0.0.1:3080`）
+- 版本：**1.0.0** —— 里程碑版：适配 DSH 0.1.7 的插件配置契约（volatile 热编辑字段 + Plugins 页配置页），并汇总 TeXPage（`tex.nju.edu.cn`）双站点支持
+- 目标运行时：DeepSeek Harness `0.1.7-rc.2` web profile（`http://127.0.0.1:3080`）；peer 区间仍接受 0.1.0-rc.5 起的宿主服务，旧契约宿主使用旧设置入口
 - 协议：附带符合 [dsh-std](https://github.com/Yan-Zero/dsh-std) 互操作规范的静态 Community v0.15 `dsh-plugin.json` 清单；经典双半区 bundle 加载仍是主激活路径。
 
 ## 界面预览
@@ -49,6 +50,8 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
   v0.3.22 为 TeXPage 增加当前 `.tex` 双向同步适配：以文件树完整路径、底部当前文件路径、加载状态、唯一 CM6 编辑器和文件树 API 的 `fileKey` 共同确认身份。反向同步通过独立服务器回读确认保存；overleaf.com 仍使用原来的文档 ID、版本和 `doc:saved` 校验。
 - **当前 `.tex` 双向同步**——辅助面板“状态”页默认把当前 Overleaf 源码同步到工作区：递归检测本地 `.tex`，没有候选时在工作区根目录新建同名文件；也可选择本地路径。切换为“本地 → Overleaf”后，可读取本地文件或使用手动粘贴的完整 LaTeX 内容，但必须先确认整篇覆盖警告，并通过文档 ID、内容版本、修改前快照和保存事件校验。
 
+  **v1.0.0（里程碑）** 适配 DSH 0.1.7 的插件配置契约：全部配置字段改为可热编辑的 volatile 字段，设置入口迁至 **设置 → 「Overleaf 工作台设置」**，也可从 **侧边栏「插件」→ 已安装 → dsh-overleaf** 进入包详情或行配置；保存后代理目标与各项开关**立即生效、无需重启**（旧契约宿主仍保留原设置入口）。同时把分版本落地的 TeXPage 支持（v0.3.16–v0.3.22：控制台与项目加载、Socket.IO 隧道、签名编译产物与日志、`.bib`/`.tex` 双向同步）汇总为一个可长期维护的里程碑。
+
 ## 为什么需要它
 
 Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直接 `<iframe src="https://tex.nju.edu.cn">` 会被浏览器拒绝。本插件在 DSH 宿主进程内实现了一个 HTTP/1.1 反向代理：浏览器所有请求走 `/overleaf-proxy/<原路径>` 再转发到你配置的上游站点——上游被锁定为唯一配置来源，没有开放 SSRF 面。iframe 与 GUI 同源之后，浏览器级桥接才成为可能：嵌入编辑器里的文本选区可以结构化地进入对话框，生成的内容也可以写回编辑器光标处。
@@ -74,13 +77,13 @@ npm 包名 `dsh-overleaf` 已被另一项目占用，因此本插件**不发布 
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
 # 或锁定某个已发布的版本：
-dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v0.3.9
+dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v1.0.0
 ```
 
 从 release 资产安装（在 [Releases](https://github.com/gychen-NJU/dsh-overleaf/releases) 下载 `.tgz`）：
 
 ```sh
-dsh plugin --profile web add ./dsh-overleaf-0.3.9.tgz
+dsh plugin --profile web add ./dsh-overleaf-1.0.0.tgz
 ```
 
 随后重启一次 web 服务（客户端 bundle 在启动期进入 boot 图谱）：
@@ -221,7 +224,7 @@ pnpm typecheck
 
 ## 兼容性说明
 
-- 针对 DSH `0.1.1-rc.2` web profile 验证；peer 区间接受宿主服务 `>=0.1.0-rc.5`、cordis `^4.0.1`。
+- 针对 DSH `0.1.7-rc.2` web profile 验证（含 0.1.7 的 volatile 设置表单、Plugins 页 keyed 配置槽与 `loader/volatile-update` 热更新契约）；peer 区间接受宿主服务 `>=0.1.0-rc.5`、cordis `^4.0.1`，旧契约宿主使用旧设置入口与 `settingsScope` 绑定，功能不受影响。
 - Node `^22.19 || >=24`。
 - 可与 `dsh-better-sidebar` / `dsh-better-overleaf` / `dsh-context` / paperlab 等并存；见共存表。
 - `dsh-plugin.json` 遵循 dsh-std Community v0.15；实现了 `@dsh-std/adapter-dsh` 的 Host 可静态发现该清单，普通 profile 直接忽略。
