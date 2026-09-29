@@ -225,6 +225,37 @@
  *   logged, never written into the report and never committed; only
  *   `openProject.cookieProvided` / `openProject.cookieSource` metadata is recorded.
  *   Keep cookie files under .tmp/ (gitignored) and never copy them elsewhere.
+ *
+ *   --debug-sockets      OPT-IN socket instrumentation (env alias
+ *                        DSH_OVERLEAF_DEBUG_SOCKETS=1). Default OFF: the report keys,
+ *                        assertion set, readings and exit codes are exactly as before.
+ *                        ON adds three keys:
+ *                          socketDebug[]      one entry per WebSocket construction:
+ *                                             { class: site|bridge|probe, rawInput,
+ *                                               usedNativePath, normalized, resolved,
+ *                                               initiatorHint, error, at, frameUrl }
+ *                          socketDebugNote    counts, or the explicit sentence that
+ *                                             nothing was constructed anywhere
+ *                          hostSource{}       { hostBase, bridgeSource, note }
+ *                        Judgment (same deterministic rule as the tap):
+ *                          class site   - byProbe !== true and bridgeOnly !== true
+ *                          class bridge - byProbe !== true and bridgeOnly === true
+ *                          class probe  - byProbe === true
+ *                        Field meaning: `rawInput` is the caller's value BEFORE any
+ *                        rewriting (captured by a layer installed on top of the
+ *                        bridge's patched constructor, once __DSH_OVERLEAF_BRIDGE__ is
+ *                        set); `normalized` is the bridge's routeSocketUrl output and
+ *                        `resolved` is the string really handed to the native
+ *                        constructor (both from the constructor tap underneath);
+ *                        `usedNativePath` says whether the construction reached that
+ *                        native boundary; `error` carries the constructor's throw or
+ *                        the async error/close text INCLUDING the target URL.
+ *                        Entries with rawInput null are constructions made before the
+ *                        debug layer existed (they are shown, not dropped).
+ *   --bridge-source=host serve /overleaf/workbench/bridge.js from the REAL host (the
+ *                        running desktop app configuration: host proxy, host cookies,
+ *                        host cache) instead of this worktree's lib/index.js.
+ *                        Default: worktree bridge.
  *   --report=<path>      JSON report path (default <worktree>\.tmp\desktop-shell-report.json)
  *
  *   TIMEOUT BUDGET: nothing in the harness waits on CDP any more (the socket tap
@@ -316,6 +347,8 @@ function parseArgs(argv) {
     report: DEFAULT_REPORT,
     keepTmp: false,
     negativeControl: false,
+    debugSockets: false,
+    bridgeSource: 'worktree',
     help: false,
   }
   const read = (name) => {
@@ -335,6 +368,12 @@ function parseArgs(argv) {
   if (argv.includes('--help') || argv.includes('-h')) options.help = true
   if (argv.includes('--keep-tmp')) options.keepTmp = true
   if (argv.includes('--negative-control')) options.negativeControl = true
+  // Opt-in socket instrumentation. Default OFF: with the flag absent every report
+  // key, assertion and reading stays exactly as before.
+  if (argv.includes('--debug-sockets')) options.debugSockets = true
+  if (process.env.DSH_OVERLEAF_DEBUG_SOCKETS === '1') options.debugSockets = true
+  const bridgeSource = read('bridge-source')
+  if (bridgeSource === 'host' || bridgeSource === 'worktree') options.bridgeSource = bridgeSource
   options.hostPort = number('host-port', options.hostPort)
   options.wsPort = number('ws-port', options.wsPort)
   options.timeoutSec = number('timeout', options.timeoutSec)
@@ -380,6 +419,7 @@ The bridge script under test comes from this worktree's lib/, not from the host.
 
 flags: --host-port= --ws-port= --timeout= --settle= --frame-origin=shell|http
        --host-cookie= --cookie=<v|@file> --cookie-file= --open-project=<id|url>
+       --debug-sockets --bridge-source=worktree|host
        --report <path> --keep-tmp --negative-control --help
 report: <worktree>\\.tmp\\desktop-shell-report.json (always written)
 
@@ -1110,9 +1150,13 @@ function installProtocolHandler(ses, hostBase) {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       })
     }
-    // The bridge under test comes from this worktree, never from the host, so a
-    // pre-fix desktop profile junction cannot produce a false negative.
+    // The bridge under test comes from this worktree by default, never from the host,
+    // so a pre-fix desktop profile junction cannot produce a false negative.
+    // `--bridge-source=host` forwards this path to the real host instead: that is the
+    // exact configuration the running desktop app serves (host proxy + host bridge +
+    // host cookies + host cache behaviour), which is what t15 asks to observe.
     if (url.hostname === 'app' && url.pathname === BRIDGE_PATH) {
+      if (options.bridgeSource === 'host') return forwardToHost(request, url, hostBase)
       const body = worktreeBridge || '/* worktree bridge unavailable */'
       return new Response(options.negativeControl ? `${body}\n${negativeControlFragment()}` : body, {
         status: 200,
@@ -1229,7 +1273,8 @@ const SOCKET_TAP_SOURCE = `(() => {
     function Tap(url, protocols) {
       var analysis = analyseFrames(stackFrames())
       var byProbe = window.__DSH_SHELL_HARNESS_PROBE__ === true
-      push({
+      var debug = window.__DSH_SOCKET_DEBUG_PENDING__ || null
+      var entry = {
         url: String(url),
         stackHint: analysis.hint,
         at: Date.now(),
@@ -1237,8 +1282,34 @@ const SOCKET_TAP_SOURCE = `(() => {
         hasBridgeFrame: analysis.hasBridgeFrame,
         hasSiteFrame: analysis.hasSiteFrame,
         bridgeOnly: !byProbe && analysis.hasBridgeFrame && !analysis.hasSiteFrame,
-      })
-      return protocols === undefined ? new Native(url) : new Native(url, protocols)
+        rawInput: debug ? debug.rawInput : null,
+        debugId: debug ? debug.id : null,
+        error: null,
+      }
+      push(entry)
+      var socket
+      try {
+        socket = protocols === undefined ? new Native(url) : new Native(url, protocols)
+      } catch (err) {
+        entry.error =
+          'WebSocket constructor threw for target ' + String(url) + ': ' + (err && err.message ? err.message : String(err))
+        throw err
+      }
+      if (window.__DSH_SHELL_HARNESS_DEBUG__) {
+        // Async failures are what the user actually sees ("connection lost"); capture
+        // them with the target URL. Only attached when the debug switch is on.
+        try {
+          socket.addEventListener('error', function () {
+            if (!entry.error) entry.error = 'WebSocket connection to ' + String(url) + ' failed (error event)'
+          })
+          socket.addEventListener('close', function (event) {
+            if (!entry.error && event && event.code !== 1000) {
+              entry.error = 'WebSocket connection to ' + String(url) + ' closed (code ' + event.code + ')'
+            }
+          })
+        } catch (err) {}
+      }
+      return socket
     }
     Tap.prototype = Native.prototype
     try { Object.setPrototypeOf(Tap, Native) } catch (err) {}
@@ -1271,6 +1342,72 @@ async function sendCdpWithTimeout(webContents, method, params, timeoutMs = 5000)
     if (timer) clearTimeout(timer)
   }
 }
+
+/**
+ * Opt-in debug layer (t15, `--debug-sockets`). Installed ON TOP of the bridge's
+ * patched constructor - and only once the bridge is really there - so it sees the
+ * CALLER's original value before any rewriting, while the tap underneath still
+ * records what the bridge finally handed to the native constructor. Costs nothing
+ * unless the switch is on.
+ */
+const SOCKET_DEBUG_SOURCE = `(() => {
+  try {
+    if (window.__DSH_SHELL_HARNESS_DEBUG__) return 'already-installed'
+    if (!window.__DSH_OVERLEAF_BRIDGE__) return 'bridge-not-ready'
+    var Inner = window.WebSocket
+    if (typeof Inner !== 'function') return 'no-websocket-constructor'
+    var records = []
+    var nextId = 1
+    function hint() {
+      try { return String(new Error().stack || '').split('\\n').slice(1, 6).join(' | ').slice(0, 300) } catch (err) { return '' }
+    }
+    function DebugSocket(url, protocols) {
+      var record = {
+        id: nextId++,
+        rawInput: String(url),
+        initiatorHint: hint(),
+        at: Date.now(),
+        error: null,
+        // The probe marks itself; without this the negative-control path (where the
+        // bridge's patch is bypassed and the tap never runs) would mislabel the
+        // probe's own construction as a site one.
+        byProbe: window.__DSH_SHELL_HARNESS_PROBE__ === true,
+      }
+      try { records.push(record); if (records.length > 200) records.shift() } catch (err) {}
+      window.__DSH_SOCKET_DEBUG_PENDING__ = record
+      var socket
+      try {
+        socket = protocols === undefined ? new Inner(url) : new Inner(url, protocols)
+      } catch (err) {
+        record.error = 'WebSocket constructor threw for target ' + String(url) + ': ' + (err && err.message ? err.message : String(err))
+        delete window.__DSH_SOCKET_DEBUG_PENDING__
+        throw err
+      }
+      delete window.__DSH_SOCKET_DEBUG_PENDING__
+      try {
+        socket.addEventListener('error', function () {
+          if (!record.error) record.error = 'WebSocket connection to ' + String(url) + ' failed (error event)'
+        })
+        socket.addEventListener('close', function (event) {
+          if (!record.error && event && event.code !== 1000) {
+            record.error = 'WebSocket connection to ' + String(url) + ' closed (code ' + event.code + ')'
+          }
+        })
+      } catch (err) {}
+      return socket
+    }
+    DebugSocket.prototype = Inner.prototype
+    try { Object.setPrototypeOf(DebugSocket, Inner) } catch (err) {}
+    window.WebSocket = DebugSocket
+    window.__DSH_SHELL_HARNESS_DEBUG__ = {
+      source: 'debug layer above the bridge WebSocket wrapper (records rawInput before rewriting)',
+      records: records,
+    }
+    return 'installed'
+  } catch (err) {
+    return 'error: ' + (err && err.message ? err.message : String(err))
+  }
+})()`
 
 function recordSocketMechanism(state, name) {
   if (!state) return
@@ -1397,6 +1534,98 @@ async function injectSocketTapIntoFrames(webContents, state) {
     if (injected > 0) recordSocketMechanism(state, 'frame-injection')
   }
   return injected
+}
+
+/** Inject the opt-in debug layer into every frame that exists right now (debug only). */
+async function injectSocketDebugIntoFrames(webContents) {
+  if (!options.debugSockets) return 0
+  const frames = descendantFrames(webContents.mainFrame)
+  let injected = 0
+  for (const frame of frames) {
+    try {
+      const result = await frame.executeJavaScript(SOCKET_DEBUG_SOURCE, false)
+      if (result === 'installed' || result === 'already-installed') injected += 1
+    } catch (err) {
+      /* frame has no JS context yet or navigated away */
+    }
+  }
+  if (injected > 0 && report.socketTap) {
+    report.socketTap.debugLayerInjections = (report.socketTap.debugLayerInjections || 0) + injected
+  }
+  return injected
+}
+
+/**
+ * Compose the per-construction debug list (debug switch only). The debug layer
+ * supplies `rawInput`/`initiatorHint` (the caller's value before any rewriting) and
+ * the tap underneath supplies `normalized` (= routeSocketUrl output, i.e. what the
+ * bridge produced) and `resolved` (= the string really handed to the native
+ * constructor), plus any error text with its target URL.
+ */
+async function collectSocketDebug(webContents) {
+  const frames = descendantFrames(webContents.mainFrame)
+  const entries = []
+  for (const frame of frames) {
+    let debugRecords = null
+    let tapRecords = []
+    try {
+      const raw = await frame.executeJavaScript(
+        `(() => {
+          const debug = window.__DSH_SHELL_HARNESS_DEBUG__
+          const tap = window.__DSH_SHELL_HARNESS_TAP__
+          return JSON.stringify({ debug: debug ? debug.records : null, tap: tap ? tap.records : [] })
+        })()`,
+        false,
+      )
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        debugRecords = parsed.debug
+        tapRecords = parsed.tap || []
+      }
+    } catch (err) {
+      continue
+    }
+    if (!debugRecords) continue
+    const byId = new Map()
+    for (const tapRecord of tapRecords) {
+      if (tapRecord.debugId !== null && tapRecord.debugId !== undefined) byId.set(tapRecord.debugId, tapRecord)
+    }
+    const covered = new Set()
+    for (const record of debugRecords) {
+      const tapRecord = byId.get(record.id) || null
+      if (tapRecord) covered.add(record.id)
+      entries.push({
+        class: tapRecord ? classifySocketConstruction(tapRecord) : record.byProbe === true ? 'probe' : 'site',
+        rawInput: record.rawInput,
+        usedNativePath: Boolean(tapRecord),
+        normalized: tapRecord ? tapRecord.url : null,
+        resolved: tapRecord ? tapRecord.url : record.rawInput,
+        initiatorHint: String(record.initiatorHint || '').slice(0, 300),
+        error: (tapRecord && tapRecord.error) || record.error || null,
+        at: record.at,
+        frameUrl: frame.url,
+      })
+    }
+    // Constructions that never passed through the debug layer (made before it was
+    // installed, or bridge-internal ones): reported with rawInput null rather than
+    // dropped, so nothing is silently invisible.
+    for (const tapRecord of tapRecords) {
+      const hasDebugId = tapRecord.debugId !== null && tapRecord.debugId !== undefined
+      if (hasDebugId) continue
+      entries.push({
+        class: classifySocketConstruction(tapRecord),
+        rawInput: null,
+        usedNativePath: true,
+        normalized: tapRecord.url,
+        resolved: tapRecord.url,
+        initiatorHint: String(tapRecord.stackHint || '').slice(0, 300),
+        error: tapRecord.error || null,
+        at: tapRecord.at,
+        frameUrl: frame.url,
+      })
+    }
+  }
+  return entries
 }
 
 function classifySocketConstruction(entry) {
@@ -1808,6 +2037,7 @@ async function main() {
   // take): inject as soon as a frame navigates, and again after load.
   window.webContents.on('did-frame-navigate', () => {
     injectSocketTapIntoFrames(window.webContents, report.socketTap).catch(() => {})
+    injectSocketDebugIntoFrames(window.webContents).catch(() => {})
   })
 
   const frameUrl =
@@ -1822,6 +2052,9 @@ async function main() {
   await injectSocketTapIntoFrames(window.webContents, report.socketTap)
   await retrySocketTapRegistration(window.webContents)
   await maybeOpenProject(window.webContents)
+  // Debug layer goes in after the bridge has patched (it returns 'bridge-not-ready'
+  // otherwise and is retried at every later injection point).
+  await injectSocketDebugIntoFrames(window.webContents)
 
   const deadline = Date.now() + options.timeoutSec * 1000
   const settleMs = options.settleSec * 1000
@@ -1940,6 +2173,7 @@ async function main() {
   // Site-built socket evidence: a second, independent channel that never borrows
   // from the harness probe. Empty here means "no site-built socket observed".
   await injectSocketTapIntoFrames(window.webContents, report.socketTap)
+  await injectSocketDebugIntoFrames(window.webContents)
   const socketEvidence = await collectSocketEvidence(window.webContents)
   // Finalize the tap state first: `installed` / `beforePageScripts` / `mechanism`
   // are derived from the mechanisms that actually took effect, and the socket
@@ -1970,6 +2204,38 @@ async function main() {
       `bridgeExcluded=${socketEvidence.bridgeSocket.length} framesInjected=${socketEvidence.framesTapped.length} ` +
       `beforePageScripts=${report.socketTap.beforePageScripts} mechanism=${report.socketTap.mechanism}`,
   )
+
+  // Opt-in debug channel (t15): raw input before rewriting, the routed target, real
+  // failure text with its URL. Absent entirely unless --debug-sockets is used, so the
+  // default report keys stay stable.
+  if (options.debugSockets) {
+    report.socketDebug = await collectSocketDebug(window.webContents)
+    const counts = { site: 0, bridge: 0, probe: 0 }
+    for (const entry of report.socketDebug) {
+      if (counts[entry.class] !== undefined) counts[entry.class] += 1
+    }
+    report.socketDebugNote =
+      report.socketDebug.length === 0
+        ? 'no WebSocket construction captured in any frame: the site built no socket, the bridge built none, and even the harness probe is absent'
+        : `${report.socketDebug.length} construction(s): site=${counts.site}, bridge=${counts.bridge}, probe=${counts.probe}`
+    log(`socketDebug: ${report.socketDebugNote}`)
+    for (const entry of report.socketDebug.slice(0, 8)) {
+      log(
+        `  socketDebug[${entry.class}] rawInput=${JSON.stringify(entry.rawInput)} normalized=${JSON.stringify(entry.normalized)} ` +
+          `resolved=${JSON.stringify(entry.resolved)} usedNativePath=${entry.usedNativePath} error=${JSON.stringify(entry.error)}`,
+      )
+    }
+  }
+  if (options.debugSockets || options.bridgeSource === 'host') {
+    report.hostSource = {
+      hostBase: report.hostBase,
+      bridgeSource: options.bridgeSource,
+      note:
+        options.bridgeSource === 'host'
+          ? 'bridge forwarded from the real host (the running desktop app configuration)'
+          : 'bridge served from this worktree lib/index.js',
+    }
+  }
 
   const assertions = []
   const assert = (criterion, ok, evidence) => {
