@@ -21,8 +21,8 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
 ```
 
 - 许可证：MIT
-- 版本：**1.0.0** —— 里程碑版：适配 DSH 0.1.7 的插件配置契约（volatile 热编辑字段 + Plugins 页配置页），并汇总 TeXPage（`tex.nju.edu.cn`）双站点支持
-- 目标运行时：DeepSeek Harness `0.1.7-rc.2` web profile（`http://127.0.0.1:3080`）；peer 区间仍接受 0.1.0-rc.5 起的宿主服务，旧契约宿主使用旧设置入口
+- 版本：**1.0.1** —— 桌面版专用修复：让工作台在 DSH 桌面壳（自定义协议 `dsh-app://`）中真正可用（协议无关的桥接路由 + TeXPage Socket.IO 地址构造修复）
+- 目标运行时：DeepSeek Harness `0.1.7-rc.2`，web profile（`http://127.0.0.1:3080`）与**桌面版**（`dsh-app://app`，`http://127.0.0.1:19387`）均已验证；peer 区间接受 0.1.1-rc.2 起的宿主服务（`^0.1.1-rc.2 || ^0.1.7-rc.1 || ^0.2.0-rc.1`）
 - 协议：附带符合 [dsh-std](https://github.com/Yan-Zero/dsh-std) 互操作规范的静态 Community v0.15 `dsh-plugin.json` 清单；经典双半区 bundle 加载仍是主激活路径。
 
 ## 界面预览
@@ -49,6 +49,8 @@ DeepSeek Harness（DSH）Web 的 **Overleaf 嵌入工作台**插件。它在会�
   v0.3.21 为 TeXPage 临时网络/服务端繁忙增加一次只读重试，共用原有超时上限，不会重复执行写入。失败提示显示文件树、写入前读取或写入后保存确认阶段，以及可用的 HTTP 状态/安全错误类别；不要仅凭“读取失败”判断登录失效。权限拒绝、错误文件路径及无效内容不重试。
   v0.3.22 为 TeXPage 增加当前 `.tex` 双向同步适配：以文件树完整路径、底部当前文件路径、加载状态、唯一 CM6 编辑器和文件树 API 的 `fileKey` 共同确认身份。反向同步通过独立服务器回读确认保存；overleaf.com 仍使用原来的文档 ID、版本和 `doc:saved` 校验。
 - **当前 `.tex` 双向同步**——辅助面板“状态”页默认把当前 Overleaf 源码同步到工作区：递归检测本地 `.tex`，没有候选时在工作区根目录新建同名文件；也可选择本地路径。切换为“本地 → Overleaf”后，可读取本地文件或使用手动粘贴的完整 LaTeX 内容，但必须先确认整篇覆盖警告，并通过文档 ID、内容版本、修改前快照和保存事件校验。
+
+  **v1.0.1（桌面版）** 修复 DSH 桌面壳里的工作台：桥接脚本改为协议无关，站点用 `location` 拼出的 `dsh-app://…` 与 `ws://dsh-app/…` 不再被原样放行，而是归一为根相对代理路径或本机隧道端口；壳内 `https://app/…` 形态的 API 与 socket.io 基址视同本站 origin；桌面端无法打开新窗口，工具栏按钮相应置灰并给出说明。此外修复 TeXPage 站点自身的 Socket.IO 地址构造——它在 `dsh-app:` 下会把 origin 拼成非法命名空间（`Invalid namespace`），编辑器因此无法同步。**桌面版请安装 `desktop` 分支**（`dsh plugin --profile desktop add github:gychen-NJU/dsh-overleaf#desktop`），安装后需退出并重开 DeepSeek Harness。
 
   **v1.0.0（里程碑）** 适配 DSH 0.1.7 的插件配置契约：全部配置字段改为可热编辑的 volatile 字段，设置入口迁至 **设置 → 「Overleaf 工作台设置」**，也可从 **侧边栏「插件」→ 已安装 → dsh-overleaf** 进入包详情或行配置；保存后代理目标与各项开关**立即生效、无需重启**（旧契约宿主仍保留原设置入口）。同时把分版本落地的 TeXPage 支持（v0.3.16–v0.3.22：控制台与项目加载、Socket.IO 隧道、签名编译产物与日志、`.bib`/`.tex` 双向同步）汇总为一个可长期维护的里程碑。
 

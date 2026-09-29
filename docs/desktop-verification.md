@@ -1,7 +1,6 @@
 # DSH 桌面端 Overleaf 工作台修复：v1.0.1 验收记录
 
-> **文档状态：草稿（DRAFT）** —— t13（`40cf291`）已落地，§5 / §6 已按实测填入；§1 只写**已独立证实**的部分，**§7 端到端验证与「桌面端可用」结论必须等 t14（harness 补「站点自建 socket」独立通道）+ t10' 短复验**。
-> 在本标记移除之前：本文出现的任何"通过／可用"字样都只描述**已完成的局部证据**，不构成验收结论；§7 **不得引用 t13 之前的任何端到端数字**（t3 首跑的站点 API 缺陷已由 t13 承接）。
+> **文档状态：已完成（ACCEPTED）** —— 修复已在用户的桌面端**实测通过**；§1 结论已升级为"站点侧在壳内可用"，§7 的两个空位已填（现场读数 + 站点 socket 归属），§9 的人工验收清单已由用户过。
 
 - **文档日期**：2026-09-30
 - **验收对象**：`dsh-app://` 自定义协议下 Overleaf 工作台打不开的桌面端修复
@@ -17,10 +16,11 @@
 | 分栏 | 内容 |
 |---|---|
 | **已证实** | ① **桥层修复成立**：离线套件 **13/13**、新前缀组 **16/16**、原 5 文件组 **467/467**（均 exit 0，见 §6）；双配置矩阵 R2-1/R2-2 漂移归零；变异负控具备真实失败能力。② **探针路由成立**：壳形状 WS 被改写到隧道。③ **web 零回归**：`pnpm test` 全链 **EXIT=0**（见 §6）。④ **修复版桥已在运行中的桌面端加载**：宿主 19387 服务的 `bridge.js` 含壳修复代码（现场复核见 §8）。 |
-| **未证实（不得写成通过）** | **站点在壳内可用**：harness 的独立通道读到 **`site=0`**（tap 在页面脚本前生效，已排除注入时机与路由形态两种解释），本 harness **既不能证明也不能否证**该项（见 §7）。 |
-| **由谁验收** | **§9 用户侧人工验收**——在**运行中的桌面窗口**采集 iframe 桥诊断与 Console 错误（§9 提供可直接粘贴的采集片段）；t15 的插桩结果作为"站点为何不自建 socket"的解释性旁证。 |
+| **已证实（端到端）** | **站点在壳内可用**：真实编辑器路由 `/overleaf-proxy/project/user/<ownerUuid>/<projectUuid>` 下，站点**自建** socket 经桥改写落到隧道（`ws://127.0.0.1:<隧道端口>/__dsh_socket__/socket.io/?EIO=4&transport=websocket`），桥诊断达到 **`ws-state=open` / `socketio-state=connected` / `ws-messages` 递增**（见 §7）。 |
+| **已证实（修复本体）** | **TeXPage Socket.IO 地址构造修复**：站点用 `window.location.protocol + "//" + _domainConf.socket` 自拼 origin，在 `dsh-app:` 下被 socket.io 解析成**非法命名空间**（`Invalid namespace`，并伴随 `Cannot read properties of undefined (reading 'on')`）。修复后该表达式在壳内改用**经校验的** `__DSH_OVERLEAF_SOCKET_ORIGIN__`；产物证据：`6.<hash>.js` 由 CDN 直连改为经 `/overleaf-proxy/__dsh_texpage_v1__/`（163,361 → **164,415** 字节，响应头 `x-dsh-texpage-compat: desktop-socket-origin-v1`），HTTP/HTTPS 行为逐字不变。 |
+| **验收方式** | 用户侧实测（编辑、编译、同步正常）+ §7 的机器侧读数；harness 的站点 socket 归属由独立通道（tap 装在页面脚本之前）给出 `byProbe:false`。 |
 
-**本文不使用"桌面端可用"这类表述**：桥层与 web 层已证实，站点层交由 §9 的现场读数判定。
+**结论**：桌面端（`dsh-app://app`）的 Overleaf 工作台**可用**；web 端行为逐字未变（§6 等价性矩阵 + 全链 `pnpm test` EXIT=0）。
 
 ---
 
@@ -130,25 +130,30 @@ self-check: worktree bridge 121151 B (shell handling: yes)
 
 **框架 A：能证的证死、不能证的划清边界**
 
-harness 内的独立通道读数：**未观测到站点自建 socket**（`site=0`；与页内探针**分列、禁止互相填充**；tap 在页面脚本前生效 `beforePageScripts=true`，已排除注入时机与路由形态两种解释）。因此本 harness **既不能证明也不能否证**"站点在壳内可用"。
+**结论：观测到站点自建 socket，且连上隧道。**
 
-- **已证实**：① 桥层修复（离线套件 + 双配置矩阵 + 变异负控，见 §6）② 探针路由（壳形状 WS 经隧道改写）③ **web 零回归**（`pnpm test` 全链 EXIT=0）。
-- **交由 §9 判定**：站点可用性 —— 由人在**运行中的桌面窗口**采集现场读数。
+**现场读数 1｜站点自建 socket 的归属与目标（t16 壳内跑，harness 独立通道）**
 
-**空位 1｜用户侧现场读数（采集方法见 §9；人在桌面窗口执行）**
+- `frameUrl` = `dsh-app://app/overleaf-proxy/project/user/1e40c590-2475-41fa-80fb-2d93ca7fbf5a/84a0d7ee-39e0-4111-8bd4-2ea2cddb378c`，title `2026SPOT - TeXPage`，documentStatus 200；
+- `siteSocket` **非空**：`count=1`、`class=site`（`byProbe:false`、`hasSiteFrame:true`，构造栈来自 `static.texpage.com/dist/777.ab3305b5236af54d549e.js`）；
+- `constructions[0].url` = `ws://127.0.0.1:59203/__dsh_socket__/socket.io/?EIO=4&transport=websocket&t=…` ⇒ **指向隧道**；
+- `--debug-sockets` 下可见站点原始输入 `ws://dsh-app/socket.io/?EIO=4&transport=websocket&t=…`（污染形态）→ `normalized = resolved` 为隧道 URL，`usedNativePath=true` ⇒ 桥改写生效；
+- 桥诊断：`ws-state=open`、`socketio-state=connected`、`ws-messages` **2→3 递增成立（末帧达成）**；该轮 **12/12 断言通过**。
 
-- `frameUrl`：
-- 桥诊断 `data-dsh-overleaf-{bridge,ws-port,ws-target,ws-state,socketio-state,ws-messages,last-error}`：
-- Console 错误（是否仍有 `ws://dsh-app/…` 或 `dsh-app://socket…`）：
-- **判读（三选一）**：
-  - **a)** `ws-target=127.0.0.1:<隧道端口>` 且 `ws-state=open`、`socketio-state=connected` ⇒ **站点侧已在壳内连通**；
-  - **b)** 桥已连上但站点仍报错 ⇒ 问题在**站点业务层**，不在桥；
-  - **c)** 桥仍未连上 ⇒ 回到桥层排查（并引空位 2 的插桩输入）。
+**现场读数 2｜修复前后对照（同一路由，同一 harness）**
 
-**空位 2｜t15 插桩结果（解释"站点为何不自建 socket"）**
+| 轮次 | 站点 socket 目标 | 站点侧结果 |
+|---|---|---|
+| 修复前 | `ws://127.0.0.1:<隧道>/__dsh_socket__/socket.io/…` | `closed (code 1005)`，站点 bundle 报 `Error: Invalid namespace` + `Cannot read properties of undefined (reading 'on')` |
+| 修复后 | 同上 | `ws-state=open` / `socketio-state=connected` / `ws-messages` 递增；页面无 namespace 错误 |
 
-- 站点是否发起过 socket、及其实参/失败原因：
-- 对 `site=0` 的解释：
+**读数 3｜适配器生效判据（可在任意时刻复核）**
+
+- `GET http://127.0.0.1:19387/overleaf-proxy/__dsh_texpage_v1__/6.<hash>.js` → `200`，响应头含 `x-dsh-texpage-compat: desktop-socket-origin-v1`，正文含 `dsh-app:` 分支与 `missing or invalid desktop TeXPage socket origin` 校验消息；
+- 上游同一文件直连为 163,361 字节，经代理为 **164,415** 字节（差值即补丁）；
+- 宿主 HTML 里控制台脚本已改为 `/overleaf-proxy/__dsh_texpage_v1__/console.<hash>.js`。
+
+**关于早期 `site=0` 读数的更正**：那一轮的 frame 停在**仪表盘外壳**（`/console/<id>`）——该路由**不加载** socket 客户端（项目页 24 个 bundle 共 3.59 MB 内无 `EIO`/`engine.io`/transports 标记），因此 `site=0` 只说明"没进到会用 socket 的页面"，**不能**说明"站点不自建 socket"。真实编辑器路由是 `/project/user/<ownerUuid>/<projectUuid>`（项目 id 为 UUID，不是 24 位十六进制）。
 
 **计数口径（已裁定，写死，避免自相矛盾）**
 
