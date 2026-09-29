@@ -1,0 +1,7 @@
+{
+  "name": "dsh-overleaf-desktop-shell-harness",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.cjs",
+  "description": "Minimal Electron app wrapper that runs scripts/desktop-shell-harness.mjs (usage and contract in that file header)."
+}

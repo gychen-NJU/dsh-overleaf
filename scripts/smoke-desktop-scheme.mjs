@@ -255,7 +255,7 @@ test('client: the toolbar new-window button is gated on a non-http(s) origin', a
 test('negative control: neutralising the shell branch turns these cases red', () => {
   const anchor = "if (shellScheme !== '' && "
   const hits = bridge.split(anchor).length - 1
-  assert.ok(hits >= 1, 'the shell-branch anchor is still present in the generated bridge')
+  assert.ok(hits >= 2, 'the shell-branch anchors are still present in the generated bridge (expected 2 gated sites)')
   const mutated = loadBridge(bridge.split(anchor).join('if (false && '), SHELL_LOCATION)
 
   assert.notEqual(mutated.context.routeSocketUrl(SHELL_SOCKET_CASES[0]), TUNNEL_SOCKET, 'ws://dsh-app case detects the missing branch')
