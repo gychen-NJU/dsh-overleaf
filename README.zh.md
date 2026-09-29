@@ -72,6 +72,8 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 
 npm 包名 `dsh-overleaf` 已被另一项目占用，因此本插件**不发布 npm**——请直接从 GitHub 安装。仓库已提交预构建的 `lib/` 产物，git 安装**无需构建步骤、无需 allowBuilds 授权**：
 
+> **使用 DSH 桌面版？** 桌面壳需要安装 `desktop` 分支——它修复了 `dsh-app://` 自定义协议下的路由，以及 TeXPage 站点的 Socket.IO 地址构造。桌面壳之外的行为两个分支完全一致。
+
 ```sh
 # 从 GitHub 安装，跟踪 main 分支（推荐，跟随最新特性）：
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf

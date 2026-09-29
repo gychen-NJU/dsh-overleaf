@@ -72,6 +72,8 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 
 The npm package name `dsh-overleaf` is occupied by another project, so this plugin is **not published to npm** — install it from GitHub instead. The repository commits the prebuilt `lib/` bundle, so git installs need **no build step and no `allowBuilds` authorization**:
 
+> **Using the DSH desktop app?** The desktop shell needs the `desktop` branch — it fixes the `dsh-app://` scheme routing and TeXPage's Socket.IO origin construction. Everything outside the desktop shell behaves identically on both branches.
+
 ```sh
 # From GitHub, tracking the main branch (recommended for latest features):
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
