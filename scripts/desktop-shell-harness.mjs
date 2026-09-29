@@ -90,15 +90,73 @@
  *   - upstream redirects are passed through to the frame (302 + Location), which
  *     is what the shell does; the frame URL tracks the real proxied path
  *     (`/overleaf-proxy/` -> `/overleaf-proxy/console` on this site).
- *   - evidence comes from three independent sources and the report keeps them
+ *   - evidence comes from four independent sources and the report keeps them
  *     apart: CDP `Network.*` + `webRequest` targets (`requests`,
  *     `requestTimeline`), the bridge's own `data-dsh-overleaf-*` attributes
- *     (`diagnostics`, `samples`), and an in-page probe that opens a
- *     shell-shaped `ws://dsh-app/socket.io/...` URL inside the frame
- *     (`socketProbe`, `probeRoutedToTunnel`, `probePolluted`). The probe socket
- *     is left open and completes a socket.io handshake, so a passing run proves
- *     bridge routing + tunnel + upstream handshake even when the site's own boot
- *     is broken; the report labels it `evidenceSource: harness in-page probe`.
+ *     (`diagnostics`, `samples`), an in-page probe that opens a shell-shaped
+ *     `ws://dsh-app/socket.io/...` URL inside the frame (`socketProbe`,
+ *     `probeRoutedToTunnel`, `probePolluted`, and the `probeSocket`
+ *     construction set), and the SITE SOCKET TAP below (`siteSocket`).
+ *     The probe socket is left open and completes a socket.io handshake, so a
+ *     passing probe proves bridge routing + tunnel + upstream handshake even
+ *     when the site's own boot is broken; the report labels it
+ *     `evidenceSource: harness in-page probe` and it NEVER fills `siteSocket`.
+ *
+ * SITE SOCKET TAP - the attribution channel (t14)
+ *   `socketio-state`/`ws-messages` are written by the bridge for every socket it
+ *   constructs, and the bridge only constructs when a page script asks it to, so
+ *   those attributes cannot say WHOSE socket it was. The tap closes that gap:
+ *     - PRIMARY: the harness serves these documents itself (protocol handler ->
+ *       forwardToHost), so the tap is inserted as the FIRST script of every
+ *       forwarded HTML document AND of the harness document. It therefore runs
+ *       before the bridge and before any other page script, with no CDP timing
+ *       involved: `socketTap.beforePageScripts === true`, `mechanism` =
+ *       "html-injection";
+ *     - REINFORCEMENTS (never on the critical path): a fire-and-forget CDP
+ *       `Page.addScriptToEvaluateOnNewDocument` with a 1.5 s budget (it does not
+ *       settle before a document exists, so it may only cover later documents) and
+ *       a post-load frame injection. If the inline injection ever did not happen,
+ *       these are what the run falls back to, and `socketTap` then reports
+ *       `beforePageScripts: false` plus a `mechanism` naming the fallback and
+ *       `source` explicitly saying DEGRADED. Never a silent, self-congratulatory
+ *       label: `attemptedSource` carries the API that was merely attempted.
+ *     - the tap wraps `window.WebSocket` and records every construction as
+ *       `{ url, stackHint, at, byProbe, hasBridgeFrame, hasSiteFrame, bridgeOnly }`;
+ *     - the harness probe marks itself (`__DSH_SHELL_HARNESS_PROBE__`), so probe
+ *       constructions land in `probeSocket`, never in `siteSocket`;
+ *     - constructions whose stack carries only bridge.js/tap frames are
+ *       bridge-internal and land in `bridgeSocketExcluded`.
+ *   Verdict keys (stable):
+ *     siteSocket{}            { source, observed, count, urls[], constructions[],
+ *                               state{ tapInstalled, framesInjected[], framesSeen } }
+ *     probeSocket{}           same shape; state = { tapInstalled }
+ *     bridgeSocketExcluded{}  same shape; state = {}
+ *     socketTap{}             { installed, beforePageScripts, mechanism,
+ *                               auxiliaryMechanisms[], degraded, source,
+ *                               attemptedSource, htmlInjections, scriptId, error,
+ *                               frameInjections, framesInjected[], framesSeen,
+ *                               totalConstructions, siteConstructions,
+ *                               probeConstructions, bridgeConstructions }
+ *   Judgment rule (deterministic, decided IN THE PAGE at construction time - no
+ *   URL-shape or timestamp guessing, so probe evidence can never be promoted):
+ *     probeSocket          := byProbe === true   (__DSH_SHELL_HARNESS_PROBE__ was set)
+ *     bridgeSocketExcluded := byProbe !== true AND bridgeOnly === true
+ *                             (a bridge.js frame on the stack, no page-script frame)
+ *     siteSocket           := every remaining record (page-initiated)
+ *   Each construction carries url / at / frameUrl / byProbe / hasBridgeFrame /
+ *   hasSiteFrame / bridgeOnly / stackHint so the classification can be audited
+ *   record by record.
+ *   Failure mode: with no site-side socket.io traffic at all, `siteSocket.count`
+ *   is 0, the harness says `未观测到站点自建 socket (site-built socket not
+ *   observed)` in both the report evidence and stdout, and that assertion joins
+ *   the failure surface (negative control included). Probe evidence is never
+ *   substituted for it.
+ *   Run (positive / negative, same window and same assertions):
+ *     scripts\desktop-shell-harness.cmd
+ *     scripts\desktop-shell-harness.cmd --negative-control
+ *   then read `.tmp\desktop-shell-report.json` ->
+ *   `.siteSocket.count` / `.probeSocket.count` / `.bridgeSocketExcluded.count` and
+ *   `.socketTap.{beforePageScripts,mechanism}`.
  *
  * KNOWN FINDING FROM THE FIRST REAL RUN (2026-09-30, PASS with probe evidence)
  *   The workbench console loads, the bridge reports ready, and a shell-shaped
@@ -148,8 +206,23 @@
  *   --frame-origin=http  load the frame over http://127.0.0.1:<host>/overleaf-proxy/
  *                        instead of dsh-app://app/overleaf-proxy/ (web-like control)
  *   --host-cookie=<v>    inject this Cookie header when forwarding (default: none)
+ *   --cookie=<v|@file>   same as --host-cookie, and `@path` reads the value from a
+ *                        file (never logged, never written into the report)
+ *   --cookie-file=<path> same, always read from the given file
+ *   --open-project=<id|url>
+ *                        after load, point the station iframe at
+ *                        /overleaf-proxy/project/<id> (or at the given URL) so the
+ *                        site boots into a project instead of its landing page;
+ *                        the outcome lands in the report's `openProject` key
  *   --report=<path>      JSON report path (default <worktree>\.tmp\desktop-shell-report.json)
- *   --keep-tmp           keep the throwaway user-data-dir
+ *
+ *   TIMEOUT BUDGET: nothing in the harness waits on CDP any more (the socket tap
+ *   registration is fire-and-forget with a 1.5 s budget and degrades to frame
+ *   injection). Recommended: --timeout 45 with --settle 15..30; on a slow machine
+ *   --timeout 180. Credentialed run example (value comes from the caller, the
+ *   harness never reads the host's cookie store):
+ *     scripts\desktop-shell-harness.cmd --cookie @.tmp\host-cookie.txt --open-project <id>
+ * *   --keep-tmp           keep the throwaway user-data-dir
  *   --negative-control   emulate the PRE-FIX bridge (restore the pristine
  *                        WebSocket constructor, i.e. let the site's polluted URL
  *                        through untouched) and run the SAME assertion set.
@@ -258,6 +331,28 @@ function parseArgs(argv) {
   const origin = read('frame-origin')
   if (origin === 'http' || origin === 'shell') options.frameOrigin = origin
   options.hostCookie = read('host-cookie')
+  // Credentialed / project-open modes (t14). `--cookie` accepts a literal value or
+  // @<path>; `--cookie-file` always reads the file. The value is never logged.
+  const cookie = read('cookie')
+  const cookieFile = read('cookie-file') || read('cookieFile')
+  let cookieSource = options.hostCookie ? 'host-cookie' : ''
+  try {
+    if (cookie.startsWith('@')) {
+      options.hostCookie = fs.readFileSync(cookie.slice(1), 'utf8').trim()
+      cookieSource = `cookie @${cookie.slice(1)}`
+    } else if (cookie !== '') {
+      options.hostCookie = cookie
+      cookieSource = 'cookie (literal)'
+    }
+    if (cookieFile !== '') {
+      options.hostCookie = fs.readFileSync(cookieFile, 'utf8').trim()
+      cookieSource = `cookie-file ${cookieFile}`
+    }
+  } catch (err) {
+    options.cookieError = err.message
+  }
+  options.cookieSource = cookieSource
+  options.openProject = read('open-project') || read('openProject')
   options.report = read('report') || read('json-out') || options.report
   return options
 }
@@ -273,7 +368,8 @@ connects its socket through 127.0.0.1:<tunnel port> with no polluted URLs left.
 The bridge script under test comes from this worktree's lib/, not from the host.
 
 flags: --host-port= --ws-port= --timeout= --settle= --frame-origin=shell|http
-       --host-cookie= --report <path> --keep-tmp --negative-control --help
+       --host-cookie= --cookie=<v|@file> --cookie-file= --open-project=<id|url>
+       --report <path> --keep-tmp --negative-control --help
 report: <worktree>\\.tmp\\desktop-shell-report.json (always written)
 
 exit: 0 passed, 1 assertion failed, 2 precondition failed, 3 internal error
@@ -813,7 +909,7 @@ function harnessDocument(hostBase) {
   const frameSrc = options.frameOrigin === 'http' ? `${hostBase}/overleaf-proxy/` : '/overleaf-proxy/'
   return `<!doctype html>
 <html>
-<head><meta charset="utf-8"><title>dsh-overleaf desktop shell harness</title></head>
+<head><meta charset="utf-8"><title>dsh-overleaf desktop shell harness</title><script>${SOCKET_TAP_SOURCE}</script></head>
 <body>
 <iframe id="station" src="${frameSrc}" style="width:1200px;height:800px;border:0"></iframe>
 <script>
@@ -910,11 +1006,39 @@ async function forwardToHost(request, url, hostBase) {
       head: isDocument ? body.toString('utf8', 0, 200).replace(/\s+/g, ' ') : null,
     })
   }
-  return new Response(body, {
+  // Deterministic before-page-scripts install: the harness serves these documents
+  // itself (protocol handler -> forwardToHost), so the tap becomes the FIRST script
+  // of every HTML document. It runs before the bridge and before any other page
+  // script, with no CDP timing involved. The tap self-guards, so the CDP and
+  // frame-injection attempts below simply become no-ops.
+  const servedContentType = String(upstream.headers.get('content-type') || '')
+  let servedBody = body
+  if (/text\/html/i.test(servedContentType) && request.method !== 'HEAD' && body.length > 0) {
+    servedBody = injectSocketTapIntoHtml(body)
+  }
+  return new Response(servedBody, {
     status: upstream.status,
     statusText: upstream.statusText,
     headers: responseHeaders,
   })
+}
+
+/**
+ * Insert the tap as the first script of a document. Returns a Buffer so the
+ * response can be rebuilt without touching unrelated headers (content-length is
+ * recomputed by Response).
+ */
+function injectSocketTapIntoHtml(body) {
+  const html = body.toString('utf8')
+  const tag = `<script>${SOCKET_TAP_SOURCE}</script>`
+  const head = /<head[^>]*>/i.exec(html)
+  const output = head ? html.slice(0, head.index + head[0].length) + tag + html.slice(head.index + head[0].length) : tag + html
+  const state = report.socketTap
+  if (state) {
+    state.htmlInjections = (state.htmlInjections || 0) + 1
+    recordSocketMechanism(state, 'html-injection')
+  }
+  return Buffer.from(output, 'utf8')
 }
 
 function installProtocolHandler(ses, hostBase) {
@@ -1003,6 +1127,288 @@ function attachNetworkRecorder(webContents, ses) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 5b. Site socket tap (the site-built socket evidence channel)        */
+/*                                                                     */
+/* The bridge reports socket.io state for sockets IT constructs, but    */
+/* the bridge only ever constructs a socket when the PAGE asks for one, */
+/* so `socketio-state` alone cannot tell "the site built a socket" from */
+/* "the harness probe built one". This tap is installed through CDP      */
+/* `Page.addScriptToEvaluateOnNewDocument` BEFORE any page script (and   */
+/* therefore before the bridge), in every frame, and records every       */
+/* `new WebSocket(...)` with its URL, a stack hint and a timestamp.      */
+/*                                                                       */
+/* Classification (never lets the probe fill the site collection):       */
+/*   probe  - the harness probe sets __dshHarnessProbeActive             */
+/*   bridge - the stack carries only bridge.js / tap frames (a socket    */
+/*            the bridge builds on its own; excluded from the site set)  */
+/*   site   - anything else, i.e. a construction whose stack still shows */
+/*            a page script (the scene's own socket.io client, or the    */
+/*            site's socket routed through the bridge)                   */
+/* ------------------------------------------------------------------ */
+
+const SOCKET_TAP_SOURCE = `(() => {
+  try {
+    if (window.__DSH_SHELL_HARNESS_TAP__) return 'already-installed'
+    var Native = window.WebSocket
+    if (typeof Native !== 'function') return 'no-websocket-constructor'
+    var records = []
+    function stackFrames() {
+      try { return String(new Error().stack || '').split('\\n').slice(1, 7) } catch (err) { return [] }
+    }
+    function analyseFrames(frames) {
+      var hasBridgeFrame = false
+      var hasSiteFrame = false
+      var hint = frames.join(' | ').slice(0, 900)
+      for (var i = 0; i < frames.length; i++) {
+        var frame = frames[i]
+        if (!frame) continue
+        if (/bridge\\.js/i.test(frame)) { hasBridgeFrame = true; continue }
+        if (/__DSH_SHELL_HARNESS|^\\s*at Tap\\b/.test(frame)) continue
+        if (/<anonymous>|eval at|about:blank/.test(frame)) continue
+        if (/[a-z][a-z0-9+.-]*:\\/\\//i.test(frame)) hasSiteFrame = true
+      }
+      return { hint: hint, hasBridgeFrame: hasBridgeFrame, hasSiteFrame: hasSiteFrame }
+    }
+    function push(entry) {
+      try { records.push(entry); if (records.length > 300) records.shift() } catch (err) {}
+    }
+    function Tap(url, protocols) {
+      var analysis = analyseFrames(stackFrames())
+      var byProbe = window.__DSH_SHELL_HARNESS_PROBE__ === true
+      push({
+        url: String(url),
+        stackHint: analysis.hint,
+        at: Date.now(),
+        byProbe: byProbe,
+        hasBridgeFrame: analysis.hasBridgeFrame,
+        hasSiteFrame: analysis.hasSiteFrame,
+        bridgeOnly: !byProbe && analysis.hasBridgeFrame && !analysis.hasSiteFrame,
+      })
+      return protocols === undefined ? new Native(url) : new Native(url, protocols)
+    }
+    Tap.prototype = Native.prototype
+    try { Object.setPrototypeOf(Tap, Native) } catch (err) {}
+    window.WebSocket = Tap
+    window.__DSH_SHELL_HARNESS_TAP__ = {
+      source: 'page WebSocket constructor tap (CDP, installed before page scripts)',
+      records: records,
+      probe: function (url) {
+        var previous = window.__DSH_SHELL_HARNESS_PROBE__
+        window.__DSH_SHELL_HARNESS_PROBE__ = true
+        try { return new window.WebSocket(url) } finally { window.__DSH_SHELL_HARNESS_PROBE__ = previous }
+      },
+    }
+    return 'installed'
+  } catch (err) {
+    return 'error: ' + (err && err.message ? err.message : String(err))
+  }
+})()`
+
+async function sendCdpWithTimeout(webContents, method, params, timeoutMs = 5000) {
+  let timer = null
+  try {
+    return await Promise.race([
+      webContents.debugger.sendCommand(method, params),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${method} timed out after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function recordSocketMechanism(state, name) {
+  if (!state) return
+  if (!Array.isArray(state.mechanisms)) state.mechanisms = []
+  if (state.mechanisms.indexOf(name) === -1) state.mechanisms.push(name)
+}
+
+/**
+ * Collapse the mechanisms that actually took effect into the two auditable result
+ * fields (`beforePageScripts`, `mechanism`) plus an honest `source`. Nothing here
+ * claims more than what happened: a run that never got in front of the page scripts
+ * reports `beforePageScripts: false`, a mechanism named after the fallback and
+ * `degraded: true`, and `source` says so explicitly.
+ */
+function finalizeSocketTapState(state) {
+  if (!state) return state
+  const mechanisms = Array.isArray(state.mechanisms) ? state.mechanisms : []
+  const htmlInjected = mechanisms.indexOf('html-injection') !== -1
+  const cdpBefore = mechanisms.indexOf('cdp-add-script-before-load') !== -1
+  const cdpAfter = mechanisms.indexOf('cdp-add-script-after-load') !== -1
+  const frameInjected = mechanisms.indexOf('frame-injection') !== -1
+  state.installed = mechanisms.length > 0
+  state.beforePageScripts = htmlInjected || cdpBefore
+  state.mechanism = htmlInjected
+    ? 'html-injection'
+    : cdpBefore
+      ? 'cdp-add-script-before-load'
+      : cdpAfter
+        ? 'cdp-add-script-after-load'
+        : frameInjected
+          ? 'frame-injection'
+          : 'none'
+  state.auxiliaryMechanisms = mechanisms.filter((name) => name !== state.mechanism)
+  state.degraded = !state.beforePageScripts
+  state.source = htmlInjected
+    ? 'inline tap injected as the first script of every forwarded document (runs before the bridge and any other page script)'
+    : cdpBefore
+      ? 'CDP Page.addScriptToEvaluateOnNewDocument, registered before the first document'
+      : cdpAfter
+        ? 'DEGRADED - CDP registration after load plus frame injection: constructions made by the first page scripts may be missed'
+        : frameInjected
+          ? 'DEGRADED - frame injection after load only: constructions made by the first page scripts may be missed'
+          : 'not installed - no tap mechanism took effect'
+  return state
+}
+
+/**
+ * Register the tap for future documents. This is DELIBERATELY not awaited: the CDP
+ * command can stay pending until a page target exists (observed: it never settled
+ * before load, and awaiting it hung the whole run until the launcher watchdog killed
+ * the child). The registration gets a 1.5 s budget and the run proceeds immediately;
+ * the inline document injection above is what actually guarantees `beforePageScripts`.
+ */
+function installSocketTap(webContents) {
+  const state = {
+    installed: false,
+    beforePageScripts: false,
+    attemptedSource: 'CDP Page.addScriptToEvaluateOnNewDocument (attempted before the first document)',
+    source: 'pending',
+    mechanism: 'none',
+    mechanisms: [],
+    htmlInjections: 0,
+    scriptId: null,
+    error: null,
+    frameInjections: 0,
+    loadStartedAt: null,
+  }
+  report.socketTap = state
+  sendCdpWithTimeout(webContents, 'Page.addScriptToEvaluateOnNewDocument', { source: SOCKET_TAP_SOURCE }, 1500)
+    .then((result) => {
+      state.scriptId = result && result.identifier ? result.identifier : null
+      recordSocketMechanism(state, state.loadStartedAt === null ? 'cdp-add-script-before-load' : 'cdp-add-script-after-load')
+      log(`site socket tap CDP registration settled (${state.scriptId || 'no identifier'})`)
+    })
+    .catch((err) => {
+      state.error = err.message
+      log(`site socket tap CDP registration did not settle: ${err.message} (inline/frame injection in use)`)
+    })
+  return state
+}
+
+/**
+ * Second registration attempt once the page target exists. The pre-load attempt can
+ * time out (no document yet), the post-load one normally succeeds and then covers
+ * documents created later. It can never make `beforePageScripts` true.
+ */
+async function retrySocketTapRegistration(webContents) {
+  const state = report.socketTap || { frameInjections: 0 }
+  try {
+    const result = await sendCdpWithTimeout(webContents, 'Page.addScriptToEvaluateOnNewDocument', {
+      source: SOCKET_TAP_SOURCE,
+    })
+    state.scriptId = result && result.identifier ? result.identifier : state.scriptId || null
+    recordSocketMechanism(state, 'cdp-add-script-after-load')
+    log(`site socket tap registered after load (${state.scriptId || 'no identifier'})`)
+  } catch (err) {
+    state.retryError = err.message
+    log(`site socket tap post-load registration failed: ${err.message}`)
+  }
+  report.socketTap = state
+  return state
+}
+
+/**
+ * Fallback / reinforcement: inject the tap into every frame that exists right now.
+ * Safe to call repeatedly (the tap self-guards with an `already-installed` return).
+ * It wraps whichever WebSocket constructor the frame currently exposes, so
+ * page-level constructions are still recorded with their own stack even when the
+ * bridge patched first - but it runs after load, so it counts as a degraded path.
+ */
+async function injectSocketTapIntoFrames(webContents, state) {
+  const frames = descendantFrames(webContents.mainFrame)
+  let injected = 0
+  for (const frame of frames) {
+    try {
+      const result = await frame.executeJavaScript(SOCKET_TAP_SOURCE, false)
+      if (result === 'installed' || result === 'already-installed') injected += 1
+    } catch (err) {
+      /* frame has no JS context yet or navigated away */
+    }
+  }
+  if (state) {
+    state.frameInjections += injected
+    if (injected > 0) recordSocketMechanism(state, 'frame-injection')
+  }
+  return injected
+}
+
+function classifySocketConstruction(entry) {
+  // Deterministic attribution, decided in the page at construction time:
+  //   byProbe    - the harness probe set __DSH_SHELL_HARNESS_PROBE__
+  //   bridgeOnly - the stack carries a bridge.js frame and no page-script frame
+  // Everything else is a page-initiated construction. No URL/timestamp guessing.
+  if (!entry) return 'bridge'
+  if (entry.byProbe === true) return 'probe'
+  if (entry.bridgeOnly === true) return 'bridge'
+  return 'site'
+}
+
+async function collectSocketEvidence(webContents) {
+  const frames = descendantFrames(webContents.mainFrame)
+  const tapped = []
+  const framesTapped = []
+  for (const frame of frames) {
+    try {
+      const raw = await frame.executeJavaScript(
+        `(() => {
+          const tap = window.__DSH_SHELL_HARNESS_TAP__
+          if (!tap) return null
+          return JSON.stringify({ source: tap.source, records: tap.records })
+        })()`,
+        false,
+      )
+      if (!raw) continue
+      const parsed = JSON.parse(raw)
+      framesTapped.push(frame.url)
+      for (const entry of parsed.records || []) tapped.push({ ...entry, frameUrl: frame.url })
+    } catch (err) {
+      /* frame navigated away or has no tap: it simply contributes nothing */
+    }
+  }
+  const probeSocket = tapped.filter((entry) => classifySocketConstruction(entry) === 'probe')
+  const bridgeSocket = tapped.filter((entry) => classifySocketConstruction(entry) === 'bridge')
+  const siteSocket = tapped.filter((entry) => classifySocketConstruction(entry) === 'site')
+  return { tapped, siteSocket, probeSocket, bridgeSocket, framesTapped, framesSeen: frames.length }
+}
+
+function socketCollection(state, entries, source) {
+  const urls = []
+  for (const entry of entries) {
+    if (entry && entry.url && urls.indexOf(entry.url) === -1) urls.push(entry.url)
+  }
+  return {
+    source,
+    observed: entries.length > 0,
+    count: entries.length,
+    urls,
+    constructions: entries.map((entry) => ({
+      url: entry.url,
+      at: entry.at,
+      frameUrl: entry.frameUrl,
+      byProbe: entry.byProbe === true,
+      hasBridgeFrame: entry.hasBridgeFrame === true,
+      hasSiteFrame: entry.hasSiteFrame === true,
+      bridgeOnly: entry.bridgeOnly === true,
+      stackHint: String(entry.stackHint || '').slice(0, 300),
+    })),
+    state,
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 6. Frame sampling                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -1076,7 +1482,16 @@ function looksLikeStation(frameUrl) {
 const PROBE_WS_URL = 'ws://dsh-app/socket.io/?EIO=4&transport=websocket'
 const PROBE_SCRIPT = `(() => {
   try {
-    const socket = new WebSocket(${JSON.stringify(PROBE_WS_URL)})
+    const tap = window.__DSH_SHELL_HARNESS_TAP__
+    window.__DSH_SHELL_HARNESS_PROBE__ = true
+    let socket
+    try {
+      socket = tap && typeof tap.probe === 'function'
+        ? tap.probe(${JSON.stringify(PROBE_WS_URL)})
+        : new WebSocket(${JSON.stringify(PROBE_WS_URL)})
+    } finally {
+      window.__DSH_SHELL_HARNESS_PROBE__ = false
+    }
     window.__dshHarnessProbeSocket = socket
     socket.addEventListener('open', () => {
       try { socket.send('40') } catch (err) {}
@@ -1115,6 +1530,47 @@ async function sampleFrame(webContents) {
   payload.frameCount = frames.length
   payload.isStation = Boolean(station)
   return payload
+}
+
+/**
+ * Optional credentialed / project-open mode (t14): point the station iframe at a
+ * real project route so the site boots past its landing page, and count what the
+ * site's own socket does. The session may carry a cookie supplied through
+ * --cookie / --cookie-file / --host-cookie; the harness NEVER reads the host's
+ * cookie store itself (non-interference rule above), and the cookie value is never
+ * logged or echoed into the report - only whether one was provided.
+ */
+async function maybeOpenProject(webContents) {
+  const requested = options.openProject
+  if (!requested) return null
+  const target =
+    requested.charAt(0) === '/' || /^[a-z][a-z0-9+.-]*:\/\//i.test(requested)
+      ? requested
+      : `/overleaf-proxy/project/${requested}`
+  let result
+  try {
+    result = await webContents.mainFrame.executeJavaScript(
+      `(() => {
+        const station = document.getElementById('station')
+        if (!station) return 'no-station-frame'
+        station.src = ${JSON.stringify(target)}
+        return station.src
+      })()`,
+      false,
+    )
+  } catch (err) {
+    result = `error: ${err.message}`
+  }
+  log(`open-project: ${target} (station navigation: ${JSON.stringify(result)})`)
+  await delay(5000)
+  report.openProject = {
+    requested,
+    target,
+    result,
+    cookieProvided: Boolean(options.hostCookie),
+    cookieSource: options.cookieSource || '',
+  }
+  return report.openProject
 }
 
 function messagesOf(sample) {
@@ -1217,15 +1673,27 @@ async function main() {
     fail(`renderer gone: ${JSON.stringify(details)}`)
   })
   attachNetworkRecorder(window.webContents, ses)
+  // Fired, never awaited: a CDP command that stays pending must not delay the run
+  // (see installSocketTap). The frame injection below covers the frames anyway.
+  installSocketTap(window.webContents)
+  // Reinforcement for frames the CDP registration cannot reach (or when it did not
+  // take): inject as soon as a frame navigates, and again after load.
+  window.webContents.on('did-frame-navigate', () => {
+    injectSocketTapIntoFrames(window.webContents, report.socketTap).catch(() => {})
+  })
 
   const frameUrl =
     options.frameOrigin === 'http' ? `${hostBase}/overleaf-proxy/` : `dsh-app://app${HARNESS_DOC_PATH}`
   log(`loading ${frameUrl}`)
+  if (report.socketTap) report.socketTap.loadStartedAt = Date.now()
   try {
     await window.loadURL(frameUrl)
   } catch (err) {
     fail(`loadURL failed: ${err.message}`)
   }
+  await injectSocketTapIntoFrames(window.webContents, report.socketTap)
+  await retrySocketTapRegistration(window.webContents)
+  await maybeOpenProject(window.webContents)
 
   const deadline = Date.now() + options.timeoutSec * 1000
   const settleMs = options.settleSec * 1000
@@ -1336,6 +1804,40 @@ async function main() {
     .filter((entry) => /^dsh-app:\/\/app(?:[:/]|$)/i.test(entry.url))
     .map((entry) => ({ url: entry.url, kind: entry.kind, count: entry.count }))
 
+  // Site-built socket evidence: a second, independent channel that never borrows
+  // from the harness probe. Empty here means "no site-built socket observed".
+  await injectSocketTapIntoFrames(window.webContents, report.socketTap)
+  const socketEvidence = await collectSocketEvidence(window.webContents)
+  // Finalize the tap state first: `installed` / `beforePageScripts` / `mechanism`
+  // are derived from the mechanisms that actually took effect, and the socket
+  // collections below read that same verdict (never a second, disagreeing copy).
+  report.socketTap = finalizeSocketTapState({
+    ...report.socketTap,
+    framesInjected: socketEvidence.framesTapped,
+    framesSeen: socketEvidence.framesSeen,
+    totalConstructions: socketEvidence.tapped.length,
+    siteConstructions: socketEvidence.siteSocket.length,
+    probeConstructions: socketEvidence.probeSocket.length,
+    bridgeConstructions: socketEvidence.bridgeSocket.length,
+  })
+  const tapInstalled = Boolean(report.socketTap.installed)
+  report.siteSocket = socketCollection(
+    {
+      tapInstalled,
+      framesInjected: socketEvidence.framesTapped,
+      framesSeen: socketEvidence.framesSeen,
+    },
+    socketEvidence.siteSocket,
+    'page WebSocket constructor tap (excludes harness probe and bridge-internal constructions)',
+  )
+  report.probeSocket = socketCollection({ tapInstalled }, socketEvidence.probeSocket, 'harness in-page probe (socketProbe/PROBE_WS_URL)')
+  report.bridgeSocketExcluded = socketCollection({}, socketEvidence.bridgeSocket, 'bridge-internal constructions excluded from siteSocket (stack carries only bridge.js frames)')
+  log(
+    `site socket evidence: site=${socketEvidence.siteSocket.length} probe=${socketEvidence.probeSocket.length} ` +
+      `bridgeExcluded=${socketEvidence.bridgeSocket.length} framesInjected=${socketEvidence.framesTapped.length} ` +
+      `beforePageScripts=${report.socketTap.beforePageScripts} mechanism=${report.socketTap.mechanism}`,
+  )
+
   const assertions = []
   const assert = (criterion, ok, evidence) => {
     assertions.push({ criterion, status: ok ? 'passed' : 'failed', evidence })
@@ -1407,6 +1909,19 @@ async function main() {
       probeRoutedToTunnel,
       `probe=${JSON.stringify(report.socketProbe || null)} probeRoutedToTunnel=${probeRoutedToTunnel}`,
     )
+    // Attribution gate: the probe proves the bridge+tunnel path, NOT that the site
+    // connected. This assertion is the only one allowed to speak for the site and
+    // it reads the constructor tap exclusively (never socketProbe/diagnostics).
+    assert(
+      'site-built socket observed (page-created WebSocket; probe/bridge constructions never fill this set)',
+      socketEvidence.siteSocket.length > 0,
+      socketEvidence.siteSocket.length > 0
+        ? `${socketEvidence.siteSocket.length} construction(s): ${report.siteSocket.urls.slice(0, 3).join(', ')}`
+        : `未观测到站点自建 socket (site-built socket not observed) - probe constructions: ${socketEvidence.probeSocket.length}, ` +
+          `bridge-internal excluded: ${socketEvidence.bridgeSocket.length}, frames tapped: ${socketEvidence.framesTapped.length} of ${socketEvidence.framesSeen}, ` +
+          `tap installed: ${Boolean(report.socketTap && report.socketTap.installed)}, mechanism: ${report.socketTap ? report.socketTap.mechanism : 'n/a'}, ` +
+          `before page scripts: ${Boolean(report.socketTap && report.socketTap.beforePageScripts)}`,
+    )
     assert(
       `at least one real WebSocket request targets the loopback tunnel (127.0.0.1:${tunnelPort})`,
       tunnelSocketRequests.length > 0,
@@ -1453,6 +1968,29 @@ function printDiagnostics() {
   )
   log(`clean dsh-app://app targets: ${report.cleanShellDocs.length}`)
   log(`websocket targets: ${report.websocketTargets.length === 0 ? 'none' : report.websocketTargets.join(' | ')}`)
+  log(
+    `site socket (constructor tap): ${
+      report.siteSocket
+        ? report.siteSocket.count === 0
+          ? '未观测到站点自建 socket (site-built socket not observed)'
+          : `${report.siteSocket.count} construction(s) - ${report.siteSocket.urls.join(' | ')}`
+        : 'n/a'
+    }`,
+  )
+  log(
+    `probe socket: ${
+      report.probeSocket
+        ? report.probeSocket.count === 0
+          ? 'none'
+          : `${report.probeSocket.count} construction(s) - ${report.probeSocket.urls.join(' | ')}`
+        : 'n/a'
+    }`,
+  )
+  log(
+    `bridge-internal constructions excluded from the site set: ${
+      report.bridgeSocketExcluded ? report.bridgeSocketExcluded.count : 'n/a'
+    }`,
+  )
   for (const line of report.consoleMessages.slice(-12)) log(`console[${line.level}] ${line.message}`)
   for (const error of report.errors.slice(-6)) log(`error: ${error}`)
 }
