@@ -211,9 +211,20 @@
  *   --cookie-file=<path> same, always read from the given file
  *   --open-project=<id|url>
  *                        after load, point the station iframe at
- *                        /overleaf-proxy/project/<id> (or at the given URL) so the
- *                        site boots into a project instead of its landing page;
- *                        the outcome lands in the report's `openProject` key
+ *                        /overleaf-proxy/console/<id> (the site's project route; an
+ *                        explicit path or URL is used as-is) so the site boots into
+ *                        a project instead of its landing page. The outcome lands in
+ *                        `openProject{}`: frameUrl / documentStatus / documentBytes /
+ *                        documentHasBridgeTag / readyState / bridgeAttribute /
+ *                        bridgeScriptTag, so a 404 route can never masquerade as a
+ *                        loaded project. Bridge attributes are re-collected from the
+ *                        frame that navigated, and the in-page probe is forced onto
+ *                        the current frame (`socketProbe.trigger`) even when no
+ *                        bridge attribute ever appears.
+ *   SECURITY: a cookie supplied via --cookie/--cookie-file/--host-cookie is never
+ *   logged, never written into the report and never committed; only
+ *   `openProject.cookieProvided` / `openProject.cookieSource` metadata is recorded.
+ *   Keep cookie files under .tmp/ (gitignored) and never copy them elsewhere.
  *   --report=<path>      JSON report path (default <worktree>\.tmp\desktop-shell-report.json)
  *
  *   TIMEOUT BUDGET: nothing in the harness waits on CDP any more (the socket tap
@@ -594,8 +605,31 @@ function shellForwardHeaders() {
   return headers
 }
 
+/**
+ * Credential material supplied through --cookie / --cookie-file / --host-cookie must
+ * never reach stdout, the report or a commit. Every log line and the serialized
+ * report pass through this redactor (defence in depth: the Origin self-check no
+ * longer echoes the cookie either).
+ */
+function redactSecrets(text) {
+  let out = String(text)
+  try {
+    const cookie = typeof options !== 'undefined' && options && options.hostCookie ? String(options.hostCookie) : ''
+    if (!cookie) return out
+    if (out.indexOf(cookie) !== -1) out = out.split(cookie).join('[redacted-cookie]')
+    for (const pair of cookie.split(';')) {
+      const eq = pair.indexOf('=')
+      const value = eq === -1 ? '' : pair.slice(eq + 1).trim()
+      if (value.length >= 6 && out.indexOf(value) !== -1) out = out.split(value).join('[redacted]')
+    }
+  } catch (err) {
+    /* never let redaction break the run */
+  }
+  return out
+}
+
 function log(message) {
-  const line = `${new Date().toISOString()} [harness] ${message}`
+  const line = redactSecrets(`${new Date().toISOString()} [harness] ${message}`)
   logLines.push(line)
   if (stdoutBroken) return
   try {
@@ -685,7 +719,9 @@ function flushReport() {
     failedAssertions.length === 0 && report.errors.length === 0 && report.exitCode === EXIT_PASSED ? 'pass' : 'fail'
   try {
     fs.mkdirSync(path.dirname(report.report), { recursive: true })
-    fs.writeFileSync(report.report, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    // Redaction happens on the serialized bytes, so no nested key can smuggle a
+    // cookie value (or a single cookie pair) into the report.
+    fs.writeFileSync(report.report, redactSecrets(`${JSON.stringify(report, null, 2)}\n`), 'utf8')
     return true
   } catch (err) {
     report.errors.push(`could not write report: ${err.message}`)
@@ -854,7 +890,15 @@ async function originSelfCheck() {
   for (const wanted of [0, 34567, 45123]) {
     const server = createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ origin: req.headers.origin || null, cookie: req.headers.cookie || null }))
+      // Never echo credential material: only whether a cookie was present and how
+      // long it was (the report must stay free of cookie values).
+      res.end(
+        JSON.stringify({
+          origin: req.headers.origin || null,
+          cookiePresent: Boolean(req.headers.cookie),
+          cookieBytes: req.headers.cookie ? String(req.headers.cookie).length : 0,
+        }),
+      )
     })
     try {
       await new Promise((resolve, reject) => {
@@ -1015,6 +1059,16 @@ async function forwardToHost(request, url, hostBase) {
   let servedBody = body
   if (/text\/html/i.test(servedContentType) && request.method !== 'HEAD' && body.length > 0) {
     servedBody = injectSocketTapIntoHtml(body)
+  }
+  if (/text\/html/i.test(servedContentType)) {
+    // Last known status per document path: the sample list is capped, so this map is
+    // what `--open-project` reads to prove whether the project route really loaded.
+    if (!report.documentStatuses) report.documentStatuses = {}
+    report.documentStatuses[`${target.pathname}${target.search}`] = {
+      status: upstream.status,
+      bytes: body.length,
+      hasBridgeTag: body.toString('utf8', 0, Math.min(body.length, 200000)).indexOf(BRIDGE_PATH) !== -1,
+    }
   }
   return new Response(servedBody, {
     status: upstream.status,
@@ -1537,8 +1591,14 @@ async function sampleFrame(webContents) {
  * real project route so the site boots past its landing page, and count what the
  * site's own socket does. The session may carry a cookie supplied through
  * --cookie / --cookie-file / --host-cookie; the harness NEVER reads the host's
- * cookie store itself (non-interference rule above), and the cookie value is never
- * logged or echoed into the report - only whether one was provided.
+ * cookie store itself (non-interference rule above), and the cookie value never
+ * appears in a log line, in the report, or in any committed file - only
+ * `cookieProvided` / `cookieSource` metadata is recorded.
+ *
+ * Target shape: a bare id becomes `/overleaf-proxy/console/<id>`, which is the
+ * site's own project route (verified against the host proxy: `/console/<id>` serves
+ * the bridged HTML while the legacy `/project/<id>` shape 404s). An explicit path
+ * or absolute URL is used exactly as passed.
  */
 async function maybeOpenProject(webContents) {
   const requested = options.openProject
@@ -1546,7 +1606,7 @@ async function maybeOpenProject(webContents) {
   const target =
     requested.charAt(0) === '/' || /^[a-z][a-z0-9+.-]*:\/\//i.test(requested)
       ? requested
-      : `/overleaf-proxy/project/${requested}`
+      : `/overleaf-proxy/console/${requested}`
   let result
   try {
     result = await webContents.mainFrame.executeJavaScript(
@@ -1562,15 +1622,83 @@ async function maybeOpenProject(webContents) {
     result = `error: ${err.message}`
   }
   log(`open-project: ${target} (station navigation: ${JSON.stringify(result)})`)
-  await delay(5000)
+  // Re-collect from the frame that actually navigated: the landing page's samples
+  // are stale the moment the project route loads, so they must never feed the verdict.
+  const loaded = await waitForStationFrame(webContents, target)
+  const forward = (report.forwardSamples || [])
+    .filter((entry) => entry.document && entry.path === target)
+    .pop()
+  const documented = report.documentStatuses ? report.documentStatuses[target] : null
   report.openProject = {
     requested,
     target,
     result,
     cookieProvided: Boolean(options.hostCookie),
     cookieSource: options.cookieSource || '',
+    frameUrl: loaded ? loaded.frameUrl : null,
+    readyState: loaded ? loaded.readyState : null,
+    title: loaded ? loaded.title : null,
+    bridgeAttribute: loaded ? loaded.bridge : null,
+    bridgeScriptTag: loaded ? loaded.hasBridge : null,
+    documentStatus: documented ? documented.status : forward ? forward.status : null,
+    documentBytes: documented ? documented.bytes : forward ? forward.bytes : null,
+    documentHasBridgeTag: documented
+      ? documented.hasBridgeTag
+      : forward
+        ? forward.hasBridgeTag
+        : null,
+    documentLoaded: Boolean(loaded && loaded.readyState === 'complete' && loaded.hasBridge),
   }
+  log(
+    `open-project loaded: frame=${report.openProject.frameUrl} status=${report.openProject.documentStatus} ` +
+      `readyState=${report.openProject.readyState} bridge=${JSON.stringify(report.openProject.bridgeAttribute)} ` +
+      `bridgeScript=${report.openProject.bridgeScriptTag}`,
+  )
+  await delay(3000)
   return report.openProject
+}
+
+/**
+ * Wait until the station frame carries the requested route and finished its document
+ * load, re-reading the bridge attributes from THAT frame. Returns the last partial
+ * observation instead of throwing; a non-2xx route shows up as `documentStatus` on
+ * the forwarded sample list, so a 404 project route can never masquerade as a
+ * loaded project.
+ */
+async function waitForStationFrame(webContents, pathFragment, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  // Do not accept "some station frame" while the requested route is still loading:
+  // the landing page matches looksLikeStation() too, and accepting it would record
+  // the console page as if the project had opened.
+  const fallbackAt = Date.now() + 6000
+  let last = null
+  while (Date.now() < deadline) {
+    const frames = descendantFrames(webContents.mainFrame)
+    const exact = frames.find((frame) => String(frame.url).indexOf(pathFragment) !== -1)
+    const station = exact || (Date.now() > fallbackAt ? frames.find((frame) => looksLikeStation(frame.url)) : null)
+    if (station) {
+      try {
+        const info = JSON.parse(
+          await station.executeJavaScript(
+            `JSON.stringify({
+              href: location.href,
+              readyState: document.readyState,
+              title: document.title,
+              hasBridge: Boolean(document.querySelector('script[src*="bridge.js"]')),
+              bridge: (document.documentElement && document.documentElement.getAttribute('data-dsh-overleaf-bridge')) || null,
+            })`,
+            false,
+          ),
+        )
+        last = { frameUrl: station.url, ...info }
+        if (info.readyState === 'complete' && info.hasBridge) return last
+      } catch (err) {
+        /* frame is mid-navigation */
+      }
+    }
+    await delay(400)
+  }
+  return last
 }
 
 function messagesOf(sample) {
@@ -1703,6 +1831,10 @@ async function main() {
   let lastSample = null
   let settleDeadline = 0
   let probeRun = false
+  // With --open-project the landing page's bridge attributes are gone, so the probe
+  // is also forced once the project route has had time to boot: it must run against
+  // the CURRENT station frame and never silently end as probe=null.
+  const probeFallbackAt = report.openProject ? Date.now() + 8000 : 0
 
   while (Date.now() < deadline) {
     const sample = await sampleFrame(window.webContents)
@@ -1711,9 +1843,10 @@ async function main() {
     const attrs = attributeMap(sample)
     const messages = messagesOf(sample)
     const target = attrs['ws-target'] || ''
-    if (!probeRun && attrs.bridge === 'ready') {
+    if (!probeRun && (attrs.bridge === 'ready' || (probeFallbackAt !== 0 && Date.now() > probeFallbackAt))) {
       probeRun = true
-      report.socketProbe = { url: PROBE_WS_URL, ...(await runSocketProbe(window.webContents)) }
+      const probeTrigger = attrs.bridge === 'ready' ? 'bridge-ready' : 'open-project-fallback'
+      report.socketProbe = { url: PROBE_WS_URL, trigger: probeTrigger, ...(await runSocketProbe(window.webContents)) }
       log(`socket probe: ${JSON.stringify(report.socketProbe)}`)
       await delay(1500)
       continue
