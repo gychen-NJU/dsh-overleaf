@@ -2,7 +2,7 @@
 
 - **文档日期**：2026-09-30（排查者：DSH 会话，非本仓库作者）
 - **适用仓库**：https://github.com/gychen-NJU/dsh-overleaf ，工作副本 `E:\GalaxyC\DSH\DSH-Overleaf\dsh-overleaf`
-- **涉及插件版本**：v1.0.0（HEAD `54bd653`，`lib/` 已提交）
+- **涉及插件版本**：排查时 HEAD = `54bd653`（v1.0.0，`lib/` 已提交）；修复随后落在 **v1.0.1**（见 `docs/desktop-verification.md`）。本行保留排查时的时间语境
 - **受影响宿主**：**仅 DSH 桌面端**（Electron 壳 0.2.0-rc.2，内置内核，`http://127.0.0.1:19387`，profile = `desktop`）
 - **不受影响**：`dsh web`（npm 全局 0.1.7-rc.2，`http://127.0.0.1:3080`，profile = `web`）——实测可正常打开工作台、无验证界面
 - **一句话根因**：桌面壳的页面 origin 是自定义协议 **`dsh-app://app`**；站点（TeXPage/Overleaf 前台）用 `location.protocol` / `location.host` 拼跨源 URL，拼出来的是 `dsh-app://…` / `ws://dsh-app/…`，**壳无法服务这类 URL**；而本插件的桥脚本（`src/inject-script.ts`）所有改写规则都以 http(s)/ws(s) 为前提，于是把这些 URL **原样放行** ⇒ 站点 socket 与心跳全挂 ⇒ 站点起不来。
