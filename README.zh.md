@@ -72,13 +72,23 @@ Overleaf 的每个响应都带 `X-Frame-Options` / CSP `frame-ancestors`，直�
 
 npm 包名 `dsh-overleaf` 已被另一项目占用，因此本插件**不发布 npm**——请直接从 GitHub 安装。仓库已提交预构建的 `lib/` 产物，git 安装**无需构建步骤、无需 allowBuilds 授权**：
 
+> **本分支为 DSH 桌面版专用**：它修复了桌面壳（自定义协议 `dsh-app://`）下工作台打不开的问题，并顺带修复 TeXPage 站点的 Socket.IO 地址构造（否则桌面端会出现 `Invalid namespace`、编辑器无法同步）。
+> - **DSH 桌面版请安装本 `desktop` 分支**（下面的示例即 `desktop` 分支）
+> - **`dsh web` 桌面无关用户请安装 `main` 分支**（桌面壳之外的行为两分支一致）
+
 ```sh
-# 从 GitHub 安装，跟踪 main 分支（推荐，跟随最新特性）：
+# DSH 桌面版：安装 desktop 分支（桌面壳专用修复）
+dsh plugin --profile desktop add github:gychen-NJU/dsh-overleaf#desktop
+
+# web 版：安装 main 分支（跟踪最新特性）
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
-# 或锁定某个已发布的版本：
+# 或锁定某个已发布的版本（web 端）：
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v1.0.0
 ```
+
+安装后**必须退出并重开 DeepSeek Harness**：桥脚本由宿主每次请求现读，而客户端 bundle 与宿主模块（含 TeXPage 站点脚本适配器）只在启动期加载，不重启不生效。
+
 
 从 release 资产安装（在 [Releases](https://github.com/gychen-NJU/dsh-overleaf/releases) 下载 `.tgz`）：
 

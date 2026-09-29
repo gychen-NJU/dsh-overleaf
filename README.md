@@ -72,13 +72,23 @@ Overleaf sends `X-Frame-Options` / CSP `frame-ancestors` on every response, so a
 
 The npm package name `dsh-overleaf` is occupied by another project, so this plugin is **not published to npm** — install it from GitHub instead. The repository commits the prebuilt `lib/` bundle, so git installs need **no build step and no `allowBuilds` authorization**:
 
+> **This branch is the desktop-specific one.** It fixes the workbench failing to open inside the DSH desktop shell (custom `dsh-app://` scheme) and repairs TeXPage's Socket.IO origin construction, without which the desktop editor reports `Invalid namespace` and never syncs.
+> - **DSH desktop: install this `desktop` branch** (the command below does)
+> - **`dsh web` users: install `main`** — behaviour outside the desktop shell is identical across both branches
+
 ```sh
-# From GitHub, tracking the main branch (recommended for latest features):
+# DSH desktop: install the desktop branch (desktop-shell fixes)
+dsh plugin --profile desktop add github:gychen-NJU/dsh-overleaf#desktop
+
+# dsh web: install main (tracks latest features)
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf
 
-# Or pin an exact released version:
+# Or pin an exact released version (web):
 dsh plugin --profile web add github:gychen-NJU/dsh-overleaf#v1.0.0
 ```
+
+After installing, **quit and reopen DeepSeek Harness**: the bridge script is read from disk per request, but the client bundle and the host-side modules (including the TeXPage site-script adapter) load only at startup.
+
 
 From a release tarball (download the `.tgz` attached to the [latest release](https://github.com/gychen-NJU/dsh-overleaf/releases)):
 
