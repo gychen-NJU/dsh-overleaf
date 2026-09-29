@@ -28,6 +28,10 @@ rem 3 internal). Evidence: the JSON report, whose absolute path the harness prin
 rem and stores in its own "report" key (default <worktree>\.tmp\desktop-shell-report.json).
 rem ---------------------------------------------------------------------------
 setlocal
+set "TEMP=%~dp0..\.tmp\launcher-temp"
+set "TMP=%TEMP%"
+set "TMPDIR=%TEMP%"
+if not exist "%TEMP%" mkdir "%TEMP%"
 if defined ELECTRON_RUN_AS_NODE set "DSH_HARNESS_RUN_AS_NODE_BEFORE=%ELECTRON_RUN_AS_NODE%"
 set "ELECTRON_RUN_AS_NODE="
 

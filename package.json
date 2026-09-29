@@ -54,7 +54,7 @@
   "scripts": {
     "build": "tsc -b && tsdown",
     "typecheck": "tsc -b --pretty false",
-    "test": "node scripts/smoke-navigation.mjs && node scripts/smoke-login.mjs && node scripts/smoke-texpage.mjs && node scripts/smoke-texpage-socket.mjs && node --test scripts/smoke-desktop-scheme.mjs scripts/smoke-socket-routing.mjs scripts/smoke-texpage-output.mjs scripts/smoke-output-routing.mjs && node --test scripts/smoke-bib-compat.mjs scripts/smoke-texpage-bib.mjs scripts/smoke-texpage-bib-proxy.mjs scripts/smoke-texpage-tex-sync.mjs scripts/smoke-texpage-tex-proxy.mjs && node scripts/smoke-offline.mjs && node scripts/smoke-live.mjs",
+    "test": "node scripts/smoke-navigation.mjs && node scripts/smoke-login.mjs && node scripts/smoke-texpage.mjs && node scripts/smoke-texpage-socket.mjs && node --test scripts/smoke-texpage-desktop-asset.mjs scripts/smoke-desktop-harness.mjs scripts/smoke-desktop-scheme.mjs scripts/smoke-socket-routing.mjs scripts/smoke-texpage-output.mjs scripts/smoke-output-routing.mjs && node --test scripts/smoke-bib-compat.mjs scripts/smoke-texpage-bib.mjs scripts/smoke-texpage-bib-proxy.mjs scripts/smoke-texpage-tex-sync.mjs scripts/smoke-texpage-tex-proxy.mjs && node scripts/smoke-offline.mjs && node scripts/smoke-live.mjs",
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {

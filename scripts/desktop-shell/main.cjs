@@ -28,9 +28,15 @@
  * 3 internal); it is propagated even if the module never loads.
  */
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
+const tmpRoot = path.resolve(__dirname, '..', '..', '.tmp')
+const runtimeTmp = path.resolve(process.env.DSH_HARNESS_RUNTIME_TMP || path.join(tmpRoot, `electron-direct-${process.pid}`))
+const relativeTmp = path.relative(tmpRoot, runtimeTmp)
+if (!relativeTmp || relativeTmp.startsWith('..') || path.isAbsolute(relativeTmp)) throw new Error('Runtime temp must be inside desktop .tmp/')
+fs.mkdirSync(runtimeTmp, { recursive: true })
+process.env.TEMP = process.env.TMP = process.env.TMPDIR = runtimeTmp
+process.env.DSH_HARNESS_RUNTIME_TMP = runtimeTmp
 
 let electron = null
 try {
@@ -44,6 +50,13 @@ if (!app || !protocol) {
   process.stderr.write('[harness] electron runtime unavailable: no app/protocol module\n')
   process.exit(2)
 }
+// Configure paths synchronously before Chromium starts or the ESM import yields.
+for (const [key, name] of [['userData', 'profile'], ['sessionData', 'session'], ['crashDumps', 'crashes']]) {
+  const destination = path.join(runtimeTmp, name)
+  fs.mkdirSync(destination, { recursive: true })
+  app.setPath(key, destination)
+}
+app.setPath('temp', runtimeTmp)
 
 // Same privileges the desktop shell declares for dsh-app; must be registered
 // before the app becomes ready.
@@ -73,7 +86,7 @@ function reportLoadFailure(detail) {
   const line = `${new Date().toISOString()} ${detail}\n`
   process.stderr.write(`[harness] could not load ${harnessPath}: ${detail}\n`)
   try {
-    fs.appendFileSync(path.join(os.tmpdir(), 'dsh-overleaf-shell-harness-load-error.txt'), line)
+    fs.appendFileSync(path.join(tmpRoot, 'desktop-shell-harness-load-error.txt'), line)
   } catch {
     /* best effort */
   }

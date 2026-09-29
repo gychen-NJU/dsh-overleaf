@@ -916,12 +916,9 @@ export function renderBridgeScript(): string {
     var parsed = new URL(String(raw), window.location.href)
     if (!/^(?:https?|wss?):$/.test(parsed.protocol) || parsed.username || parsed.password) return raw
     var path = parsed.pathname
-    /* socket.io namespaces live in the URL path (/socket.io/<namespace>), so only
-       the prefix may be tested. This check is inlined on purpose: the smoke suite
-       slices this one function out of the bundle and runs it in an isolated vm,
-       where any helper defined outside would be a ReferenceError swallowed by the
-       caller's try/catch - silently turning every case into a pass-through. */
-    var socketIoPath = path === '/socket.io' || path.indexOf('/socket.io/') === 0
+    /* Namespace selection belongs to Socket.IO CONNECT packets. Only the exact
+       transport endpoint may be forwarded to the announced socket origin. */
+    var socketIoPath = path === '/socket.io' || path === '/socket.io/'
     var socketOrigin = window.__DSH_OVERLEAF_SOCKET_ORIGIN__
     var upstreamOrigin = window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__
     var socketHost = typeof socketOrigin === 'string' ? new URL(socketOrigin).host : ''

@@ -201,6 +201,9 @@ test('shell: announced output/socket and content-origin branches keep priority',
 
 test('shell: websockets that are not /socket.io are passed through untouched', () => {
   for (const raw of [
+    'ws://app/socket.io/console',
+    'ws://dsh-app/socket.io/console',
+    'wss://socket.tex.nju.edu.cn/socket.io/console',
     'ws://app/sidebar/ws/agent-opens',
     'ws://app/sidebar/ws/fs-watch?sessionId=synthetic',
     'ws://dsh-app/sidebar/ws/agent-opens',

@@ -39,14 +39,8 @@ const COMPILE_REQUEST_TIMEOUT_MS = 10 * 60_000
 /** Timeout granted to establish the tunneled upstream TCP/TLS connection. */
 const UPGRADE_CONNECT_TIMEOUT_MS = 10_000
 
-/**
- * Upgrade paths the socket marker may carry to the upstream socket host:
- * - `/socket.io` and `/socket.io/` (default namespace), and
- * - `/socket.io/<namespace>[/]` (socket.io puts custom namespaces in the path,
- *   e.g. `/socket.io/console`), with at most two segments so the marker can
- *   never become an arbitrary-path tunnel.
- */
-const SOCKET_UPGRADE_PATH = /^\/socket\.io(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%-]+){0,2}\/?$/
+// Socket.IO namespaces travel in CONNECT packets, not in this transport path.
+const SOCKET_UPGRADE_PATH = /^\/socket\.io\/?$/
 
 /** Hop-by-hop headers that must never cross a proxy hop. */
 const HOP_BY_HOP = new Set([
@@ -719,9 +713,7 @@ export class ReverseProxy {
     const subPath = subPathOf(req.url, PROXY_PREFIX)
     let target: URL
     try { target = this.targetFor(subPath, false) } catch { socket.destroy(); return }
-    // socket.io namespaces ride in the URL path (/socket.io/<namespace>), so the
-    // marker must accept exactly one namespace segment - rejecting it destroys
-    // every namespaced upgrade and the site then reports "Invalid namespace".
+    // Keep the separate socket origin limited to its declared transport endpoint.
     if (subPath.startsWith(SOCKET_PROXY_PATH) && !SOCKET_UPGRADE_PATH.test(target.pathname)) { socket.destroy(); return }
     const isTls = target.protocol === 'https:'
     const port = Number(target.port) || (isTls ? 443 : 80)

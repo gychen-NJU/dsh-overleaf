@@ -291,9 +291,9 @@
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { observeSocketPacket, evaluateSiteSockets } from './desktop-socket-verdict.mjs'
 
 const EXIT_PASSED = 0
 const EXIT_ASSERTION = 1
@@ -307,6 +307,13 @@ const HARNESS_DOC_PATH = '/__dsh_shell_harness__'
 const BRIDGE_PATH = '/overleaf/workbench/bridge.js'
 const PROXY_PREFIX = '/overleaf-proxy'
 const DEFAULT_REPORT = path.join(WORKTREE, '.tmp', 'desktop-shell-report.json')
+const TMP_ROOT = path.join(WORKTREE, '.tmp')
+function workspaceTemporaryPath(value) {
+  const resolved = path.resolve(value)
+  const relative = path.relative(TMP_ROOT, resolved)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Harness output must be inside desktop worktree .tmp/')
+  return resolved
+}
 const DIAGNOSTIC_KEYS = ['bridge', 'ws-port', 'ws-target', 'ws-state', 'socketio-state', 'ws-messages']
 const POLLUTED_PATTERNS = [
   { name: 'ws://dsh-app/...', test: (url) => /^wss?:\/\/dsh-app(?:[:/]|$)/i.test(url) },
@@ -341,7 +348,7 @@ function parseArgs(argv) {
   const options = {
     hostPort: 19387,
     wsPort: 0,
-    timeoutSec: 60,
+    timeoutSec: 120,
     settleSec: 25,
     frameOrigin: 'shell',
     hostCookie: '',
@@ -350,6 +357,7 @@ function parseArgs(argv) {
     negativeControl: false,
     debugSockets: false,
     bridgeSource: 'worktree',
+    probe: false,
     help: false,
   }
   const read = (name) => {
@@ -369,6 +377,7 @@ function parseArgs(argv) {
   if (argv.includes('--help') || argv.includes('-h')) options.help = true
   if (argv.includes('--keep-tmp')) options.keepTmp = true
   if (argv.includes('--negative-control')) options.negativeControl = true
+  options.probe = read('probe') === 'on'
   // Opt-in socket instrumentation. Default OFF: with the flag absent every report
   // key, assertion and reading stays exactly as before.
   if (argv.includes('--debug-sockets')) options.debugSockets = true
@@ -404,7 +413,7 @@ function parseArgs(argv) {
   }
   options.cookieSource = cookieSource
   options.openProject = read('open-project') || read('openProject')
-  options.report = read('report') || read('json-out') || options.report
+  options.report = workspaceTemporaryPath(read('report') || read('json-out') || options.report)
   return options
 }
 
@@ -528,6 +537,10 @@ if (!options.help && !hasElectronApp) {
     if (electronExe) {
       const entry = isDir(APP_DIR) ? APP_DIR : fileURLToPath(import.meta.url)
       const env = { ...process.env, DSH_HARNESS_REEXEC: '1', DSH_HARNESS_ELECTRON_RUNTIME: electronExe }
+      const runtimeTmp = workspaceTemporaryPath(path.join(TMP_ROOT, `electron-${process.pid}-${Date.now()}`))
+      fs.mkdirSync(runtimeTmp, { recursive: true })
+      env.TEMP = env.TMP = env.TMPDIR = runtimeTmp
+      env.DSH_HARNESS_RUNTIME_TMP = runtimeTmp
       // Electron tests the variable's presence, so it must be deleted, not blanked.
       if (env.ELECTRON_RUN_AS_NODE) env.DSH_HARNESS_RUN_AS_NODE_BEFORE = env.ELECTRON_RUN_AS_NODE
       delete env.ELECTRON_RUN_AS_NODE
@@ -775,7 +788,7 @@ function flushReport() {
 /* ------------------------------------------------------------------ */
 
 const defaultUserData = app.getPath('userData')
-const userDataDir = path.join(os.tmpdir(), `dsh-overleaf-shell-harness-${process.pid}`)
+const userDataDir = workspaceTemporaryPath(path.join(process.env.DSH_HARNESS_RUNTIME_TMP || TMP_ROOT, `user-data-${process.pid}`))
 if (path.resolve(userDataDir) === path.resolve(defaultUserData)) {
   log('refusing to run: throwaway profile resolved to the real profile')
   process.exit(EXIT_INTERNAL)
@@ -783,6 +796,10 @@ if (path.resolve(userDataDir) === path.resolve(defaultUserData)) {
 fs.rmSync(userDataDir, { recursive: true, force: true })
 fs.mkdirSync(userDataDir, { recursive: true })
 app.setPath('userData', userDataDir)
+app.setPath('sessionData', userDataDir)
+const crashDir = workspaceTemporaryPath(path.join(userDataDir, 'crashes'))
+fs.mkdirSync(crashDir, { recursive: true })
+app.setPath('crashDumps', crashDir)
 report.userDataDir = userDataDir
 report.defaultUserData = defaultUserData
 report.environment.userDataDir = userDataDir
@@ -1247,6 +1264,7 @@ function attachNetworkRecorder(webContents, ses) {
 
 const SOCKET_TAP_SOURCE = `(() => {
   try {
+    var observePacket = ${observeSocketPacket.toString()}
     if (window.__DSH_SHELL_HARNESS_TAP__) return 'already-installed'
     var Native = window.WebSocket
     if (typeof Native !== 'function') return 'no-websocket-constructor'
@@ -1295,6 +1313,15 @@ const SOCKET_TAP_SOURCE = `(() => {
         entry.error =
           'WebSocket constructor threw for target ' + String(url) + ': ' + (err && err.message ? err.message : String(err))
         throw err
+      }
+      socket.addEventListener('open', function () { entry.opened = true })
+      socket.addEventListener('close', function (event) { entry.closed = true; entry.closeCode = event.code })
+      socket.addEventListener('error', function () { entry.error = 'socket error' })
+      socket.addEventListener('message', function (event) { observePacket(entry, 'received', event.data) })
+      var nativeSend = socket.send
+      socket.send = function (data) {
+        observePacket(entry, 'sent', data)
+        return nativeSend.call(this, data)
       }
       if (window.__DSH_SHELL_HARNESS_DEBUG__) {
         // Async failures are what the user actually sees ("connection lost"); capture
@@ -1855,7 +1882,10 @@ async function maybeOpenProject(webContents) {
   } else if (requested.charAt(0) === '/') {
     target = requested
   } else {
-    target = `${PREFIX}/console/${requested}`
+    throw new Error('--open-project requires the real /project/user/<owner>/<project> editor URL, not a bare project ID')
+  }
+  if (!/^\/overleaf-proxy\/project\/user\/[^/]+\/[^/?#]+(?:[?#]|$)/.test(target)) {
+    throw new Error('--open-project must identify a TeXPage /project/user/<owner>/<project> editor')
   }
   let result
   try {
@@ -1898,7 +1928,8 @@ async function maybeOpenProject(webContents) {
       : forward
         ? forward.hasBridgeTag
         : null,
-    documentLoaded: Boolean(loaded && loaded.readyState === 'complete' && loaded.hasBridge),
+    documentLoaded: Boolean(loaded && loaded.readyState === 'complete' && loaded.hasBridge && loaded.frameUrl.includes(target)),
+    editorReady: Boolean(loaded && loaded.editorReady),
   }
   log(
     `open-project loaded: frame=${report.openProject.frameUrl} status=${report.openProject.documentStatus} ` +
@@ -1921,12 +1952,11 @@ async function waitForStationFrame(webContents, pathFragment, timeoutMs = 15000)
   // Do not accept "some station frame" while the requested route is still loading:
   // the landing page matches looksLikeStation() too, and accepting it would record
   // the console page as if the project had opened.
-  const fallbackAt = Date.now() + 6000
   let last = null
   while (Date.now() < deadline) {
     const frames = descendantFrames(webContents.mainFrame)
     const exact = frames.find((frame) => String(frame.url).indexOf(pathFragment) !== -1)
-    const station = exact || (Date.now() > fallbackAt ? frames.find((frame) => looksLikeStation(frame.url)) : null)
+    const station = exact
     if (station) {
       try {
         const info = JSON.parse(
@@ -1937,12 +1967,13 @@ async function waitForStationFrame(webContents, pathFragment, timeoutMs = 15000)
               title: document.title,
               hasBridge: Boolean(document.querySelector('script[src*="bridge.js"]')),
               bridge: (document.documentElement && document.documentElement.getAttribute('data-dsh-overleaf-bridge')) || null,
+              editorReady: Boolean(document.querySelector('.cm-editor .cm-content[contenteditable="true"], .CodeMirror textarea, .ace_editor textarea')),
             })`,
             false,
           ),
         )
         last = { frameUrl: station.url, ...info }
-        if (info.readyState === 'complete' && info.hasBridge) return last
+        if (info.readyState === 'complete' && info.hasBridge && info.editorReady) return last
       } catch (err) {
         /* frame is mid-navigation */
       }
@@ -1979,6 +2010,7 @@ function satisfiedPositive(attrs, tunnelPort) {
 }
 
 async function main() {
+  if (!options.openProject && !options.probe) throw new Error('Site acceptance requires --open-project with a real editor URL; --probe=on explicitly selects isolated routing-probe mode')
   log(`electron ${process.versions.electron} / node ${process.versions.node}, profile ${userDataDir}`)
   log(`host 127.0.0.1:${options.hostPort}, frame origin mode ${options.frameOrigin}, mode ${report.mode}`)
   log(`self-check report path (absolute): ${report.report}`)
@@ -2086,6 +2118,7 @@ async function main() {
   let lastSample = null
   let settleDeadline = 0
   let probeRun = false
+  let siteVerdict = evaluateSiteSockets([])
   // With --open-project the landing page's bridge attributes are gone, so the probe
   // is also forced once the project route has had time to boot: it must run against
   // the CURRENT station frame and never silently end as probe=null.
@@ -2098,7 +2131,7 @@ async function main() {
     const attrs = attributeMap(sample)
     const messages = messagesOf(sample)
     const target = attrs['ws-target'] || ''
-    if (!probeRun && (attrs.bridge === 'ready' || (probeFallbackAt !== 0 && Date.now() > probeFallbackAt))) {
+    if (options.probe && !probeRun && (attrs.bridge === 'ready' || (probeFallbackAt !== 0 && Date.now() > probeFallbackAt))) {
       probeRun = true
       const probeTrigger = attrs.bridge === 'ready' ? 'bridge-ready' : 'open-project-fallback'
       report.socketProbe = { url: PROBE_WS_URL, trigger: probeTrigger, ...(await runSocketProbe(window.webContents)) }
@@ -2106,12 +2139,19 @@ async function main() {
       await delay(1500)
       continue
     }
-    const fullyConnected =
+    const siteEvidence = await collectSocketEvidence(window.webContents)
+    siteVerdict = evaluateSiteSockets(siteEvidence.siteSocket)
+    const fullyConnected = options.probe && !options.openProject ?
       attrs.bridge === 'ready' &&
       target.startsWith(`127.0.0.1:${tunnelPort}`) &&
       attrs['ws-state'] === 'open' &&
       attrs['socketio-state'] === 'connected' &&
-      messages !== null
+      messages !== null : siteVerdict.pass
+    if (siteVerdict.pass && options.openProject) {
+      connectedSample = sample
+      growthObserved = true
+      break
+    }
     if (fullyConnected) {
       if (!connectedSample) {
         connectedSample = sample
@@ -2197,6 +2237,13 @@ async function main() {
   await injectSocketTapIntoFrames(window.webContents, report.socketTap)
   await injectSocketDebugIntoFrames(window.webContents)
   const socketEvidence = await collectSocketEvidence(window.webContents)
+  siteVerdict = evaluateSiteSockets(socketEvidence.siteSocket)
+  report.siteAcceptance = siteVerdict
+  report.probeMode = options.probe && !options.openProject
+  if (options.openProject) {
+    const editor = await waitForStationFrame(window.webContents, report.openProject.target, 2000)
+    report.openProject.editorReady = Boolean(editor && editor.editorReady)
+  }
   // Finalize the tap state first: `installed` / `beforePageScripts` / `mechanism`
   // are derived from the mechanisms that actually took effect, and the socket
   // collections below read that same verdict (never a second, disagreeing copy).
@@ -2295,22 +2342,22 @@ async function main() {
       finalAttrs.bridge === 'ready',
       `bridge=${JSON.stringify(finalAttrs.bridge)}`,
     )
-    assert(
+    if (report.probeMode) assert(
       `WebSocket went to the loopback tunnel (127.0.0.1:${tunnelPort})`,
       String(finalAttrs['ws-target'] || '').startsWith(`127.0.0.1:${tunnelPort}`),
       `ws-target=${JSON.stringify(finalAttrs['ws-target'])}`,
     )
-    assert(
+    if (report.probeMode) assert(
       'socket stayed open (data-dsh-overleaf-ws-state=open)',
       finalAttrs['ws-state'] === 'open',
       `ws-state=${JSON.stringify(finalAttrs['ws-state'])}`,
     )
-    assert(
+    if (report.probeMode) assert(
       'socket.io handshake completed (data-dsh-overleaf-socketio-state=connected)',
       finalAttrs['socketio-state'] === 'connected',
       `socketio-state=${JSON.stringify(finalAttrs['socketio-state'])}`,
     )
-    assert(
+    if (report.probeMode) assert(
       'socket.io messages were received (data-dsh-overleaf-ws-messages grows)',
       growthObserved,
       `ws-messages ${connectedMessages === null ? 'n/a' : connectedMessages} -> ${messagesOf(lastSample || {})}`,
@@ -2325,7 +2372,7 @@ async function main() {
             .map((entry) => `${entry.url} (${entry.pattern})`)
             .join(', '),
     )
-    assert(
+    if (options.probe) assert(
       'independent in-page probe: the bridge rewrote a shell-shaped ws:// URL onto the tunnel',
       probeRoutedToTunnel,
       `probe=${JSON.stringify(report.socketProbe || null)} probeRoutedToTunnel=${probeRoutedToTunnel}`,
@@ -2333,7 +2380,7 @@ async function main() {
     // Attribution gate: the probe proves the bridge+tunnel path, NOT that the site
     // connected. This assertion is the only one allowed to speak for the site and
     // it reads the constructor tap exclusively (never socketProbe/diagnostics).
-    assert(
+    if (!report.probeMode) assert(
       'site-built socket observed (page-created WebSocket; probe/bridge constructions never fill this set)',
       socketEvidence.siteSocket.length > 0,
       socketEvidence.siteSocket.length > 0
@@ -2343,6 +2390,13 @@ async function main() {
           `tap installed: ${Boolean(report.socketTap && report.socketTap.installed)}, mechanism: ${report.socketTap ? report.socketTap.mechanism : 'n/a'}, ` +
           `before page scripts: ${Boolean(report.socketTap && report.socketTap.beforePageScripts)}`,
     )
+    if (!report.probeMode) {
+      assert('site namespace confirmed and connection survives two heartbeat intervals', siteVerdict.pass, JSON.stringify(siteVerdict))
+      assert('real project editor loaded and initialized', Boolean(report.openProject && report.openProject.documentLoaded && report.openProject.editorReady),
+        JSON.stringify({ loaded: report.openProject?.documentLoaded, editorReady: report.openProject?.editorReady }))
+      const namespaceErrors = report.consoleMessages.filter(entry => /Invalid namespace/.test(entry.message || ''))
+      assert('site has no Invalid namespace console error', namespaceErrors.length === 0, `${namespaceErrors.length} namespace errors`)
+    }
     assert(
       `at least one real WebSocket request targets the loopback tunnel (127.0.0.1:${tunnelPort})`,
       tunnelSocketRequests.length > 0,

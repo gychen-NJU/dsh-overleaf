@@ -75,7 +75,7 @@ export declare class OverleafWorkbenchService extends Service {
     static inject: string[];
     static Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
         baseUrl: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
-        browserChannel: import("@deepseek-ai/schemastery").default<"auto" | "default" | "msedge" | "chrome" | "real", "auto" | "default" | "msedge" | "chrome" | "real", "volatile-defined">;
+        browserChannel: import("@deepseek-ai/schemastery").default<"default" | "auto" | "msedge" | "chrome" | "real", "default" | "auto" | "msedge" | "chrome" | "real", "volatile-defined">;
         browserPath: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
         loginProxyServer: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
         loginTimeoutMs: import("@deepseek-ai/schemastery").default<number, number, "volatile-defined">;
@@ -86,7 +86,7 @@ export declare class OverleafWorkbenchService extends Service {
         assistPanelEnabled: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
     }>>, Schemastery.ObjectT<NoInfer<{
         baseUrl: import("@deepseek-ai/schemastery").default<string, string, "volatile-defined">;
-        browserChannel: import("@deepseek-ai/schemastery").default<"auto" | "default" | "msedge" | "chrome" | "real", "auto" | "default" | "msedge" | "chrome" | "real", "volatile-defined">;
+        browserChannel: import("@deepseek-ai/schemastery").default<"default" | "auto" | "msedge" | "chrome" | "real", "default" | "auto" | "msedge" | "chrome" | "real", "volatile-defined">;
         browserPath: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
         loginProxyServer: import("@deepseek-ai/schemastery").default<string, string, "volatile">;
         loginTimeoutMs: import("@deepseek-ai/schemastery").default<number, number, "volatile-defined">;
