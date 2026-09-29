@@ -305,6 +305,7 @@ const WORKTREE = path.resolve(HERE, '..')
 const APP_DIR = path.join(HERE, 'desktop-shell')
 const HARNESS_DOC_PATH = '/__dsh_shell_harness__'
 const BRIDGE_PATH = '/overleaf/workbench/bridge.js'
+const PROXY_PREFIX = '/overleaf-proxy'
 const DEFAULT_REPORT = path.join(WORKTREE, '.tmp', 'desktop-shell-report.json')
 const DIAGNOSTIC_KEYS = ['bridge', 'ws-port', 'ws-target', 'ws-state', 'socketio-state', 'ws-messages']
 const POLLUTED_PATTERNS = [
@@ -1832,10 +1833,30 @@ async function sampleFrame(webContents) {
 async function maybeOpenProject(webContents) {
   const requested = options.openProject
   if (!requested) return null
-  const target =
-    requested.charAt(0) === '/' || /^[a-z][a-z0-9+.-]*:\/\//i.test(requested)
-      ? requested
-      : `/overleaf-proxy/console/${requested}`
+  /* Accepted forms:
+     - a bare project id              -> /overleaf-proxy/console/<id>   (dashboard shell)
+     - a root-relative proxy/other path -> used as-is
+     - an absolute URL                -> its path is mapped onto the proxy, so
+       https://tex.nju.edu.cn/project/user/<owner>/<project>
+       becomes /overleaf-proxy/project/user/<owner>/<project> (the REAL editor
+       route; loading the upstream URL as-is would bypass the proxy and never
+       reach the bridge). */
+  let requestedHost = null
+  let target
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(requested)) {
+    try {
+      const parsed = new URL(requested)
+      requestedHost = parsed.host
+      const path = `${parsed.pathname}${parsed.search}`
+      target = path === PROXY_PREFIX || path.indexOf(`${PROXY_PREFIX}/`) === 0 ? path : `${PROXY_PREFIX}${path}`
+    } catch (err) {
+      target = requested
+    }
+  } else if (requested.charAt(0) === '/') {
+    target = requested
+  } else {
+    target = `${PREFIX}/console/${requested}`
+  }
   let result
   try {
     result = await webContents.mainFrame.executeJavaScript(
@@ -1860,6 +1881,7 @@ async function maybeOpenProject(webContents) {
   const documented = report.documentStatuses ? report.documentStatuses[target] : null
   report.openProject = {
     requested,
+    requestedUrlHost: requestedHost,
     target,
     result,
     cookieProvided: Boolean(options.hostCookie),
