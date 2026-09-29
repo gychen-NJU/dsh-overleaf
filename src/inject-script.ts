@@ -257,6 +257,19 @@ export function renderBridgeScript(): string {
         if (contentDom !== '' && parsed.origin === contentDom && !isWorkbenchRoute && !isAlreadyProxied) {
           return PREFIX + parsed.pathname + parsed.search + parsed.hash
         }
+        /* Desktop shell: the site builds protocol-relative API bases from
+           location.host, so in the shell it emits //app/api/... which the
+           fetch/XHR wrappers complete to https://app/.... The shell host is the
+           page's own origin, exactly like dsh-app://app, so re-root it under
+           the proxy the same way. Placed after the announced output/socket and
+           content-origin branches so their priority is untouched, and gated on
+           shellScheme so the web branches above stay byte-identical. */
+        if (shellScheme !== '' && parsed.host === shellHost) {
+          var samePath = parsed.pathname
+          var alreadyProxied = samePath === PREFIX || samePath.indexOf(PREFIX + '/') === 0 || samePath.indexOf('/overleaf/workbench/') === 0
+          if (!alreadyProxied) samePath = PREFIX + samePath
+          return samePath + parsed.search + parsed.hash
+        }
         if (protocolRelative) return parsed.toString()
       }
       return raw

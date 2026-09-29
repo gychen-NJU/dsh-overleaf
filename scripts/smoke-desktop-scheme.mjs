@@ -34,6 +34,7 @@ const PREFIX = '/overleaf-proxy'
 const WS_PORT = 50999
 const UPSTREAM = 'https://tex.nju.edu.cn'
 const SOCKET_ORIGIN = 'https://socket.tex.nju.edu.cn'
+const TEXPAGE_OUTPUT_ORIGIN = 'https://latex-file.texpageusercontent.com'
 const LOOPBACK = 'http://127.0.0.1:3080'
 const TUNNEL_SOCKET = `ws://127.0.0.1:${WS_PORT}/__dsh_socket__/socket.io/?EIO=4&transport=websocket`
 const SHELL_SOCKET_CASES = [
@@ -79,6 +80,7 @@ function loadBridge(source, location, wsPort = WS_PORT) {
     location,
     __DSH_OVERLEAF_UPSTREAM_ORIGIN__: UPSTREAM,
     __DSH_OVERLEAF_SOCKET_ORIGIN__: SOCKET_ORIGIN,
+    __DSH_OVERLEAF_TEXPAGE_OUTPUT_ORIGIN__: TEXPAGE_OUTPUT_ORIGIN,
     __DSH_OVERLEAF_WS_PORT__: wsPort,
   }
   const context = vm.createContext({
@@ -138,6 +140,65 @@ test('shell: heartbeat and protocol-relative socket.io become root-relative prox
   )
 })
 
+test('shell: the shell host in http(s) form counts as the page origin (site API bases)', () => {
+  /* The site builds protocol-relative API bases from location.host, so in the
+     shell it emits //app/api/... which the fetch/XHR wrappers complete to
+     https://app/.... Both forms must land on the proxy, with no double prefix. */
+  const cases = [
+    ['https://app/api/tag', `${PREFIX}/api/tag`],
+    ['https://app/api/project', `${PREFIX}/api/project`],
+    ['https://app/api/project/total', `${PREFIX}/api/project/total`],
+    ['https://app/api/project/total?t=123', `${PREFIX}/api/project/total?t=123`],
+    ['https://app/api/user/invitation', `${PREFIX}/api/user/invitation`],
+    ['https://app/api/project/invitation', `${PREFIX}/api/project/invitation`],
+    /* The socket.io HTTP forms (polling and the websocket handshake URL) take
+       the same proxy path the web context produces for //<loopback>/socket.io;
+       the host registers an upgrade route for /overleaf-proxy/socket.io/
+       (src/service.ts). The websocket transport itself is handled by
+       routeSocketUrl, which keeps its own tunnel form. */
+    ['https://app/socket.io/?EIO=4&transport=websocket', `${PREFIX}/socket.io/?EIO=4&transport=websocket`],
+    ['https://app/socket.io/?EIO=4&transport=polling', `${PREFIX}/socket.io/?EIO=4&transport=polling`],
+    ['//app/api/project', `${PREFIX}/api/project`],
+    ['//app/api/tag?scope=all', `${PREFIX}/api/tag?scope=all`],
+    ['https://app/api/tag?scope=all#frag', `${PREFIX}/api/tag?scope=all#frag`],
+    ['https://app/overleaf-proxy/api', `${PREFIX}/api`],
+    ['https://app/overleaf/workbench/bridge.js', '/overleaf/workbench/bridge.js'],
+    ['dsh-app://app/api/tag', `${PREFIX}/api/tag`],
+  ]
+  for (const [raw, expected] of cases) {
+    assert.equal(shellBridge.context.routeUrl(raw), expected, raw)
+  }
+  for (const raw of cases.map(([value]) => value)) {
+    assert.ok(
+      !String(shellBridge.context.routeUrl(raw)).includes(`${PREFIX}${PREFIX}`),
+      `no double proxy prefix for ${raw}`,
+    )
+  }
+})
+
+test('shell: announced output/socket and content-origin branches keep priority', () => {
+  assert.equal(
+    shellBridge.context.routeUrl(`${TEXPAGE_OUTPUT_ORIGIN}/CompileResult/owner/project/build/output.log?X-Amz-Signature=synthetic`),
+    `${PREFIX}/__dsh_texpage_output__/CompileResult/owner/project/build/output.log?X-Amz-Signature=synthetic`,
+    'latex-file output origin still uses its isolated marker',
+  )
+  assert.equal(
+    shellBridge.context.routeUrl('https://socket.tex.nju.edu.cn/heartbeat?m=1'),
+    `${PREFIX}/__dsh_socket__/heartbeat?m=1`,
+    'announced socket host still uses the socket marker',
+  )
+  assert.equal(
+    shellBridge.context.routeUrl('https://socket.tex.nju.edu.cn/socket.io/?EIO=4'),
+    `${PREFIX}/__dsh_socket__/socket.io/?EIO=4`,
+    'announced socket.io still uses the socket marker',
+  )
+  assert.equal(
+    shellBridge.context.routeUrl('dsh-app://socket.tex.nju.edu.cn/heartbeat?m=1'),
+    `${PREFIX}/__dsh_socket__/heartbeat?m=1`,
+    'un-poisoned socket host unchanged',
+  )
+})
+
 test('shell: websockets that are not /socket.io are passed through untouched', () => {
   for (const raw of [
     'ws://app/sidebar/ws/agent-opens',
@@ -167,6 +228,25 @@ test('shell: no routing path emits dsh-app://, ws://app/ or ws://dsh-app/', () =
   for (const value of outputs) {
     assert.ok(!/^dsh-app:\/\//.test(value), `no dsh-app:// leak: ${value}`)
     assert.ok(!/^wss?:\/\/(?:app|dsh-app)(?:[:/]|$)/.test(value), `no shell-host websocket leak: ${value}`)
+  }
+})
+
+test('shell: paths that already carry a proxy/workbench form are not prefixed twice', () => {
+  /* Same guard as the shell-origin branch: an already-proxied pathname keeps
+     its path semantics (relative form - the shell host would be a dead URL). */
+  const cases = [
+    ['https://app/overleaf-proxy/api', `${PREFIX}/api`],
+    ['https://app/overleaf-proxy', PREFIX],
+    ['https://app/overleaf/workbench/bridge.js', '/overleaf/workbench/bridge.js'],
+    ['https://app/overleaf/workbench/api/status?x=1', '/overleaf/workbench/api/status?x=1'],
+    ['dsh-app://app/overleaf-proxy/api', `${PREFIX}/api`],
+  ]
+  for (const [raw, expected] of cases) {
+    assert.equal(shellBridge.context.routeUrl(raw), expected, raw)
+    assert.ok(
+      !String(shellBridge.context.routeUrl(raw)).includes(`${PREFIX}${PREFIX}`),
+      `no double proxy prefix for ${raw}`,
+    )
   }
 })
 
