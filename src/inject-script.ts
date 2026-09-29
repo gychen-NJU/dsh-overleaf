@@ -62,6 +62,20 @@ export function renderBridgeScript(): string {
     }
   }
   var PREFIX = '/overleaf-proxy'
+  /* Diagnostics shim: self-contained AND global, so the smoke slices that run
+     parts of this script in an isolated vm (the fetch/XHR wrappers) never miss
+     it. A slice-local function would be scoped to the slice program while its
+     .then() callbacks live in the sandbox realm, throwing a ReferenceError
+     inside a promise that surfaces as an unhandled rejection. This shim is
+     always callable and forwards to the real sink bound as
+     window.__dshOverleafDiag by the reporter below. */
+  function diagRecord(kind, detail) {
+    try {
+      var sink = window.__dshOverleafDiag
+      if (typeof sink === 'function') sink(kind, detail)
+    } catch (err) {}
+  }
+  try { window.diagRecord = diagRecord } catch (err) {}
   function sendToParent(message) {
     try {
       if (window.parent && window.parent !== window) {
@@ -682,7 +696,7 @@ export function renderBridgeScript(): string {
           diagRecord('fetch', fetchMethod + ' ' + diagRouted + ' -> ' + String(response && response.status))
         }, function (error) {
           diagRecord('fetch-fail', fetchMethod + ' ' + diagRouted + ' -> ' + String(error && error.message || error))
-        })
+        }).catch(function () {})
       } catch (err) {}
       if (rawUrl !== '' && pathnameOf(rawUrl).indexOf('/api/project/fileTree') !== -1) {
         routedResult.then(function (response) {
@@ -828,12 +842,15 @@ export function renderBridgeScript(): string {
   var DIAG_MAX = 120
   var diagEvents = []
   var diagStep = 0
-  function diagRecord(kind, detail) {
+  function diagRecordReal(kind, detail) {
     try {
       if (diagEvents.length >= DIAG_MAX) diagEvents.shift()
       diagEvents.push({ n: ++diagStep, at: Date.now(), kind: kind, detail: String(detail).slice(0, 400) })
     } catch (err) {}
   }
+  /* Bind the real sink: the shim declared near the top of the script forwards
+     every call here, so slices that run outside this scope stay inert. */
+  try { window.__dshOverleafDiag = diagRecordReal } catch (err) {}
   function diagSnippet(value) {
     var text = String(value)
     if (diagEvents.length >= DIAG_MAX) diagEvents.shift()
@@ -899,6 +916,12 @@ export function renderBridgeScript(): string {
     var parsed = new URL(String(raw), window.location.href)
     if (!/^(?:https?|wss?):$/.test(parsed.protocol) || parsed.username || parsed.password) return raw
     var path = parsed.pathname
+    /* socket.io namespaces live in the URL path (/socket.io/<namespace>), so only
+       the prefix may be tested. This check is inlined on purpose: the smoke suite
+       slices this one function out of the bundle and runs it in an isolated vm,
+       where any helper defined outside would be a ReferenceError swallowed by the
+       caller's try/catch - silently turning every case into a pass-through. */
+    var socketIoPath = path === '/socket.io' || path.indexOf('/socket.io/') === 0
     var socketOrigin = window.__DSH_OVERLEAF_SOCKET_ORIGIN__
     var upstreamOrigin = window.__DSH_OVERLEAF_UPSTREAM_ORIGIN__
     var socketHost = typeof socketOrigin === 'string' ? new URL(socketOrigin).host : ''
@@ -914,7 +937,7 @@ export function renderBridgeScript(): string {
     var shellSchemeName = shellScheme.replace(/:$/, '')
     var shellHost = shellScheme === '' ? '' : location.host
     if (shellScheme !== '' && (parsed.protocol === shellScheme || parsed.host === shellHost || parsed.host === shellSchemeName)) {
-      if (!/^\\/socket\\.io\\/?$/.test(path)) return raw
+      if (!socketIoPath) return raw
       if (socketHost !== '') path = '/__dsh_socket__' + path
       var shellPort = parseInt(window.__DSH_OVERLEAF_WS_PORT__, 10) || 0
       if (shellPort > 0) return 'ws://127.0.0.1:' + shellPort + path + parsed.search
@@ -922,7 +945,7 @@ export function renderBridgeScript(): string {
       return raw
     }
     if (socketHost !== '' && parsed.host === socketHost) {
-      if (!/^\\/socket\\.io\\/?$/.test(path)) return raw
+      if (!socketIoPath) return raw
       path = '/__dsh_socket__' + path
     } else if (parsed.host !== window.location.host && parsed.host !== upstreamHost) {
       return raw
