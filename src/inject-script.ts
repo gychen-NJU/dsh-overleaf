@@ -673,6 +673,17 @@ export function renderBridgeScript(): string {
         }
       }
       var routedResult = originalFetch.apply(window, arguments)
+      /* Diagnostics: record the routed target and the outcome so the host can
+         see what the site actually requested. Never blocks or alters the call. */
+      var diagRouted = ''
+      try { diagRouted = String(arguments[0] instanceof URL ? arguments[0].toString() : (typeof arguments[0] === 'string' ? arguments[0] : rawUrl)).slice(0, 200) } catch (err) { diagRouted = rawUrl }
+      try {
+        routedResult.then(function (response) {
+          diagRecord('fetch', fetchMethod + ' ' + diagRouted + ' -> ' + String(response && response.status))
+        }, function (error) {
+          diagRecord('fetch-fail', fetchMethod + ' ' + diagRouted + ' -> ' + String(error && error.message || error))
+        })
+      } catch (err) {}
       if (rawUrl !== '' && pathnameOf(rawUrl).indexOf('/api/project/fileTree') !== -1) {
         routedResult.then(function (response) {
           if (!response.ok) return
@@ -727,6 +738,16 @@ export function renderBridgeScript(): string {
         if (typeof url === 'string') {
           arguments[1] = routeUrl(url)
         }
+        /* Diagnostics: record the site's XHR target and its outcome. */
+        try {
+          diagRecord('xhr-open', String(method || 'GET') + ' ' + rawUrl + ' -> ' + String(arguments[1]).slice(0, 200))
+          var diagXhr = this
+          var diagXhrUrl = String(arguments[1]).slice(0, 200)
+          diagXhr.addEventListener('loadend', function () {
+            diagRecord('xhr-done', diagXhrUrl + ' -> ' + String(diagXhr.status))
+          })
+          diagXhr.addEventListener('error', function () { diagRecord('xhr-error', diagXhrUrl) })
+        } catch (err) {}
         if (typeof arguments[1] === 'string' && arguments[1].indexOf(PREFIX + '/__dsh_texpage_output__/') !== -1) {
           // Safe diagnostic only: never expose signed URLs, query values or
           // document bytes in the DOM/console.
@@ -795,6 +816,77 @@ export function renderBridgeScript(): string {
     if (DEBUG) log('eventsource patch skipped', err)
   }
 
+  /* ---------------------------------------------------------------- */
+  /* Live diagnostics self-report                                      */
+  /*                                                                    */
+  /* The embedded page reports its own network behaviour (WebSocket /   */
+  /* fetch / XHR targets, statuses and thrown errors) back to the host  */
+  /* under the same origin, so the host - and therefore the operator -  */
+  /* can inspect what the site actually did without a DevTools session. */
+  /* Failures here are silent: diagnostics must never affect the page.  */
+  /* ---------------------------------------------------------------- */
+  var DIAG_MAX = 120
+  var diagEvents = []
+  var diagStep = 0
+  function diagRecord(kind, detail) {
+    try {
+      if (diagEvents.length >= DIAG_MAX) diagEvents.shift()
+      diagEvents.push({ n: ++diagStep, at: Date.now(), kind: kind, detail: String(detail).slice(0, 400) })
+    } catch (err) {}
+  }
+  function diagSnippet(value) {
+    var text = String(value)
+    if (diagEvents.length >= DIAG_MAX) diagEvents.shift()
+    diagEvents.push({ n: ++diagStep, at: Date.now(), kind: 'snip', detail: text.slice(0, 160) })
+    return value
+  }
+  function diagPayload() {
+    var root = null
+    try { root = document.documentElement } catch (err) {}
+    var attrs = {}
+    try {
+      if (root) {
+        var ns = root.attributes
+        for (var i = 0; i < ns.length; i++) {
+          var name = String(ns[i].name)
+          if (name.indexOf('data-dsh-overleaf-') === 0) attrs[name.slice(19)] = String(ns[i].value).slice(0, 300)
+        }
+      }
+    } catch (err) {}
+    var events = diagEvents.slice()
+    diagEvents.length = 0
+    return { href: String(location.href).slice(0, 300), attrs: attrs, events: events }
+  }
+  function diagSend() {
+    var payload
+    try { payload = diagPayload() } catch (err) { return }
+    if (payload.events.length === 0) return
+    try {
+      var body = JSON.stringify(payload)
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        if (navigator.sendBeacon('/overleaf/workbench/diag', body)) return
+      }
+      if (typeof window.fetch === 'function') {
+        window.fetch('/overleaf/workbench/diag', { method: 'POST', body: body, keepalive: true }).catch(function () {})
+      }
+    } catch (err) {}
+  }
+  function diagInstall() {
+    try { window.setInterval(diagSend, 10000) } catch (err) {}
+    try {
+      window.addEventListener('error', function (event) {
+        diagRecord('window-error', (event && event.message) || 'error')
+      })
+      window.addEventListener('unhandledrejection', function (event) {
+        var reason = event && event.reason
+        diagRecord('unhandled-rejection', (reason && reason.message) || String(reason || 'rejection'))
+      })
+      window.addEventListener('pagehide', function () { diagSend() })
+      document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') diagSend() })
+    } catch (err) {}
+    diagRecord('bridge-init', location.href)
+  }
+
   /* WebSocket transport (socket.io websocket upgrade path).
 
      The webserver's upgrade registry is exact-path only and cannot host
@@ -847,12 +939,14 @@ export function renderBridgeScript(): string {
       var WS_PORT = parseInt(window.__DSH_OVERLEAF_WS_PORT__, 10) || 0
       markDiagnostic('ws-port', WS_PORT)
       function PatchedWebSocket(url, protocols) {
+        var rawUrl = String(url)
         try {
           url = routeSocketUrl(url)
         } catch (err) {
           if (DEBUG) log('ws url fix failed', err)
         }
         var socketUrl = String(url)
+        diagRecord('ws-construct', 'raw=' + rawUrl + ' -> ' + socketUrl)
         try {
           var parsedSocketUrl = new URL(socketUrl)
           markDiagnostic('ws-target', parsedSocketUrl.host)
@@ -864,20 +958,21 @@ export function renderBridgeScript(): string {
         var messageCount = 0
         markDiagnostic('ws-messages', 0)
         var socket = new OriginalWebSocket(url, protocols)
-        socket.addEventListener('open', function () { markDiagnostic('ws-state', 'open') })
+        socket.addEventListener('open', function () { markDiagnostic('ws-state', 'open'); diagRecord('ws-open', socketUrl) })
         socket.addEventListener('message', function (event) {
           messageCount += 1
           markDiagnostic('ws-messages', messageCount)
           // Report protocol milestones, never payloads, session IDs or tokens.
           if (typeof event.data === 'string') {
-            if (event.data.indexOf('40') === 0) markDiagnostic('socketio-state', 'connected')
-            else if (event.data.indexOf('44') === 0) markDiagnostic('socketio-state', 'connect-error')
+            if (event.data.indexOf('40') === 0) { markDiagnostic('socketio-state', 'connected'); diagRecord('ws-msg-40', socketUrl) }
+            else if (event.data.indexOf('44') === 0) { markDiagnostic('socketio-state', 'connect-error'); diagRecord('ws-msg-44', socketUrl) }
           }
         })
-        socket.addEventListener('error', function () { markDiagnostic('ws-state', 'error') })
+        socket.addEventListener('error', function () { markDiagnostic('ws-state', 'error'); diagRecord('ws-error', socketUrl) })
         socket.addEventListener('close', function (event) {
           markDiagnostic('ws-state', 'closed:' + String(event && event.code || 0))
           markDiagnostic('socketio-state', 'closed')
+          diagRecord('ws-close', socketUrl + ' code=' + String(event && event.code || 0))
         })
         return socket
       }
@@ -902,7 +997,7 @@ export function renderBridgeScript(): string {
       var originalSendBeacon = navigator.sendBeacon.bind(navigator)
       var wrappedSendBeacon = function (url, data) {
         try {
-          if (typeof url === 'string') url = routeUrl(url)
+          if (typeof url === 'string') { diagRecord('beacon', String(url).slice(0, 200)); url = routeUrl(url) }
         } catch (err) {
           if (DEBUG) log('beacon url fix failed', err)
         }
@@ -2078,6 +2173,10 @@ export function renderBridgeScript(): string {
     announceLocation()
     reportCapabilities()
   }, 'dom ready'))
+
+  /* Start the live diagnostics reporter last: every wrapper above is already
+     installed, so nothing it observes can be attributed to a partial setup. */
+  diagInstall()
 
   log('bridge ready')
 })()

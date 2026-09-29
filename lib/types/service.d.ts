@@ -105,6 +105,15 @@ export declare class OverleafWorkbenchService extends Service {
     private loginStartedAt;
     private loginResult;
     private loginError;
+    /**
+     * Latest diagnostics self-reported by each embedded page, keyed by page kind.
+     * Bounded: one entry per href prefix, events capped. Purely observational.
+     */
+    private pageDiagnostics;
+    /** Store one diagnostics report from an embedded page (best effort). */
+    private recordDiagnostics;
+    /** Snapshot of the stored page diagnostics for the read route. */
+    private diagnosticsSnapshot;
     constructor(ctx: Context, config: WorkbenchConfig);
     /** Resolve the workspace from server-owned session metadata, never client input. */
     private workspaceForPayload;

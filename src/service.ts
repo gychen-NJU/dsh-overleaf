@@ -62,6 +62,12 @@ const MAX_REQUEST_BYTES = 64 * 1024
 // capped at 64 KiB.
 const MAX_TEX_REQUEST_BYTES = MAX_TEX_FILE_BYTES * 6 + 64 * 1024
 const MAX_BIB_FILE_BYTES = 2 * 1024 * 1024
+/** Live page-diagnostics channel (bridge self-report -> host memory). */
+const DIAGNOSTICS_PATH = '/overleaf/workbench/diag'
+const DIAGNOSTICS_MAX_REQUEST_BYTES = 512 * 1024
+const DIAGNOSTICS_MAX_PAGES = 8
+const DIAGNOSTICS_MAX_EVENTS_PER_REPORT = 500
+const DIAGNOSTICS_MAX_EVENTS_KEPT = 4000
 const MAX_BIB_RESULTS = 50
 const MAX_BIB_SCAN_DEPTH = 8
 const MAX_TEX_RESULTS = 100
@@ -358,6 +364,74 @@ export class OverleafWorkbenchService extends Service {
   private loginResult: WorkbenchLoginResult | undefined
   private loginError: string | undefined
 
+  /**
+   * Latest diagnostics self-reported by each embedded page, keyed by page kind.
+   * Bounded: one entry per href prefix, events capped. Purely observational.
+   */
+  private pageDiagnostics = new Map<string, {
+    href: string
+    attrs: Record<string, string>
+    events: Array<Record<string, unknown>>
+    reports: number
+    updatedAt: number
+  }>()
+
+  /** Store one diagnostics report from an embedded page (best effort). */
+  private recordDiagnostics(payload: unknown): void {
+    if (typeof payload !== 'object' || payload === null) return
+    const raw = payload as Record<string, unknown>
+    const href = typeof raw.href === 'string' ? raw.href.slice(0, 300) : ''
+    const attrsRaw = typeof raw.attrs === 'object' && raw.attrs !== null ? raw.attrs as Record<string, unknown> : {}
+    const attrs: Record<string, string> = {}
+    for (const [key, value] of Object.entries(attrsRaw).slice(0, 40)) {
+      attrs[String(key).slice(0, 60)] = String(value).slice(0, 300)
+    }
+    const incoming = Array.isArray(raw.events) ? raw.events.slice(0, DIAGNOSTICS_MAX_EVENTS_PER_REPORT) : []
+    const events: Array<Record<string, unknown>> = []
+    for (const entry of incoming) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const item = entry as Record<string, unknown>
+      events.push({
+        n: typeof item.n === 'number' ? item.n : 0,
+        at: typeof item.at === 'number' ? item.at : Date.now(),
+        kind: String(item.kind ?? '').slice(0, 40),
+        detail: String(item.detail ?? '').slice(0, 400),
+      })
+    }
+    const key = href.replace(/[?#].*$/, '').slice(0, 120) || 'unknown'
+    const existing = this.pageDiagnostics.get(key)
+    const merged = existing === undefined ? events : existing.events.concat(events)
+    this.pageDiagnostics.set(key, {
+      href,
+      attrs,
+      events: merged.slice(-DIAGNOSTICS_MAX_EVENTS_KEPT),
+      reports: (existing?.reports ?? 0) + 1,
+      updatedAt: Date.now(),
+    })
+    while (this.pageDiagnostics.size > DIAGNOSTICS_MAX_PAGES) {
+      const oldest = [...this.pageDiagnostics.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]
+      if (oldest === undefined) break
+      this.pageDiagnostics.delete(oldest[0])
+    }
+  }
+
+  /** Snapshot of the stored page diagnostics for the read route. */
+  private diagnosticsSnapshot(limit: number): Record<string, unknown> {
+    const bounded = Math.min(Math.max(Math.trunc(limit) || 200, 1), DIAGNOSTICS_MAX_EVENTS_KEPT)
+    const pages: Array<Record<string, unknown>> = []
+    for (const [key, value] of this.pageDiagnostics) {
+      pages.push({
+        key,
+        href: value.href,
+        attrs: value.attrs,
+        reports: value.reports,
+        updatedAt: value.updatedAt,
+        events: value.events.slice(-bounded),
+      })
+    }
+    return { pages, count: pages.length }
+  }
+
   constructor(ctx: Context, config: WorkbenchConfig) {
     super(ctx, 'overleaf-workbench')
     // Keep the loader-resolved container: its `.volatile()` fields are live
@@ -550,6 +624,38 @@ export class OverleafWorkbenchService extends Service {
   }
 
   private registerRoutes(): void {
+    // Live page diagnostics: the bridge self-reports its own network activity
+    // (WebSocket / fetch / XHR targets, statuses, thrown errors) under this
+    // loopback-only prefix, so the operator can inspect what the embedded site
+    // actually did without attaching a DevTools session. Both directions are
+    // bounded and failure-tolerant; they never influence page behaviour.
+    this.ctx.effect(() => this.ctx.webServer.register({
+      kind: 'exact',
+      path: DIAGNOSTICS_PATH,
+      handler: async (req, res) => {
+        if (!isLoopback(req)) {
+          sendJson(res, 403, {
+            ok: false,
+            error: { code: 'dsh-overleaf-loopback-only', message: 'diagnostics routes are loopback-only' },
+          })
+          return
+        }
+        const query = new URL(req.url ?? '/', 'http://127.0.0.1')
+        if ((req.method ?? 'GET').toUpperCase() === 'GET') {
+          const rawLimit = Number(query.searchParams.get('limit') ?? '200')
+          sendJson(res, 200, { ok: true, value: this.diagnosticsSnapshot(Number.isFinite(rawLimit) ? rawLimit : 200) })
+          return
+        }
+        try {
+          const payload = await readJsonBody(req, DIAGNOSTICS_MAX_REQUEST_BYTES)
+          this.recordDiagnostics(payload)
+          sendJson(res, 200, { ok: true, value: { stored: true } })
+        } catch (error) {
+          sendError(res, error)
+        }
+      },
+    }), 'dsh-overleaf: page diagnostics')
+
     // JSON API routes.
     this.route('/overleaf/workbench/status', () => this.status())
     // Login runs in the background: the route returns immediately and the
