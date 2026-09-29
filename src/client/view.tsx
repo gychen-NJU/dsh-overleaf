@@ -1374,6 +1374,12 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
     )
   }
 
+  /* The DSH desktop shell serves this page from a non-http(s) origin
+     (dsh-app://app). window.open() there would yield dsh-app://app/..., which
+     the shell's setWindowOpenHandler rejects without any feedback, so the
+     toolbar keeps this entry point visible but disabled and says why. */
+  const desktopShell = !/^https?:$/.test(location.protocol)
+
   return (
     <div className="dso-root">
       <div className="dso-toolbar">
@@ -1381,7 +1387,8 @@ export function OverleafView(props: OverleafViewProps): ReactNode {
         <button className="dso-btn" title={tt('toolbar.reload')} onClick={() => { try { frameRef.current?.contentWindow?.location.reload() } catch { /* cross-doc reload race */ } }}>⟳</button>
         <button
           className="dso-btn"
-          title={tt('toolbar.openWindow')}
+          title={desktopShell ? tt('toolbar.openWindowUnavailable') : tt('toolbar.openWindow')}
+          disabled={desktopShell}
           onClick={() => { window.open(`${location.origin}${embedEntry}`, '_blank') }}
         >↗</button>
         <span style={{ flex: 1 }} />
